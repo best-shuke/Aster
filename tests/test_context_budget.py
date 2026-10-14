@@ -638,6 +638,12 @@ class WireCacheTests(unittest.TestCase):
                 request_fingerprint(unencodable, tools, settings, memo)
         check(messages)  # A failed extension leaves the stored states consistent.
         check(messages[:2])
+        unencodable_tools = [{"type": "function", "function": {"name": "\ud800"}}]
+        for _ in range(2):  # An unencodable head must not leave a half-reset chain.
+            for memo in (None, cache):
+                with self.assertRaises(UnicodeEncodeError):
+                    request_fingerprint(messages, unencodable_tools, settings, memo)
+        check(messages)
 
     def test_estimate_context_matches_uncached_for_anchor_and_fallback_paths(self):
         settings = self._settings()

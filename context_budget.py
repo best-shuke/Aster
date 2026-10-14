@@ -108,9 +108,9 @@ class WireCache:
         parts = list(map(_COMPACT, self._lookup(messages)))
         with self._lock:
             if head_json != self._chain_head:
-                self._chain_head = head_json
-                self._chain_parts = []
-                self._chain_states = [hashlib.sha256((head_json[:-1] + ",[").encode())]
+                # Hash first: an unencodable head must leave the previous states intact.
+                initial = hashlib.sha256((head_json[:-1] + ",[").encode())
+                self._chain_head, self._chain_parts, self._chain_states = head_json, [], [initial]
             chain, states = self._chain_parts, self._chain_states
             shared = self._shared_prefix(parts)
             if shared < len(chain) and shared < len(parts):
