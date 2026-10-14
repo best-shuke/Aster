@@ -3,12 +3,18 @@
 import hashlib
 import json
 import math
+from itertools import compress, repeat
+from operator import is_not, itemgetter
 from urllib.parse import urlsplit
 
 from config import parse_reasoning_effort
 from usage import number
 
 LOCAL_METADATA = "_harness"
+
+# WireCache entry fields: (message, compact JSON, default-separator JSON length, non-ASCII count).
+_MESSAGE, _COMPACT, _PRETTY_LEN, _NON_ASCII = (itemgetter(i) for i in range(4))
+_MISS = (None,)
 
 
 def wire_messages(messages):
@@ -18,50 +24,124 @@ def wire_messages(messages):
 class WireCache:
     """Per-message serialization memo for the read-only budget/display path.
 
-    ``context_status`` recomputes a snapshot after every tool result, and both the
-    usage-anchor fingerprint and the char count serialize ~the whole history each time,
-    making a long session roughly O(n²). Message wire-content is immutable once appended
-    (only the stripped ``_harness`` metadata is added later), so each message's serialized
-    forms can be cached by object identity. A strong reference to each cached message keeps
-    its ``id`` from being reused; ``sync`` drops entries for messages no longer present.
+    ``context_status`` (after every tool result), the per-round snapshot and compaction
+    check in ``TaskRuntime``, and compaction itself all size and fingerprint ~the whole
+    history, making a long session roughly O(n²). Message wire-content is immutable once
+    appended (only the stripped ``_harness`` metadata is added later), so each message's
+    serialized forms can be cached by object identity. A strong reference to each cached
+    message keeps its ``id`` from being reused; ``sync`` drops entries for messages no
+    longer present.
 
-    The cached strings are byte-identical to the uncached serialization, so fingerprints
-    and char counts match whether or not a cache is supplied.
+    The request-prefix hash is kept incrementally too, keyed by serialized content rather
+    than identity, so a fingerprint over a prefix that extends the last one hashes only the
+    new messages.
+
+    Every result is byte- or number-identical to the uncached computation, so fingerprints,
+    token estimates and char counts match whether or not a cache is supplied.
     """
 
-    __slots__ = ("_entries",)
+    __slots__ = ("_chain_head", "_chain_parts", "_chain_states", "_entries")
 
     def __init__(self) -> None:
         self._entries: dict[int, tuple] = {}
+        self._chain_head: str | None = None
+        self._chain_parts: list[str] = []
+        self._chain_states: list = []
 
     def _entry(self, message) -> tuple:
         key = id(message)
         hit = self._entries.get(key)
-        if hit is not None and hit[0] is message:
+        if hit is not None and _MESSAGE(hit) is message:
             return hit
         wire = {k: v for k, v in message.items() if k != LOCAL_METADATA}
         compact = json.dumps(wire, ensure_ascii=False, separators=(",", ":"))
-        pretty_len = len(json.dumps(wire, ensure_ascii=False))
-        entry = (message, compact, pretty_len)
+        pretty = json.dumps(wire, ensure_ascii=False)
+        # The same count as estimate_text_tokens' sum(ord(c) > 127 ...): exactly the
+        # characters (lone surrogates included) the ASCII codec cannot encode.
+        non_ascii = 0 if pretty.isascii() else len(pretty) - len(pretty.encode("ascii", "ignore"))
+        entry = (message, compact, len(pretty), non_ascii)
         self._entries[key] = entry
         return entry
 
-    def compact_list_json(self, messages) -> str:
-        # Equivalent to json.dumps(wire_messages(messages), ensure_ascii=False,
-        # separators=(",", ":")): a JSON array is "[" + items joined by "," + "]".
-        return "[" + ",".join(self._entry(message)[1] for message in messages) + "]"
+    def _lookup(self, messages) -> list[tuple]:
+        # The entry for each message. Each per-message step is a C-level map, so a
+        # mostly cached history costs a pointer walk plus serializing only the misses.
+        entries = list(map(self._entries.get, map(id, messages), repeat(_MISS)))
+        stale = map(is_not, map(_MESSAGE, entries), messages)
+        for index in compress(range(len(entries)), stale):
+            entries[index] = self._entry(messages[index])
+        return entries
+
+    def _list_stats(self, messages) -> tuple[int, int]:
+        # Length and non-ASCII count of json.dumps(wire_messages(messages), ensure_ascii=False):
+        # "[" + items joined by the default ", " separator + "]"; the separators are ASCII.
+        entries = self._lookup(messages)
+        length = sum(map(_PRETTY_LEN, entries)) + 2 * max(0, len(entries) - 1) + 2
+        return length, sum(map(_NON_ASCII, entries))
 
     def pretty_list_len(self, messages) -> int:
-        # Length of json.dumps(wire_messages(messages), ensure_ascii=False) with the
-        # default ", " item separator: 1 ("[") + items + 2*(n-1) separators + 1 ("]").
-        if not messages:
-            return 2
-        return 2 + sum(self._entry(message)[2] for message in messages) + 2 * (len(messages) - 1)
+        # Equivalent to len(json.dumps(wire_messages(messages), ensure_ascii=False)).
+        return self._list_stats(messages)[0]
+
+    def list_tokens(self, messages) -> int:
+        # Equivalent to estimate_tokens(wire_messages(messages)).
+        return _estimate_tokens_from(*self._list_stats(messages))
+
+    def message_tokens(self, message) -> int:
+        # Equivalent to estimate_tokens(wire_messages([message])[0]).
+        entry = self._entry(message)
+        return _estimate_tokens_from(_PRETTY_LEN(entry), _NON_ASCII(entry))
+
+    def message_fingerprint(self, message) -> str:
+        # Equivalent to fingerprint(wire_messages([message])[0]).
+        return hashlib.sha256(_COMPACT(self._entry(message)).encode()).hexdigest()
+
+    def prefix_fingerprint(self, head_json: str, messages) -> str:
+        # sha256 of the compact dump of [*head, wire_messages(messages)], which is
+        # head_json[:-1] + ",[" + compact items joined by "," + "]]". UTF-8 encodes per
+        # character, so the hash can be fed piecewise. The state after each message is
+        # kept, so a prefix that extends the last one hashes only the new messages.
+        if head_json != self._chain_head:
+            self._chain_head = head_json
+            self._chain_parts = []
+            self._chain_states = [hashlib.sha256((head_json[:-1] + ",[").encode())]
+        parts = list(map(_COMPACT, self._lookup(messages)))
+        chain, states = self._chain_parts, self._chain_states
+        shared = self._shared_prefix(parts)
+        if shared < len(chain) and shared < len(parts):
+            self._truncate_chain(shared)
+        for part in parts[len(chain) :]:
+            state = states[-1].copy()
+            state.update(("," + part if chain else part).encode())
+            chain.append(part)
+            states.append(state)
+        final = states[len(parts)].copy()
+        final.update(b"]]")
+        return final.hexdigest()
+
+    def _shared_prefix(self, parts) -> int:
+        chain = self._chain_parts
+        shared = min(len(parts), len(chain))
+        # List equality short-circuits on identical strings, so the usual all-equal
+        # case is a fast pointer walk.
+        if parts[:shared] == chain[:shared]:
+            return shared
+        return next(i for i in range(shared) if parts[i] != chain[i])
+
+    def _truncate_chain(self, length: int) -> None:
+        del self._chain_parts[length:]
+        del self._chain_states[length + 1 :]
 
     def sync(self, messages) -> None:
-        live = {id(message) for message in messages}
-        if len(self._entries) != len(live) or self._entries.keys() != live:
-            self._entries = {key: value for key, value in self._entries.items() if key in live}
+        for key in self._entries.keys() - set(map(id, messages)):
+            del self._entries[key]
+        if self._chain_parts:
+            # Keep only the hashed prefix still at the head of the live history, holding
+            # the live strings, so the chain cannot outgrow the live message set.
+            parts = list(map(_COMPACT, self._lookup(messages[: len(self._chain_parts)])))
+            shared = self._shared_prefix(parts)
+            self._truncate_chain(shared)
+            self._chain_parts[:] = parts[:shared]
 
 
 def fingerprint(value):
@@ -79,17 +159,20 @@ def request_fingerprint(messages, tools, settings, cache: WireCache | None = Non
     ]
     if cache is None:
         return fingerprint([*head, wire_messages(messages)])
-    # Byte-identical to the branch above: splice the cached messages array in as the
+    # Byte-identical to the branch above: the cached messages array is hashed as the
     # final element of the compact-serialized head list.
     head_json = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
-    combined = head_json[:-1] + "," + cache.compact_list_json(messages) + "]"
-    return hashlib.sha256(combined.encode()).hexdigest()
+    return cache.prefix_fingerprint(head_json, messages)
+
+
+def _estimate_tokens_from(length, non_ascii):
+    return math.ceil((length - non_ascii) / 3 + non_ascii * 2)
 
 
 def estimate_text_tokens(text):
     # Deliberately more room than pi's chars/4 heuristic, especially for Chinese.
     non_ascii = sum(ord(c) > 127 for c in text)
-    return math.ceil((len(text) - non_ascii) / 3 + non_ascii * 2)
+    return _estimate_tokens_from(len(text), non_ascii)
 
 
 def estimate_tokens(value):
@@ -129,6 +212,7 @@ def estimate_context(messages, tools, settings, cache: WireCache | None = None):
     A digest validates both the original input and the returned assistant text.
     Compaction, edits, model/effort changes and different child histories therefore
     cannot reuse a stale usage anchor. No mutable client-wide 'last usage' is used.
+    A ``cache`` only memoizes serialization; the result is identical without one.
     """
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
@@ -143,18 +227,35 @@ def estimate_context(messages, tools, settings, cache: WireCache | None = None):
             messages[:index], tools, settings, cache
         ):
             continue
-        if metadata.get("response_fingerprint") != fingerprint(wire_messages([message])[0]):
+        response = (
+            fingerprint(wire_messages([message])[0])
+            if cache is None
+            else cache.message_fingerprint(message)
+        )
+        if metadata.get("response_fingerprint") != response:
             continue
         output = usage.get("completion_tokens")
-        output = output if number(output) else estimate_tokens(wire_messages([message]))
-        trailing = sum(estimate_tokens(m) for m in wire_messages(messages[index + 1 :]))
+        if not number(output):
+            output = (
+                estimate_tokens(wire_messages([message]))
+                if cache is None
+                else cache.list_tokens([message])
+            )
+        trailing = (
+            sum(estimate_tokens(m) for m in wire_messages(messages[index + 1 :]))
+            if cache is None
+            else sum(cache.message_tokens(m) for m in messages[index + 1 :])
+        )
         return {
             "tokens": math.ceil(prompt + output + trailing),
             "source": "usage",
             "anchor_index": index,
         }
+    history = (
+        estimate_tokens(wire_messages(messages)) if cache is None else cache.list_tokens(messages)
+    )
     return {
-        "tokens": estimate_tokens(wire_messages(messages)) + estimate_tokens(tools or []),
+        "tokens": history + estimate_tokens(tools or []),
         "source": "estimate",
         "anchor_index": None,
     }

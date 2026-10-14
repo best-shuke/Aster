@@ -2,12 +2,14 @@ import copy
 import io
 import json
 import os
+import random
 import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from config import Settings, environment_context
@@ -17,6 +19,7 @@ from context_budget import (
     context_window,
     estimate_context,
     estimate_tokens,
+    fingerprint,
     input_budget,
     request_fingerprint,
     wire_messages,
@@ -527,6 +530,204 @@ class WireCacheTests(unittest.TestCase):
         )
         context_snapshot(replaced, None, settings, cache)
         self.assertLessEqual(len(cache._entries), len(replaced))
+
+    def _anchor(self, messages, tools, settings, response):
+        # The metadata DeepSeekClient._attach_usage records for a provider response.
+        observed = UsageAccumulator()
+        observed.add({"usage": {"prompt_tokens": 500 + len(messages), "completion_tokens": 7}})
+        client = SimpleNamespace(settings=settings)
+        return DeepSeekClient._attach_usage(
+            client, response, wire_messages(messages), tools, observed
+        )
+
+    def test_sizes_tokens_and_message_fingerprints_match_uncached_for_unusual_text(self):
+        cache = WireCache()
+        messages = [*self._messages(), *UNUSUAL_MESSAGES, LONE_SURROGATE]
+        for start in range(len(messages)):
+            for end in range(start, len(messages) + 1):
+                subset = messages[start:end]
+                visible = wire_messages(subset)
+                self.assertEqual(
+                    cache.pretty_list_len(subset), len(json.dumps(visible, ensure_ascii=False))
+                )
+                self.assertEqual(cache.list_tokens(subset), estimate_tokens(visible))
+        for message in messages:
+            self.assertEqual(
+                cache.message_tokens(message), estimate_tokens(wire_messages([message])[0])
+            )
+        for message in messages[:-1]:
+            self.assertEqual(
+                cache.message_fingerprint(message), fingerprint(wire_messages([message])[0])
+            )
+
+    def test_prefix_fingerprint_matches_uncached_across_extension_divergence_and_head_changes(
+        self,
+    ):
+        settings = self._settings()
+        tools = [{"type": "function", "function": {"name": "exec"}}]
+        messages = [*self._messages(), *UNUSUAL_MESSAGES]
+        cache = WireCache()
+
+        def check(prefix, tools=tools, settings=settings):
+            self.assertEqual(
+                request_fingerprint(prefix, tools, settings, cache),
+                request_fingerprint(prefix, tools, settings),
+            )
+
+        for index in range(len(messages) + 1):  # A growing session extends the hashed prefix.
+            check(messages[:index])
+        for index in range(len(messages), -1, -1):  # Shorter prefixes reuse stored states.
+            check(messages[:index])
+        check([*messages[:3], {"role": "user", "content": "diverged"}, *messages[4:]])
+        check(messages)
+        check([dict(messages[0]), *messages[1:]])  # Equal content in a new object.
+        check(messages, tools=None)
+        check(messages, settings=replace(settings, model="other"))
+        check(messages)
+        unencodable = [*messages[:2], LONE_SURROGATE]
+        for memo in (None, cache):
+            with self.assertRaises(UnicodeEncodeError):
+                request_fingerprint(unencodable, tools, settings, memo)
+        check(messages)  # A failed extension leaves the stored states consistent.
+        check(messages[:2])
+
+    def test_estimate_context_matches_uncached_for_anchor_and_fallback_paths(self):
+        settings = self._settings()
+        tools = [{"type": "function", "function": {"name": "exec"}}]
+        call = {"id": "c1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}
+        history = [
+            {"role": "system", "content": "系统 instructions"},
+            {"role": "user", "content": "q"},
+        ]
+        history.append(
+            self._anchor(
+                history,
+                tools,
+                settings,
+                {"role": "assistant", "content": None, "tool_calls": [call]},
+            )
+        )
+        history.append({"role": "tool", "tool_call_id": "c1", "content": "结果 ✅"})
+        history.append(
+            self._anchor(history, tools, settings, {"role": "assistant", "content": "答"})
+        )
+        history.append({"role": "user", "content": "follow-up after the anchor"})
+        unmetered = self._anchor(history, tools, settings, {"role": "assistant", "content": "n/a"})
+        unmetered["_harness"]["usage"].pop("completion_tokens")
+        edited = {**history[4], "content": "edited after anchoring"}
+        scenarios = {
+            "latest anchor": ([*history], 4),
+            "anchor without completion tokens": ([*history, unmetered], 6),
+            "edited response falls back to an earlier anchor": (
+                [*history[:4], edited, history[5]],
+                2,
+            ),
+            "no anchor": (wire_messages(history), None),
+        }
+        cache = WireCache()
+        for name, (messages, anchor_index) in scenarios.items():
+            expected = estimate_context(messages, tools, settings)
+            self.assertEqual(expected["anchor_index"], anchor_index, name)
+            for tool_set in (tools, None):
+                with self.subTest(name, tools=tool_set):
+                    self.assertEqual(
+                        estimate_context(messages, tool_set, settings, cache),
+                        estimate_context(messages, tool_set, settings),
+                    )
+
+    def test_sync_bounds_entries_and_hash_states_to_the_live_history(self):
+        settings = self._settings()
+        messages = [*self._messages(), *UNUSUAL_MESSAGES]
+        cache = WireCache()
+        context_snapshot(messages, None, settings, cache)
+        request_fingerprint(messages, None, settings, cache)
+        self.assertEqual(len(cache._chain_parts), len(messages))
+        cache.sync(messages[:3])  # A shorter live history drops the hashed tail.
+        self.assertEqual(len(cache._chain_parts), 3)
+        self.assertEqual(len(cache._chain_states), 4)
+        request_fingerprint(messages, None, settings, cache)
+        # Compaction: a rebuilt system message with equal content, a summary, a recent tail.
+        live = [dict(messages[0]), {"role": "system", "content": "Summary"}, *messages[-2:]]
+        cache.sync(live)
+        self.assertLessEqual(set(cache._entries), {id(message) for message in live})
+        self.assertEqual(len(cache._chain_parts), 1)
+        self.assertEqual(len(cache._chain_states), 2)
+        self.assertIs(cache._chain_parts[0], cache._entries[id(live[0])][1])
+        self.assertEqual(
+            request_fingerprint(live, None, settings, cache),
+            request_fingerprint(live, None, settings),
+        )
+
+    def test_random_session_histories_match_uncached(self):
+        # Differential check over appends, anchors, edits, compaction-style replacement,
+        # truncation, repeated objects, metadata-only updates and settings/tool changes.
+        rng = random.Random(20261014)
+        base = self._settings()
+        settings_choices = [base, replace(base, reasoning_effort="high"), replace(base, model="m")]
+        tool_choices = [None, [], [{"type": "function", "function": {"name": "exec"}}]]
+        texts = ["plain", "中文内容", "emoji 🙂", "naïve", 'q"b\\s', "\x00ctl", "x" * 300, ""]
+        settings, tools, system_text = base, tool_choices[2], "System 系统"
+        history: list = [{"role": "user", "content": "task"}]
+        cache = WireCache()
+        for step in range(400):
+            op = rng.randrange(10)
+            # A fresh system object each step, as Conversation.context_status builds one.
+            system = {"role": "system", "content": system_text}
+            if op == 0:
+                role = rng.choice(["user", "tool", "system"])
+                history.append({"role": role, "content": rng.choice(texts)})
+            elif op == 1:
+                response = {"role": "assistant", "content": rng.choice(texts)}
+                history.append(self._anchor([system, *history], tools, settings, response))
+            elif op == 2 and history:
+                index = rng.randrange(len(history))
+                history[index] = {**history[index], "content": rng.choice(texts) + "!"}
+            elif op == 3 and len(history) > 3:
+                tail = history[-rng.randint(1, 3) :]
+                history[:] = [{"role": "system", "content": f"Summary {step}"}, *tail]
+            elif op == 4 and history:
+                del history[rng.randrange(len(history)) :]
+            elif op == 5:
+                tools = rng.choice(tool_choices)
+            elif op == 6:
+                settings = rng.choice(settings_choices)
+            elif op == 7 and history:
+                history.append(rng.choice(history))
+            elif op == 8:
+                system_text = rng.choice(["System 系统", "Reloaded prompt"])
+            elif op == 9 and history:
+                rng.choice(history).setdefault("_harness", {})["performance"] = step
+            live = [system, *history]
+            with self.subTest(step=step, op=op):
+                self.assertEqual(
+                    context_snapshot(live, tools, settings, cache),
+                    context_snapshot(live, tools, settings),
+                )
+                end = rng.randint(0, len(live))
+                self.assertEqual(
+                    request_fingerprint(live[:end], tools, settings, cache),
+                    request_fingerprint(live[:end], tools, settings),
+                )
+                start = rng.randint(0, len(live))
+                part = live[start : rng.randint(start, len(live))]
+                self.assertEqual(cache.list_tokens(part), estimate_tokens(wire_messages(part)))
+                self.assertLessEqual(set(cache._entries), {id(message) for message in live})
+                self.assertLessEqual(len(cache._chain_parts), len(live))
+                self.assertEqual(len(cache._chain_states), len(cache._chain_parts) + 1)
+
+
+UNUSUAL_MESSAGES = [
+    {"role": "user", "content": "naïve café — ünïcödé"},
+    {"role": "user", "content": "emoji 🙂👍🏽, 中文, and a   line separator"},
+    {"role": "tool", "tool_call_id": "t", "content": 'ctrl \x00\x1f\t\n quote " back \\ slash'},
+    {"role": "assistant", "content": None, "n": 1, "f": 1.5, "b": True, "z": None, "x": [["é"]]},
+    {"content": "same keys, different order", "role": "user"},
+    {},
+    {"role": "user", "content": ""},
+]
+# Counted like any other character, but not UTF-8 encodable: fingerprinting must fail
+# the same way with and without a cache.
+LONE_SURROGATE = {"role": "user", "content": "broken \ud800 escape"}
 
 
 if __name__ == "__main__":
