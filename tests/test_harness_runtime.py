@@ -160,7 +160,7 @@ class HarnessRuntimeTests(unittest.TestCase):
     def test_role_cache_rejects_empty_nontext_and_oversized_utf8_content(self):
         for text in ("", "  ", None, "中文"):
             with self.subTest(text=text):
-                cache = RolePromptCache(lambda role, execution: text, max_bytes=4)
+                cache = RolePromptCache(lambda role, execution, text=text: text, max_bytes=4)
                 with self.assertRaises(ValueError):
                     cache("recon", ExecutionContext(time.monotonic() + 1))
                 self.assertEqual(cache.cache, {})

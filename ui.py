@@ -288,7 +288,16 @@ class _CachedCodeBlock(CodeBlock):
                     if old_type != new_type:
                         break
                     if old_text != new_text:
-                        unchanged_chars += len(os.path.commonprefix((old_text, new_text)))
+                        # Count the characters shared before the first difference. (os.path
+                        # helpers are for paths, not token text, so compare directly.)
+                        unchanged_chars += next(
+                            (
+                                i
+                                for i, (a, b) in enumerate(zip(old_text, new_text, strict=False))
+                                if a != b
+                            ),
+                            min(len(old_text), len(new_text)),
+                        )
                         break
                     unchanged_chars += len(old_text)
                 common = min(common, processed[:unchanged_chars].count("\n"))
