@@ -16,7 +16,7 @@ from pathlib import PurePath
 
 from client_runtime import client_event
 from config import Settings
-from context_budget import context_snapshot, estimate_tokens
+from context_budget import WireCache, context_snapshot, estimate_tokens
 from context_management import OutputRecovery, compact_messages, excerpt
 from contracts import (
     CompletionClient,
@@ -276,9 +276,13 @@ class TaskRuntime:
         final_validator=None,
         check_active=None,
         cancelled=None,
+        wire_cache: WireCache | None = None,
     ):
         deadline = min(deadline, getattr(client, "deadline", None) or deadline)
         self.client, self.settings, self.deadline = client, settings, deadline
+        # Memoizes per-message serialization for the per-round compaction check and
+        # context snapshot; it never changes what is sent or how usage is anchored.
+        self.wire_cache = wire_cache
         self.check_active = check_active
         self.cancelled = cancelled if cancelled is not None else threading.Event()
         self.progress = TaskProgress(settings.workspace)
@@ -395,6 +399,7 @@ class TaskRuntime:
             on_progress,
             reserve_chars=reserved + 2 if reserved else 0,
             reserve_tokens=reserved_tokens + 2 if reserved_tokens else 0,
+            cache=self.wire_cache,
         )
         selected_notes = snapshot if compacted else notes
         if selected_notes:
@@ -647,7 +652,12 @@ class TaskRuntime:
                 on_progress(
                     {
                         "phase": "context",
-                        **context_snapshot([current_system, *messages], definitions, self.settings),
+                        **context_snapshot(
+                            [current_system, *messages],
+                            definitions,
+                            self.settings,
+                            self.wire_cache,
+                        ),
                     }
                 )
             if on_start:

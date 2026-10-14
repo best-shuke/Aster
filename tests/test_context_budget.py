@@ -29,6 +29,7 @@ from conversation import Conversation
 from deepseek_client import CompletionError, DeepSeekClient
 from task_runtime import RUNTIME_INSTRUCTIONS
 from tests.support import make_settings
+from tools import CodingTools
 from ui import Console
 from usage import CacheStats, UsageAccumulator
 
@@ -49,6 +50,17 @@ def stream(usage=None, finish="stop"):
             {"choices": [], "usage": usage},
             {"choices": [], "usage": {"completion_tokens": None}},
         ]
+    return io.BytesIO(
+        b"".join(("data: " + json.dumps(c) + "\n").encode() for c in chunks) + b"data: [DONE]\n"
+    )
+
+
+def tool_stream(call_id, usage):
+    call = {"index": 0, "id": call_id, "function": {"name": "ls", "arguments": "{}"}}
+    chunks = [
+        {"choices": [{"delta": {"tool_calls": [call]}, "finish_reason": "tool_calls"}]},
+        {"choices": [], "usage": usage},
+    ]
     return io.BytesIO(
         b"".join(("data: " + json.dumps(c) + "\n").encode() for c in chunks) + b"data: [DONE]\n"
     )
@@ -360,6 +372,40 @@ class BudgetTests(unittest.TestCase):
         self.assertGreater(snapshot["chars"], 0)
         self.assertEqual(snapshot["window_tokens"], 64000)
 
+    def test_task_rounds_share_the_conversation_cache_without_changing_any_value(self):
+        conversation = Conversation(
+            self.settings, DeepSeekClient(self.settings), CodingTools(self.root)
+        )
+        cache = conversation._wire_cache
+        sources = []
+
+        def checked_snapshot(messages, tools, settings, wire_cache=None):
+            self.assertIs(wire_cache, cache)
+            expected = context_snapshot(messages, tools, settings)
+            self.assertEqual(context_snapshot(messages, tools, settings, wire_cache), expected)
+            sources.append(expected["source"])
+            return expected
+
+        def checked_estimate(messages, tools, settings, wire_cache=None):
+            self.assertIs(wire_cache, cache)
+            expected = estimate_context(messages, tools, settings)
+            self.assertEqual(estimate_context(messages, tools, settings, wire_cache), expected)
+            return expected
+
+        usage = {"prompt_tokens": 3000, "completion_tokens": 40}
+        responses = [tool_stream(f"call-{index}", usage) for index in range(3)] + [stream(usage)]
+        with (
+            patch("http_transport.open_url", side_effect=responses),
+            patch("task_runtime.context_snapshot", checked_snapshot),
+            patch("conversation.context_snapshot", checked_snapshot),
+            patch("context_management.estimate_context", checked_estimate),
+        ):
+            answer = conversation.ask("List the workspace.", on_progress=lambda _: None)
+        self.assertEqual(answer, "done")
+        # Per-round snapshots from TaskRuntime plus one after each tool result and answer.
+        self.assertGreaterEqual(len(sources), 8)
+        self.assertIn("usage", sources)
+
 
 class UsageTests(unittest.TestCase):
     def test_gateway_metadata_zero_and_trailing_nulls(self):
@@ -531,10 +577,11 @@ class WireCacheTests(unittest.TestCase):
         context_snapshot(replaced, None, settings, cache)
         self.assertLessEqual(len(cache._entries), len(replaced))
 
-    def _anchor(self, messages, tools, settings, response):
+    def _anchor(self, messages, tools, settings, response, prompt_tokens=None):
         # The metadata DeepSeekClient._attach_usage records for a provider response.
         observed = UsageAccumulator()
-        observed.add({"usage": {"prompt_tokens": 500 + len(messages), "completion_tokens": 7}})
+        prompt = 500 + len(messages) if prompt_tokens is None else prompt_tokens
+        observed.add({"usage": {"prompt_tokens": prompt, "completion_tokens": 7}})
         client = SimpleNamespace(settings=settings)
         return DeepSeekClient._attach_usage(
             client, response, wire_messages(messages), tools, observed
@@ -714,6 +761,68 @@ class WireCacheTests(unittest.TestCase):
                 self.assertLessEqual(set(cache._entries), {id(message) for message in live})
                 self.assertLessEqual(len(cache._chain_parts), len(live))
                 self.assertEqual(len(cache._chain_states), len(cache._chain_parts) + 1)
+
+    def _add_rounds(self, messages, system, definitions, settings, turn):
+        # A user turn of bulky tool rounds, each response anchored with realistic usage.
+        messages.append({"role": "user", "content": f"task {turn}"})
+        for round_index in range(8):
+            call_id = f"c{turn}-{round_index}"
+            call = {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "exec", "arguments": ""},
+            }
+            prefix = [system, *messages]
+            response = {"role": "assistant", "content": None, "tool_calls": [call]}
+            prompt = estimate_context(prefix, definitions, settings)["tokens"]
+            messages.append(self._anchor(prefix, definitions, settings, response, prompt))
+            content = f"evidence {turn}/{round_index} 证据 " * 300
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+
+    def test_compaction_matches_uncached_and_keeps_the_cache_within_the_live_history(self):
+        system = {"role": "system", "content": "Fixed instructions 系统"}
+        definitions = [{"type": "function", "function": {"name": "exec", "description": "run"}}]
+        base = self._settings()
+        modes = {
+            "tokens": replace(base, context_window_tokens=40000, context_reserve_tokens=1000),
+            "characters": replace(base, max_context_chars=60000),
+        }
+        for mode, settings in modes.items():
+            original: list = []
+            for turn in range(3):
+                self._add_rounds(original, system, definitions, settings, turn)
+            runs = []
+            for cache in (None, WireCache()):
+                messages, events, compacted = copy.deepcopy(original), [], []
+                for compaction in range(2):
+                    for turn in range(7, 10) if compaction else ():
+                        # Grow again; the second pass reuses the same cache.
+                        self._add_rounds(messages, system, definitions, settings, turn)
+                    with patch(
+                        "context_management.summarize",
+                        side_effect=lambda _c, _s, source, *_: f"Summary of {len(source)}",
+                    ):
+                        compacted.append(
+                            compact_messages(
+                                messages,
+                                system,
+                                definitions,
+                                SimpleNamespace(),
+                                settings,
+                                on_progress=events.append,
+                                reserve_chars=100,
+                                reserve_tokens=100,
+                                cache=cache,
+                            )
+                        )
+                    if cache is not None:
+                        live = [system, *messages]
+                        self.assertLessEqual(set(cache._entries), {id(m) for m in live})
+                        self.assertLessEqual(len(cache._chain_parts), len(live))
+                runs.append((compacted, wire_messages(messages), events))
+            with self.subTest(mode):
+                self.assertEqual(runs[0][0], [True, True])
+                self.assertEqual(runs[1], runs[0])
 
 
 UNUSUAL_MESSAGES = [

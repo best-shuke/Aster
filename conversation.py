@@ -449,6 +449,7 @@ class Conversation:
             self.settings,
             deadline,
             on_progress=on_progress,
+            cache=self._wire_cache,
         )
         self.save()
 
@@ -759,7 +760,9 @@ class Conversation:
                     return problem
             return acceptance.validate(content)
 
-        runtime = TaskRuntime(self.client, self.settings, deadline, validate_final)
+        runtime = TaskRuntime(
+            self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache
+        )
         while True:
             try:
                 message = runtime.generate(
