@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from config import Settings, environment_context, parse_reasoning_effort, system_prompt
-from context_budget import context_snapshot
+from context_budget import WireCache, context_snapshot
 from context_management import compact_messages, summarize
 from contracts import (
     CompletionClient,
@@ -87,6 +87,7 @@ class Conversation:
         self.reload_prompt()
         self.tool_runs: list[ToolRun] = []
         self._tool_runs_lock = threading.RLock()
+        self._wire_cache = WireCache()
         self._execution_title = ""
         self._execution_closed = False
         self.recovery_notice = None
@@ -132,7 +133,10 @@ class Conversation:
 
     def context_status(self) -> dict:
         return context_snapshot(
-            [self._runtime_system_message(), *self.messages], self.definitions, self.settings
+            [self._runtime_system_message(), *self.messages],
+            self.definitions,
+            self.settings,
+            self._wire_cache,
         )
 
     def _load(self) -> list[Message]:

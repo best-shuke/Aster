@@ -12,11 +12,13 @@ from unittest.mock import patch
 
 from config import Settings, environment_context
 from context_budget import (
+    WireCache,
     context_snapshot,
     context_window,
     estimate_context,
     estimate_tokens,
     input_budget,
+    request_fingerprint,
     wire_messages,
 )
 from context_management import compact_messages
@@ -444,6 +446,87 @@ class UsageTests(unittest.TestCase):
             ):
                 client.complete([], on_content=lambda _: None)
             self.assertEqual(client.cache_stats.snapshot()["calls"], 3)
+
+
+class WireCacheTests(unittest.TestCase):
+    def _settings(self):
+        return make_settings(
+            api_key="test",
+            base_url="https://example.invalid",
+            model="test",
+            session_file=Path(tempfile.gettempdir()) / "unused-session.json",
+            workspace=Path(tempfile.gettempdir()),
+            max_context_chars=None,
+            keep_recent_turns=6,
+            max_task_seconds=60,
+            max_subagents=2,
+            context_window_tokens=64000,
+            context_reserve_tokens=8192,
+        )
+
+    def _messages(self):
+        return [
+            {"role": "system", "content": '系统 prompt with "quotes" and \\slash'},
+            {"role": "user", "content": "hello\nworld"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "function": {"name": "exec", "arguments": '{"x":1}'}}],
+                "_harness": {"usage": {"prompt_tokens": 10}},
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": '{"ok":true,"emoji":"✅"}'},
+            {"role": "assistant", "content": "done", "reasoning_content": "思考"},
+            {"role": "user", "content": ""},
+        ]
+
+    def test_request_fingerprint_is_identical_with_and_without_cache(self):
+        settings = self._settings()
+        messages = self._messages()
+        cache = WireCache()
+        for tools in (None, [], [{"type": "function", "function": {"name": "exec"}}]):
+            for index in range(len(messages) + 1):
+                prefix = messages[:index]
+                self.assertEqual(
+                    request_fingerprint(prefix, tools, settings),
+                    request_fingerprint(prefix, tools, settings, cache),
+                )
+
+    def test_context_snapshot_is_identical_with_and_without_cache(self):
+        settings = self._settings()
+        messages = self._messages()
+        for tools in (None, [], [{"type": "function", "function": {"name": "exec"}}]):
+            self.assertEqual(
+                context_snapshot(messages, tools, settings),
+                context_snapshot(messages, tools, settings, WireCache()),
+            )
+
+    def test_pretty_list_len_matches_default_separator_dump(self):
+        cache = WireCache()
+        messages = self._messages()
+        for subset in ([], messages[:1], messages[:3], messages):
+            self.assertEqual(
+                cache.pretty_list_len(subset),
+                len(json.dumps(wire_messages(subset), ensure_ascii=False)),
+            )
+
+    def test_cache_tracks_appends_replacements_and_prunes_dead_entries(self):
+        settings = self._settings()
+        cache = WireCache()
+        messages = self._messages()
+        context_snapshot(messages, None, settings, cache)
+        messages.append({"role": "user", "content": "新消息"})
+        self.assertEqual(
+            request_fingerprint(messages, None, settings),
+            request_fingerprint(messages, None, settings, cache),
+        )
+        # A full replacement (as compaction produces) must not reuse stale serializations.
+        replaced = [{"role": "system", "content": "新的 system"}, {"role": "user", "content": "q"}]
+        self.assertEqual(
+            request_fingerprint(replaced, None, settings),
+            request_fingerprint(replaced, None, settings, cache),
+        )
+        context_snapshot(replaced, None, settings, cache)
+        self.assertLessEqual(len(cache._entries), len(replaced))
 
 
 if __name__ == "__main__":
