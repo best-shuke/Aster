@@ -1,0 +1,25 @@
+[project]
+name = "aster"
+description = "Aster — terminal coding companion"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx2>=2,<3",
+    "jsonschema>=4,<5",
+    "mcp>=2,<3",
+    "prompt-toolkit>=3,<4",
+    "PyYAML>=6,<7",
+    "referencing>=0.30,<1",
+    "rich>=14,<15",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF001"]
