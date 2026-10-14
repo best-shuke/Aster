@@ -3,6 +3,7 @@ import io
 import json
 import os
 import random
+import sys
 import tempfile
 import time
 import unittest
@@ -823,6 +824,45 @@ class WireCacheTests(unittest.TestCase):
             with self.subTest(mode):
                 self.assertEqual(runs[0][0], [True, True])
                 self.assertEqual(runs[1], runs[0])
+
+    def test_shared_cache_stays_exact_under_concurrent_use(self):
+        settings = self._settings()
+        histories = [
+            [{"role": "user", "content": f"history {h} message {i} " * 20} for i in range(40)]
+            for h in range(3)
+        ]
+        tool_choices = [None, [{"type": "function", "function": {"name": "exec"}}]]
+        expected = {
+            (h, end, t): request_fingerprint(histories[h][:end], tool_choices[t], settings)
+            for h in range(3)
+            for end in range(41)
+            for t in range(2)
+        }
+        cache, failures = WireCache(), []
+
+        def worker(seed):
+            rng = random.Random(seed)
+            for _ in range(400):
+                h, end, t = rng.randrange(3), rng.randrange(41), rng.randrange(2)
+                try:
+                    if rng.random() < 0.1:
+                        cache.sync(histories[h])
+                    actual = request_fingerprint(
+                        histories[h][:end], tool_choices[t], settings, cache
+                    )
+                    if actual != expected[(h, end, t)]:
+                        failures.append((h, end, t))
+                except Exception as exc:  # A torn update can also raise.
+                    failures.append(repr(exc))
+
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)  # Interleave threads aggressively.
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(worker, range(4)))
+        finally:
+            sys.setswitchinterval(interval)
+        self.assertEqual(failures, [])
 
 
 UNUSUAL_MESSAGES = [

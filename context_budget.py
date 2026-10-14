@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import threading
 from itertools import compress, repeat
 from operator import is_not, itemgetter
 from urllib.parse import urlsplit
@@ -37,12 +38,15 @@ class WireCache:
     new messages.
 
     Every result is byte- or number-identical to the uncached computation, so fingerprints,
-    token estimates and char counts match whether or not a cache is supplied.
+    token estimates and char counts match whether or not a cache is supplied. Entries are
+    immutable, so concurrent lookups are benign; the lock guards the multi-step updates to
+    the hash states and the pruning.
     """
 
-    __slots__ = ("_chain_head", "_chain_parts", "_chain_states", "_entries")
+    __slots__ = ("_chain_head", "_chain_parts", "_chain_states", "_entries", "_lock")
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._entries: dict[int, tuple] = {}
         self._chain_head: str | None = None
         self._chain_parts: list[str] = []
@@ -101,21 +105,22 @@ class WireCache:
         # head_json[:-1] + ",[" + compact items joined by "," + "]]". UTF-8 encodes per
         # character, so the hash can be fed piecewise. The state after each message is
         # kept, so a prefix that extends the last one hashes only the new messages.
-        if head_json != self._chain_head:
-            self._chain_head = head_json
-            self._chain_parts = []
-            self._chain_states = [hashlib.sha256((head_json[:-1] + ",[").encode())]
         parts = list(map(_COMPACT, self._lookup(messages)))
-        chain, states = self._chain_parts, self._chain_states
-        shared = self._shared_prefix(parts)
-        if shared < len(chain) and shared < len(parts):
-            self._truncate_chain(shared)
-        for part in parts[len(chain) :]:
-            state = states[-1].copy()
-            state.update(("," + part if chain else part).encode())
-            chain.append(part)
-            states.append(state)
-        final = states[len(parts)].copy()
+        with self._lock:
+            if head_json != self._chain_head:
+                self._chain_head = head_json
+                self._chain_parts = []
+                self._chain_states = [hashlib.sha256((head_json[:-1] + ",[").encode())]
+            chain, states = self._chain_parts, self._chain_states
+            shared = self._shared_prefix(parts)
+            if shared < len(chain) and shared < len(parts):
+                self._truncate_chain(shared)
+            for part in parts[len(chain) :]:
+                state = states[-1].copy()
+                state.update(("," + part if chain else part).encode())
+                chain.append(part)
+                states.append(state)
+            final = states[len(parts)].copy()
         final.update(b"]]")
         return final.hexdigest()
 
@@ -133,15 +138,16 @@ class WireCache:
         del self._chain_states[length + 1 :]
 
     def sync(self, messages) -> None:
-        for key in self._entries.keys() - set(map(id, messages)):
-            del self._entries[key]
-        if self._chain_parts:
-            # Keep only the hashed prefix still at the head of the live history, holding
-            # the live strings, so the chain cannot outgrow the live message set.
-            parts = list(map(_COMPACT, self._lookup(messages[: len(self._chain_parts)])))
-            shared = self._shared_prefix(parts)
-            self._truncate_chain(shared)
-            self._chain_parts[:] = parts[:shared]
+        with self._lock:
+            for key in self._entries.keys() - set(map(id, messages)):
+                del self._entries[key]
+            if self._chain_parts:
+                # Keep only the hashed prefix still at the head of the live history, holding
+                # the live strings, so the chain cannot outgrow the live message set.
+                parts = list(map(_COMPACT, self._lookup(messages[: len(self._chain_parts)])))
+                shared = self._shared_prefix(parts)
+                self._truncate_chain(shared)
+                self._chain_parts[:] = parts[:shared]
 
 
 def fingerprint(value):
