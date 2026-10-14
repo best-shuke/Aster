@@ -72,7 +72,7 @@ class WireCache:
         # mostly cached history costs a pointer walk plus serializing only the misses.
         entries = list(map(self._entries.get, map(id, messages), repeat(_MISS)))
         stale = map(is_not, map(_MESSAGE, entries), messages)
-        for index in compress(range(len(entries)), stale):
+        for index in list(compress(range(len(entries)), stale)):  # Scan fully, then fill.
             entries[index] = self._entry(messages[index])
         return entries
 
