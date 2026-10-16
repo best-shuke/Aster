@@ -33,9 +33,19 @@ uv sync --locked
 - 任务计划、子代理调度、文件修改冲突检测与检查点恢复。
 - 上下文预算、压缩、会话保存、历史恢复及执行轨迹。
 - MCP 客户端、skills 发现、环境切换、模板与 workflow 扩展接口。
+- 环境：按环境独立选择技能、MCP 服务与工具权限；`multi-agent` 环境运行多个独立成员代理，支持直接通信、任务依赖、共享产物与会议/辩论/独立调查等可选协议。
 - 交互式终端、命令补全和 Markdown 输出。
 
-常用命令：`/help`、`/status`、`/new`、`/history`、`/resume`、`/trace`、`/tasks`、`/skills`、`/environment`。完整说明可在运行后用 `/help` 查看。
+常用命令：`/help`、`/status`、`/new`、`/history`、`/resume`、`/trace`、`/tasks`、`/skills`、`/environment`（`/env`）、`/multiagents`。完整说明可在运行后用 `/help` 与 `/env help` 查看。
+
+```text
+/env create product-team --template multi-agent
+/env use product-team
+/env skills add brainstorming
+/env status
+设计并开发一个 AI 产品，让团队自主决定如何调研、讨论、分工和执行。
+/env exit
+```
 
 ## 开发与测试
 
@@ -51,6 +61,7 @@ TERM=xterm-256color uv run --locked python -m unittest discover -s tests
 ## 文档
 
 - [架构](docs/architecture.md)：模块划分与执行链路。
+- [环境](docs/environments.md)：环境定义、能力继承、多代理运行时与协作协议。
 - [配置入口](docs/configuration.md)：模型、目录与扩展设置。
 - [Git 与私密数据](docs/git-policy.md)：提交边界。
 - [贡献指南](CONTRIBUTING.md)：开发和验证方式。

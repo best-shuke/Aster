@@ -729,8 +729,12 @@ class ResourceLimitTests(TeamTestCase):
                 team("send_message", to=["engineer"], kind="request", content="second"),
                 team("wait", timeout=30),
                 say("done"),
+                team("wait", timeout=30),
+                lambda messages, tools: say(
+                    "next turn: " + last_tool(messages)["data"]["items"][0]["content"]
+                ),
             ),
-            engineer=Steps(say("first handled")),
+            engineer=Steps(say("first handled"), say("second handled")),
         )
         conversation = self.team_conversation(script, "tight")
         self.ask(conversation)
@@ -738,6 +742,8 @@ class ResourceLimitTests(TeamTestCase):
         self.assertIn("reached its limit of 1 activations", script.seen("main"))
         self.assertEqual(len(script.requests["engineer"]), 1)
         self.assertTrue(self.events(conversation, "budget_exhausted"))
+        # The interim notice did not settle the request: the next turn delivers the answer.
+        self.assertEqual(self.ask(conversation, "continue"), "next turn: second handled")
 
     def test_activation_timeout_reports_failure_to_requester(self):
         def slow(messages, tools):
@@ -932,6 +938,26 @@ class PermissionTests(TeamTestCase):
         ]
         self.assertNotIn("messages", results[0]["data"])
         self.assertEqual(results[1]["error"]["code"], "not_found")
+
+    def test_delegate_workers_of_a_member_inherit_its_restrictions(self):
+        self.define(
+            "delegating",
+            agents={
+                "lead": {
+                    "description": "delegates",
+                    "tools": ["read", "delegate"],
+                    "write_paths": ["out"],
+                }
+            },
+        )
+        conversation = self.team_conversation(TeamScript(main=Steps(say("ok"))), "delegating")
+        member = conversation.team.member("lead")
+        delegate = member.tools.registry["delegate"].handler.__self__
+        workers = delegate.runner.execute_workspace.__self__
+        self.assertEqual(workers.protected_paths, conversation.team.protected_paths)
+        self.assertEqual(workers.write_roots, ((self.workspace / "out").resolve(),))
+        with self.assertRaises(PermissionError):
+            workers.path(str(self.settings.session_file))
 
     def test_task_depth_limit_stops_recursive_delegation(self):
         self.define("shallow", limits={"max_task_depth": 1})

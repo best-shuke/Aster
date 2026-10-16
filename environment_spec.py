@@ -86,7 +86,7 @@ class TeamLimits:
     max_meeting_rounds: int = 4
     max_task_depth: int = 3
     max_tool_calls_per_agent: int = 80
-    token_budget_per_agent: int = 400_000
+    token_budget_per_agent: int = 1_000_000
     activation_timeout_seconds: int = 600
 
 

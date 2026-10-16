@@ -13,7 +13,7 @@
 | `DEEPSEEK_MCP_ENABLED` / `DEEPSEEK_MCP_CONFIG_FILE` | MCP 开关与本地配置路径 |
 | `DEEPSEEK_SKILLS_ENABLED` / `DEEPSEEK_SKILLS_DIR` | 技能发现开关与目录 |
 | `DEEPSEEK_ENVIRONMENTS_DIR` | 用户能力环境定义目录 |
-| `DEEPSEEK_ENVIRONMENT_STATE_DIR` | 本地能力环境信任与运行状态目录 |
+| `DEEPSEEK_ENVIRONMENT_STATE_DIR` | 本地能力环境信任、审计与多代理会话状态目录 |
 | `DEEPSEEK_TEMPLATES_DIR` / `DEEPSEEK_WORKFLOWS_DIR` | 本地模板与 workflow 目录 |
 | `DEEPSEEK_WEBSEARCH_ENABLED` | 联网搜索开关 |
 | `DEEPSEEK_WEBSEARCH_BASE_URL` / `DEEPSEEK_WEBSEARCH_API_KEY` | 搜索服务地址与独立凭据 |
@@ -23,6 +23,8 @@
 | `DEEPSEEK_MAX_SUBAGENTS` | 子代理并发上限 |
 
 配置先从进程环境读取；本地文件只补充尚未设置的值。直接运行 Python 入口时，未指定配置文件则读取当前目录的 `.env`；`bin/agent` 则使用程序目录的 `.env`。
+
+环境定义的字段、技能与 MCP 的继承规则、团队成员与资源限制见 [环境](environments.md)；示例在 [docs/examples](examples/)。
 
 默认资源目录位于程序目录下：`skills/`、`environments/`、`templates/`、`workflows/` 和 `mcp.json`。本仓库的这些目录只放说明文件，实际资源默认被 Git 忽略。自定义路径与其他参数的具体解析方式见源码；为避免相对路径歧义，可使用自己机器上的绝对路径。
 

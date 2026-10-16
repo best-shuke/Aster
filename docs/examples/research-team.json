@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "name": "research-team",
+  "description": "Research team: independent researchers, an analyst and a critic",
+  "type": "multi-agent",
+  "inherit_skills": true,
+  "inherit_mcp": true,
+  "mcp_config_file": "research-team/mcp.json",
+  "skills": {
+    "team-collaboration": true,
+    "independent-debate": true,
+    "brainstorming": true,
+    "research": true,
+    "critical-thinking": false
+  },
+  "mcp": {
+    "search": {"tools": ["search", "fetch_*"]},
+    "github": {"tools": ["get_*", "search_*", "list_*"], "deny": ["*_delete*"]}
+  },
+  "agents": {
+    "researcher": {
+      "description": "Finds and verifies sources on the web and in GitHub.",
+      "instructions": "You are a careful researcher. Cite every source you used and separate facts from inference.",
+      "tools": ["read", "grep", "find", "ls", "websearch"],
+      "skills": ["research", "team-collaboration"],
+      "mcp": {"search": "*", "github": ["search_*", "get_*"]}
+    },
+    "analyst": {
+      "description": "Turns findings into comparisons and numbers; writes the report.",
+      "instructions": "You analyse evidence and write concise, structured reports in docs/research.",
+      "tools": ["read", "grep", "find", "ls", "write", "edit"],
+      "write_paths": ["docs/research"]
+    },
+    "critic": {
+      "description": "Challenges conclusions and checks that claims are supported.",
+      "instructions": "You look for weak evidence, missing alternatives and overclaiming.",
+      "tools": ["read", "grep", "ls"],
+      "skills": ["independent-debate", "team-collaboration"]
+    }
+  },
+  "limits": {
+    "max_concurrent_agents": 3,
+    "max_meeting_rounds": 3,
+    "max_activations_per_agent": 6,
+    "token_budget_per_agent": 300000
+  },
+  "collaboration": {
+    "protocols": ["meeting", "debate", "brainstorm", "independent_research", "review_decision"],
+    "dynamic_agents": false
+  }
+}

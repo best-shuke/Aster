@@ -187,6 +187,8 @@ class TeamRuntime:
         self._stop_activations()
         with self.lock:
             self._close_store()
+            # Never keep acting on the previous session if the new one cannot be opened.
+            self.state, self.session_id, self.members = None, None, {}
             store = TeamStore(self.state_dir, self.environment, session_id)
             data, notices = store.open(self.settings.workspace)
             self.store, self.state, self.session_id = store, TeamState(data), session_id
@@ -229,7 +231,9 @@ class TeamRuntime:
 
     def begin_turn(self, deadline: float) -> None:
         with self.lock:
-            self._require_open()
+            if self.state is None:
+                # The session could not be opened; main still works, team actions report why.
+                return
             self.accepting = True
             self.turn_deadline = deadline
             self.nudges = 0
@@ -373,6 +377,7 @@ class TeamRuntime:
                     hop=item.get("hop", 0) + 1,
                     depth=item.get("depth", 0),
                     auto=True,
+                    interim=True,
                 )
 
     def _drain(self) -> None:
@@ -478,6 +483,8 @@ class TeamRuntime:
             state="completed" if ok else result.status,
             activity="finished",
             title=title,
+            model_requests=record["turn"]["model_requests"],
+            tool_calls=record["turn"]["tool_calls"],
             error={"code": result.status, "message": result.error} if result.error else None,
         )
 
@@ -656,6 +663,7 @@ class TeamRuntime:
         hop,
         depth,
         auto=False,
+        interim=False,
     ):
         message = self.state.add_message(
             sender=sender,
@@ -667,8 +675,10 @@ class TeamRuntime:
             hop=hop,
             depth=depth,
             auto=auto,
+            interim=interim,
         )
-        if reply_to is not None:
+        # An interim notice ("queued until my next turn") does not settle the request.
+        if reply_to is not None and not interim:
             original = self.state.data["messages"].get(reply_to)
             if original is not None and sender not in original["replied_by"]:
                 original["replied_by"].append(sender)

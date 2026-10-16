@@ -369,3 +369,49 @@ class EnvironmentCommandTests(EditorTestCase):
             handle_command(conversation, console, "/multiagents")
         self.assertEqual(conversation.environment_id, "user:multi-agent")
         self.assertEqual(output.getvalue().count("已创建默认多代理环境"), 1)
+
+
+class ShippedResourceTests(EditorTestCase):
+    """The documented examples and built-in templates must stay valid definitions."""
+
+    def test_documented_examples_resolve(self):
+        examples = ROOT / "docs" / "examples"
+        for name in ("research", "critical-thinking"):
+            skill(self.settings.skills_dir / name, name)
+        servers = json.loads(self.baseline_mcp.read_text())
+        servers["mcpServers"]["github"] = {"url": "https://github.example.invalid/mcp"}
+        self.baseline_mcp.write_text(json.dumps(servers), encoding="utf-8")
+        for path in examples.glob("*.json"):
+            target = self.program / path.name
+            target.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        resources = examples / "research-team"
+        (self.program / "research-team").mkdir()
+        for path in resources.iterdir():
+            (self.program / "research-team" / path.name).write_text(path.read_text())
+        with patch.dict("os.environ", {"SEARCH_MCP_TOKEN": "synthetic"}):
+            team = self.store.resolve("research-team")
+            self.assertTrue(team.multi_agent)
+            self.assertEqual(set(team.servers), {"search", "github"})
+            self.assertFalse(team.mcp_scope.permits("github", "repo_delete_all"))
+            self.assertEqual(team.notes, ())
+            solo = self.store.resolve("solo-writer")
+        self.assertFalse(solo.policy.permits("exec"))
+        self.assertEqual(solo.active_skills, {"writing", "brainstorming"})
+
+    def test_builtin_templates_and_skills_load(self):
+        templates = EnvironmentEditor(self.store).templates()
+        self.assertEqual(set(templates), {"single-agent", "multi-agent"})
+        result = self.editor.create("crew", template="multi-agent")
+        catalog = self.store.skill_catalog(result.environment)
+        self.assertEqual(catalog.diagnostics, [])
+        self.assertEqual(
+            {item.name for item in catalog.skills},
+            {
+                "team-collaboration",
+                "task-delegation",
+                "independent-debate",
+                "brainstorming",
+                "conflict-resolution",
+                "team-retrospective",
+            },
+        )

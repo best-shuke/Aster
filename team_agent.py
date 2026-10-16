@@ -63,7 +63,15 @@ class BudgetedClient:
         self._agent = agent
 
     def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
         return getattr(self._inner, name)
+
+    def fork(self, *, settings, cache_stats=None) -> "BudgetedClient":
+        # Delegate workers of a member spend from the member's budget.
+        return BudgetedClient(
+            fork_client(self._inner, settings, cache_stats), self._runtime, self._agent
+        )
 
     def complete(self, messages, tools=None, on_content=None, timeout=180, **kwargs):
         try:
@@ -158,16 +166,17 @@ class MemberAgent:
             if name in names and name not in ATTACHED
         }
         tools.policy = ToolPolicy(names, runtime.base_tools.policy.deny)
+        # Restrictions first: delegate workers snapshot this tool set when attached.
+        tools.protected_paths = runtime.protected_paths
+        if spec.write_paths is not None:
+            workspace = runtime.settings.workspace.resolve()
+            tools.write_roots = tuple((workspace / item).resolve() for item in spec.write_paths)
         if "mcp" in names:
             tools.attach_mcp(ScopedMcp(runtime.mcp_manager, mcp_scope(runtime, spec)))
         if "delegate" in names:
             tools.worker_allow = frozenset()
             tools.attach_reasoning(self.client, max_workers=runtime.limits.max_concurrent_agents)
         tools.registry[TEAM_TOOL] = self.team_tool.spec()
-        tools.protected_paths = runtime.protected_paths
-        if spec.write_paths is not None:
-            workspace = runtime.settings.workspace.resolve()
-            tools.write_roots = tuple((workspace / item).resolve() for item in spec.write_paths)
         return tools
 
     def run(self, activation: "Activation") -> "ActivationResult":
