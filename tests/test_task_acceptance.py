@@ -183,3 +183,70 @@ class TaskAcceptanceTests(unittest.TestCase):
             arguments["cwd"] = external
             self.execute("exec", arguments)
             self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+
+    def test_descriptor_redirection_is_not_shell_composition(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        arguments = self.command("from app import answer; assert answer == 42")
+        arguments["command"] += " 2>&1"
+        self.execute("exec", arguments)
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+
+    def test_an_uncounted_composed_check_is_explained(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        arguments = self.command("from app import answer; assert answer == 42")
+        arguments["command"] = "cd . && " + arguments["command"]
+        self.execute("exec", arguments)
+        problem = self.acceptance.validate("已完成并验证。")
+        self.assertIn("was not counted", problem)
+        self.assertIn("cwd argument", problem)
+
+    def test_work_continuing_in_the_background_is_not_verified_yet(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 41\n"})
+        self.assertIn("no successful verification", self.acceptance.validate("已安排。"))
+        self.assertIsNone(self.acceptance.validate("已安排，成员在后台继续。", background=True))
+        self.assertEqual(self.acceptance.status, "background")
+
+
+class BlockerAttributionTests(unittest.TestCase):
+    """Only the agent's own inability marks a task blocked, not a teammate's."""
+
+    def acceptance(self, others=()):
+        acceptance = TaskAcceptance("检查团队结果", TaskContract("answer"), others=others)
+        acceptance.evidence.append({"tool": "exec", "status": "ok"})
+        return acceptance
+
+    def status(self, text, others=("critic", "engineer")):
+        acceptance = self.acceptance(others)
+        self.assertIsNone(acceptance.validate(text))
+        return acceptance.status
+
+    def test_own_inability_is_a_blocker(self):
+        for text in (
+            "无法完成，测试失败。",
+            "由于缺少依赖，无法执行测试。",
+            "我已经修复了一半，但我无法继续：缺少权限。",
+            "I fixed the parser. I cannot proceed without the API key.",
+            "Unable to complete the migration: the database is read-only.",
+            "需要你确认 n=1 时的行为。",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.status(text), "blocked")
+
+    def test_a_teammates_limitation_is_not_the_agents_blocker(self):
+        for text in (
+            # The live run's false positive: the answer reports the critic's gap.
+            "已修复 stats.py，4/4 测试通过。critic 无法执行测试，这一验证缺口由我重新运行测试补上。",
+            "critic只有只读工具，无法执行测试；我已重新运行并通过。",
+            "评审者无法执行测试，我补跑了全部测试。",
+            "The critic is read-only and cannot proceed with running tests; I ran them: 4 passed.",
+            "engineer 报告“无法完成迁移”，随后改用备用方案并已完成。",
+            "Earlier I was blocked by a missing fixture; I added it and all tests pass.",
+            "起初无法执行测试，安装 pytest 后全部通过。",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.status(text), "completed")
+
+    def test_unknown_names_still_count_as_the_agents_own_blocker(self):
+        self.assertEqual(self.status("pytest 无法执行，缺少依赖。", others=()), "blocked")
+        self.assertEqual(self.status("critic 无法执行测试。", others=()), "blocked")
+        self.assertEqual(self.status("critic 无法执行测试。"), "completed")

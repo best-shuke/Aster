@@ -38,6 +38,7 @@ SUBCOMMANDS = frozenset(
         "agents",
         "limits",
         "log",
+        "results",
         "reload",
         "type",
         "help",

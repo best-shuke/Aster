@@ -118,6 +118,8 @@ def handle_command(conversation: Conversation, console: Console, prompt: str) ->
 
 
 def run_interactive(conversation: Conversation, console: Console) -> None:
+    # Another message may follow, so team members can keep working between turns.
+    conversation.team_background = True
     console.execution_provider = lambda: execution_entries(
         conversation.execution_snapshot(), conversation.messages
     )

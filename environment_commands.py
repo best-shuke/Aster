@@ -31,6 +31,7 @@ USAGE = """  /env list                          列出全部环境
   /env agents remove|enable|disable 名称
   /env limits [键=整数|default …]   查看或修改资源限制
   /env log [数量]                    查看团队事件
+  /env results                       查看成员在后台完成的工作和发给主代理的结果（不消耗）
   以上编辑命令默认作用于当前环境；用 --env 名称 指定其他环境。"""
 
 
@@ -239,6 +240,16 @@ class EnvironmentCommands:
         if not lines:
             self.console.info("暂无团队事件。")
         for line in lines:
+            self.console.info(line)
+        return True
+
+    def cmd_results(self, arguments) -> bool:
+        if arguments:
+            raise ValueError("用法：/env results")
+        team = getattr(self.conversation, "team", None)
+        if team is None:
+            raise ValueError("当前环境没有团队运行时（仅 multi-agent 环境有成员结果）")
+        for line in team.result_lines():
             self.console.info(line)
         return True
 

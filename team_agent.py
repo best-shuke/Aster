@@ -24,7 +24,7 @@ from team_state import TeamError
 from team_tools import TeamTool, member_instructions
 from tool_runtime import ExecutionContext, ToolResult
 from tools import ToolPolicy
-from usage import CacheStats
+from usage import CacheStats, uncached_tokens
 
 if TYPE_CHECKING:
     from team_runtime import Activation, ActivationResult, TeamRuntime
@@ -55,7 +55,12 @@ def mcp_scope(runtime: "TeamRuntime", spec: AgentSpec) -> McpScope:
 
 
 class BudgetedClient:
-    """Charges every model request (including summaries) to the member's token budget."""
+    """Charges every model request (including summaries) to the member's token budget.
+
+    A request costs its uncached prompt tokens plus its output, as the provider reports
+    them. Without reported usage the whole request is estimated, which overcounts a
+    cached prefix but never undercounts.
+    """
 
     def __init__(self, inner, runtime: "TeamRuntime", agent: str):
         self._inner = inner
@@ -79,9 +84,8 @@ class BudgetedClient:
         except TeamError as exc:
             raise CompletionError("budget_exhausted", str(exc)) from exc
         response = self._inner.complete(messages, tools, on_content, timeout, **kwargs)
-        usage = (response.get(LOCAL_METADATA) or {}).get("usage") or {}
-        tokens = usage.get("total_tokens")
-        if not isinstance(tokens, int):
+        tokens = uncached_tokens((response.get(LOCAL_METADATA) or {}).get("usage"))
+        if tokens is None:
             tokens = (
                 estimate_tokens(messages)
                 + estimate_tokens(tools or [])

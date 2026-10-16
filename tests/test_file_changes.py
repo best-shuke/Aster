@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from file_changes import FileMergeConflict, FileTransaction, merge_text
+from file_changes import EditLedger, FileMergeConflict, FileTransaction, merge_text, text_digest
 from file_state import FileChangedError, atomic_write_text, file_digest, file_lock
 from tool_runtime import ArtifactStore, ExecutionContext
 
@@ -260,3 +260,39 @@ class FileLockTests(unittest.TestCase):
             )
         self.assertEqual(process.stdout.strip(), "timeout")
         self.assertEqual(self.target.read_text(), "original")
+
+
+class EditLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.path = Path("/workspace/app.py")
+
+    def test_merges_only_onto_content_another_agent_wrote(self):
+        ledger = EditLedger()
+        base = ledger.remember("alpha\nbeta\n")
+        ledger.record_write(self.path, "ALPHA\nbeta\n")
+        self.assertTrue(ledger.written_by_agent(self.path, text_digest("ALPHA\nbeta\n")))
+        self.assertEqual(
+            ledger.merge(self.path, base, "ALPHA\nbeta\n", "alpha\nBETA\n"), "ALPHA\nBETA\n"
+        )
+        with self.assertRaisesRegex(FileChangedError, "Read it again"):
+            ledger.merge(self.path, base, "alpha\nbeta\nuser\n", "alpha\nBETA\n")
+        with self.assertRaisesRegex(FileChangedError, "Read it again"):
+            ledger.merge(self.path, text_digest("unseen"), "ALPHA\nbeta\n", "alpha\nBETA\n")
+        with self.assertRaisesRegex(FileMergeConflict, "changes conflict"):
+            ledger.merge(self.path, base, "ALPHA\nbeta\n", "Alpha\nbeta\n")
+
+    def test_writes_are_tracked_per_path(self):
+        ledger = EditLedger()
+        ledger.record_write(self.path, "content")
+        self.assertFalse(
+            ledger.written_by_agent(Path("/workspace/other.py"), text_digest("content"))
+        )
+        self.assertFalse(ledger.written_by_agent(self.path, None))
+
+    def test_memory_stays_bounded_and_keeps_recent_contents(self):
+        ledger = EditLedger(limit_chars=10)
+        old = ledger.remember("123456")
+        recent = ledger.remember("abcdef")
+        self.assertIsNone(ledger.content(old))
+        self.assertEqual(ledger.content(recent), "abcdef")
+        self.assertLessEqual(ledger.size, 10)

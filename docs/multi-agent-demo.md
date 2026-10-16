@@ -36,7 +36,7 @@ agent --environment stats-team --yes \
 
 结果：`stats.py` 两处修复，4/4 测试通过；`SPEC.md` 与测试文件未改动。三个代理各自独立调用模型：engineer 1 次激活、14 次工具调用，critic 1 次激活、22 次工具调用。
 
-该轮命令以退出码 1 结束：原有的验收启发式把最终答复中“critic 无法执行测试”一句判定为“受阻”。这是 `task_acceptance.py` 的误判，与团队运行时无关。
+该轮命令以退出码 1 结束：原有的验收启发式把最终答复中“critic 无法执行测试”一句判定为“受阻”。这是 `task_acceptance.py` 的误判，与团队运行时无关；现在“无法…”类表述按句中最近的主语归属，描述成员（或其他第三方）的限制不再使主代理的任务受阻。
 
 ## 第二轮：恢复会话后的直接求助与正式会议
 
@@ -71,7 +71,30 @@ printf '%s\n' "/resume latest" \
 - 主代理在需要权衡时召集了正式会议；两人第 1 轮各自给出带证据的立场，第 2 轮 engineer 因预算缺席，会议照常收敛，主持人（main）记录 5 条决策并生成会议产物。
 - engineer 预算耗尽后由 main 实现（`stats.py` 守卫、`SPEC.md` 契约一行、3 个新测试），critic 只读复核后同意交付；最终 7/7 测试通过。
 
-本次演示把 `token_budget_per_agent` 设为 25 万，researcher 与 engineer 都触发了限制，运行时自动替它们答复，没有代理无限等待。预算按每次请求的完整输入（含缓存命中部分）加输出计算，因此默认值已提高到 100 万。
+本次演示把 `token_budget_per_agent` 设为 25 万，researcher 与 engineer 都触发了限制，运行时自动替它们答复，没有代理无限等待。当时预算按每次请求的完整输入（含缓存命中部分）加输出计算；之后改为只计未命中缓存的输入加输出，默认值相应设为 40 万。
+
+## 后台工作：两次提问之间（另一次运行）
+
+在一个 `slugify` 小工作区（`max_activations_per_agent=3`、`max_tool_calls_per_agent=20`、`token_budget_per_agent=150000`、`background_seconds=600`）中交互运行，要求主代理安排 engineer 实现 `max_length` 并补测试、由 critic 依赖评审，且不要等待：
+
+```text
++  24.2s main      task_created        t1 → engineer
++  28.5s main      task_created        t2 → critic，depends_on=[t1]
++  35.5s main      background_started  主代理答复，本轮记为“后台继续”；engineer 仍在工作
++ 109.5s engineer  task_updated        t1 completed；critic 随即被唤醒
++ 117.7s engineer  message_sent        request → main：请裁决规格中的一处矛盾
++ 232.0s critic    task_updated        t2 completed：有条件通过
++ 232.0s main      background_ended    团队空闲，主代理有 3 条新结果
++ 247.5s main      turn_started        用户：“看看结果”
++ 276.7s main      message_sent        reply → engineer：裁决规格矛盾
++ 280.0s main      decision_recorded   记录裁决
+```
+
+- 主代理答复后，状态栏显示“团队后台 1 人工作中”；每个成员结束时输入框上方打印一行，团队空闲后状态栏改为“团队 3 条新结果 /env results”。
+- `/env results` 列出两名成员的报告与发给主代理的 3 项结果，且不消耗它们；下一轮主代理收到“后台期间发生了什么”的提示，用 `team action=wait` 读取结果，回答了 engineer 的问题并记录决策。
+- 此前一次只修复 `slugify` 的交互运行中，engineer 6 次模型请求、8 次工具调用共计 8604 个非缓存 token（该会话提示缓存命中率 90.9%），旧口径会把每次请求的完整输入都计入。
+
+这两次交互运行还暴露了两处验收问题，均已修复：成员仍在后台修改代码时，主代理的“change”任务会被要求立即验证尚未完成的修改；`cd … && python -m unittest … 2>&1` 不被计为验证时，提示没有说明原因（`2>&1` 本身也被误当作命令组合）。
 
 ## 演示暴露并已修复的问题
 

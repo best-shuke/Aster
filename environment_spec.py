@@ -86,8 +86,10 @@ class TeamLimits:
     max_meeting_rounds: int = 4
     max_task_depth: int = 3
     max_tool_calls_per_agent: int = 80
-    token_budget_per_agent: int = 1_000_000
+    token_budget_per_agent: int = 400_000
     activation_timeout_seconds: int = 600
+    # Interactive sessions: how long members keep working after main answers (0 = never).
+    background_seconds: int = 1800
 
 
 LIMIT_RANGES = {
@@ -101,6 +103,7 @@ LIMIT_RANGES = {
     "max_tool_calls_per_agent": (1, 5000),
     "token_budget_per_agent": (1000, 50_000_000),
     "activation_timeout_seconds": (10, 7200),
+    "background_seconds": (0, 86400),
 }
 
 

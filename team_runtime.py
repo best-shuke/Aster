@@ -3,9 +3,11 @@
 Members run as independent activations on worker threads, each with its own private
 context and model client. Delivering an item to an idle member schedules it; items for a
 busy member wait in its mailbox and are coalesced into its next activation. Team activity
-is bound to the main agent's turn: begin_turn resumes pending work and end_turn pauses
-it (running activations are cancelled and their items requeued). Every change is
-persisted, so a later turn, /resume, or a new process continues where work stopped.
+starts with the main agent's turn: begin_turn resumes pending work. When the turn ends,
+work still running either pauses (activations are cancelled and their items requeued) or,
+in interactive sessions, continues in the background until the team is idle, the
+background time limit passes, or the next turn takes it over. Every change is persisted,
+so a later turn, /resume, or a new process continues where work stopped.
 """
 
 import threading
@@ -37,6 +39,12 @@ from tool_runtime import ExecutionContext
 ITEMS_PER_ACTIVATION = 12
 GROUP_LIMIT = 20
 STOP_GRACE_SECONDS = 10
+BACKGROUND_ACTIVITY = 50
+
+
+def _one_line(value, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 class MainOrigin:
@@ -119,6 +127,11 @@ class TeamRuntime:
         self.notices: list[str] = []
         self.main_origin = MainOrigin()
         self._titles: dict[str, str] = {}
+        # Whether this turn's leftover work may continue after it ends.
+        self.turn_background = False
+        # Token of the running background period; a stale timer must not end a newer one.
+        self._background: object | None = None
+        self._background_timer: threading.Timer | None = None
 
     # Members -------------------------------------------------------------------------
 
@@ -130,6 +143,10 @@ class TeamRuntime:
                 if dynamic is not None and record["status"] != "removed":
                     specs.append(self._dynamic_spec(name, dynamic))
         return specs
+
+    def member_names(self) -> tuple[str, ...]:
+        with self.lock:
+            return tuple(spec.name for spec in self.member_specs())
 
     def member_spec(self, name: str) -> AgentSpec | None:
         return next((spec for spec in self.member_specs() if spec.name == name), None)
@@ -183,6 +200,7 @@ class TeamRuntime:
 
     def open_session(self, session_id: str) -> list[str]:
         with self.lock:
+            self._end_background("stopped")
             self.accepting = False
         # Workers need the lock to finish, so never wait for them while holding it.
         self._stop_activations()
@@ -207,6 +225,7 @@ class TeamRuntime:
 
     def close(self) -> None:
         with self.lock:
+            self._end_background("stopped")
             self.accepting = False
         self._stop_activations()
         with self.lock:
@@ -221,8 +240,8 @@ class TeamRuntime:
                 self.store = None
 
     @contextmanager
-    def turn(self, deadline: float):
-        self.begin_turn(deadline)
+    def turn(self, deadline: float, *, background: bool = False):
+        self.begin_turn(deadline, background=background)
         interrupted = True
         try:
             yield
@@ -230,13 +249,16 @@ class TeamRuntime:
         finally:
             self.end_turn(interrupted=interrupted)
 
-    def begin_turn(self, deadline: float) -> None:
+    def begin_turn(self, deadline: float, *, background: bool = False) -> None:
         with self.lock:
             if self.state is None:
                 # The session could not be opened; main still works, team actions report why.
                 return
+            # Work still running in the background continues as part of this turn.
+            self._end_background("resumed")
             self.accepting = True
             self.turn_deadline = deadline
+            self.turn_background = background
             self.nudges = 0
             data = self.state.data
             data["turn"] = {"number": data["turn"]["number"] + 1, "messages": 0}
@@ -258,6 +280,11 @@ class TeamRuntime:
         with self.lock:
             if self.state is None:
                 return 0
+            if self.turn_background and not interrupted and self._start_background():
+                self._event("turn_ended", MAIN, paused=0, interrupted=False, background=True)
+                self._persist()
+                self.changed.notify_all()
+                return 0
             self.accepting = False
             paused = len(self.activations)
         self._stop_activations()
@@ -265,19 +292,143 @@ class TeamRuntime:
             if self.state is not None:
                 self._event("turn_ended", MAIN, paused=paused, interrupted=interrupted)
                 self._persist()
+                self._team_progress()
             self.changed.notify_all()
         return paused
 
-    def _stop_activations(self) -> None:
+    # Background work ----------------------------------------------------------------
+
+    def _start_background(self) -> bool:
+        """Keep the team working after main answered (caller holds the lock)."""
+        seconds = self.limits.background_seconds
+        if seconds <= 0 or self._quiescent():
+            return False
+        # Activations get their own timeouts; the timer bounds the whole period.
+        self.turn_deadline = float("inf")
+        token = self._background = object()
+        timer = threading.Timer(seconds, self._background_expired, args=(token,))
+        timer.daemon = True
+        self._background_timer = timer
+        summary = self._summary()
+        self.state.data["background"] = {
+            "status": "running",
+            "started_at": now(),
+            "ended_at": None,
+            "seconds": seconds,
+            "turn": self.state.data["turn"]["number"],
+            "activity": [],
+            "reported": False,
+        }
+        self._event(
+            "background_started",
+            MAIN,
+            working=summary["working"],
+            queued=summary["queued"],
+            seconds=seconds,
+        )
+        timer.start()
+        self._team_progress()
+        return True
+
+    @property
+    def in_background(self) -> bool:
+        return self._background is not None
+
+    def _end_background(self, reason: str) -> None:
+        """End the background period: finished, expired, resumed or stopped (lock held)."""
+        if self._background is None:
+            return
+        self._background = None
+        timer, self._background_timer = self._background_timer, None
+        if timer is not None:
+            timer.cancel()
+        if reason != "resumed":
+            self.accepting = False
+        if self.state is None:
+            return
+        record = self.state.data.get("background") or {}
+        record.update(status=reason, ended_at=now())
+        unread = len(self.state.mailbox(MAIN))
+        summary = self._summary()
+        self._event("background_ended", MAIN, reason=reason, unread=unread)
+        notice = None
+        if reason == "stopped" and (summary["working"] or summary["queued"]):
+            notice = "团队后台工作随会话关闭而暂停；剩余工作在下次打开该会话的第一轮继续"
+        elif reason == "finished":
+            notice = "团队后台工作已完成" + (f"，主代理有 {unread} 条新结果" if unread else "")
+        elif reason == "expired":
+            notice = (
+                f"团队后台工作达到 {record.get('seconds', 0) // 60} 分钟时限，已暂停；"
+                "剩余工作在下一轮继续"
+            )
+        if notice is not None:
+            notice += "。/env results 查看，或直接继续对话。"
+        self._team_progress(notice=notice)
+
+    def _background_expired(self, token: object) -> None:
         with self.lock:
-            running = list(self.activations.values())
-            for activation in running:
-                activation.cancelled.set()
+            if self._background is not token or self.state is None:
+                return
+            self._end_background("expired")
+            running = self._cancel_running()
+            self._persist()
+        self._join(running)
+        with self.lock:
+            if self.state is not None:
+                self._persist()
+            self.changed.notify_all()
+
+    def _background_activity(self, name: str, title: str, result: ActivationResult) -> None:
+        record = self.state.data.get("background") or {}
+        activity = record.setdefault("activity", [])
+        activity.append(
+            {
+                "at": now(),
+                "agent": name,
+                "title": title,
+                "status": result.status,
+                "report": excerpt(result.final or result.error or "", 600),
+            }
+        )
+        del activity[:-BACKGROUND_ACTIVITY]
+        label = "完成" if result.status == "ok" else f"结束（{result.status}）"
+        self._team_progress(notice=f"后台 · {name} {label}：{title}")
+
+    def _team_progress(self, notice: str | None = None) -> None:
+        """Tell the UI what the team does while main is not in a turn (lock held)."""
+        if self.on_progress is None or self.state is None:
+            return
+        summary = self._summary()
+        record = self.state.data.get("background") or {}
+        event = {
+            "phase": "team",
+            "background": record.get("status") if record else None,
+            "working": summary["working"],
+            "queued": summary["queued"],
+            "unread": len(self.state.mailbox(MAIN)),
+        }
+        if notice:
+            event["notice"] = notice
+        with suppress(Exception):
+            self.on_progress(event)
+
+    def _cancel_running(self) -> list[Activation]:
+        running = list(self.activations.values())
+        for activation in running:
+            activation.cancelled.set()
+        return running
+
+    def _join(self, running: list[Activation]) -> None:
         deadline = time.monotonic() + STOP_GRACE_SECONDS
         for activation in running:
             thread = activation.thread
             if thread is not None and thread is not threading.current_thread():
                 thread.join(max(0, deadline - time.monotonic()))
+
+    def _stop_activations(self) -> None:
+        with self.lock:
+            running = self._cancel_running()
+        self._join(running)
 
     # Scheduling ---------------------------------------------------------------------
 
@@ -442,6 +593,8 @@ class TeamRuntime:
                     del self.activations[activation.agent]
                 if self.state is not None and activation.session == self.session_id:
                     self._drain()
+                    if self._background is not None and self._quiescent():
+                        self._end_background("finished")
                     self._persist()
                 self.changed.notify_all()
 
@@ -497,6 +650,8 @@ class TeamRuntime:
             tool_calls=record["turn"]["tool_calls"],
             error={"code": result.status, "message": result.error} if result.error else None,
         )
+        if self._background is not None:
+            self._background_activity(name, title, result)
 
     def waits_for(self, name: str) -> set[str]:
         """Agents this one waits on: unanswered requests, delegated tasks, its protocols."""
@@ -1381,11 +1536,29 @@ class TeamRuntime:
             if not summary["working"] and not summary["queued"]:
                 return None
             self.nudges += 1
+            working = ", ".join(summary["working"] + summary["queued"])
+            if self.turn_background and self.limits.background_seconds > 0:
+                return (
+                    f"Held once, not rejected: team members are still working ({working}). Call "
+                    "team action=wait to collect their results, or team action=cancel to stop "
+                    "them. To answer now anyway, send your final answer again and it is accepted; "
+                    "the members then keep working in the background and what they send you "
+                    "arrives next turn, so tell the user."
+                )
             return (
-                "Team members are still working ("
-                + ", ".join(summary["working"] + summary["queued"])
-                + "). Call team action=wait to collect their results, or team action=cancel to "
-                "stop them, before giving your final answer."
+                f"Team members are still working ({working}). Call team action=wait to collect "
+                "their results, or team action=cancel to stop them, before giving your final "
+                "answer."
+            )
+
+    def continues_in_background(self) -> bool:
+        """True when work still running keeps going after this turn ends."""
+        with self.lock:
+            return (
+                self.state is not None
+                and self.turn_background
+                and self.limits.background_seconds > 0
+                and not self._quiescent()
             )
 
     def main_instructions(self) -> str:
@@ -1408,6 +1581,19 @@ class TeamRuntime:
                 parts.append("Queued work resumes now: " + ", ".join(summary["queued"]) + ".")
             if summary["running_protocols"]:
                 parts.append("Running protocols: " + ", ".join(summary["running_protocols"]) + ".")
+            background = self.state.data.get("background")
+            if background and not background.get("reported"):
+                background["reported"] = True
+                done = [
+                    f"{item['agent']} {item['status']} ({item['title']})"
+                    for item in background.get("activity", [])[-10:]
+                ]
+                parts.append(
+                    "Since your last answer the team worked in the background"
+                    + (f": {'; '.join(done)}" if done else "")
+                    + ("; still running." if background["status"] == "running" else ".")
+                    + (" Call team action=wait to read what arrived for you." if unread else "")
+                )
             if self.notices:
                 parts.append("Recovered: " + "; ".join(self.notices) + ".")
                 self.notices = []
@@ -1427,7 +1613,7 @@ class TeamRuntime:
                 lines.append(
                     f"  成员 {name} · {record['status']} · 待处理 {len(self.state.mailbox(name))}"
                     f" · 本轮激活 {turn['activations']} · 工具 {turn['tool_calls']}"
-                    f" · 约 {turn['tokens']} tokens"
+                    f" · 约 {turn['tokens']} 非缓存 tokens"
                     + (" · 动态成员" if "dynamic" in record else "")
                 )
             for task in data["tasks"].values():
@@ -1448,6 +1634,71 @@ class TeamRuntime:
                 lines.append(
                     f"  共享产物 {len(data['artifacts'])} 个；决策 {len(data['decisions'])} 条"
                 )
+            if data.get("background"):
+                lines.append("  " + self._background_line())
+            return lines
+
+    def _background_line(self) -> str:
+        record = self.state.data.get("background") or {}
+        status = record.get("status")
+        if status == "running":
+            summary = self._summary()
+            elapsed = max(0, int(now() - record.get("started_at", now())))
+            return (
+                f"后台：进行中 · 已 {elapsed // 60} 分 {elapsed % 60} 秒"
+                f" · 工作中 {', '.join(summary['working']) or '无'}"
+                + (f" · 排队 {', '.join(summary['queued'])}" if summary["queued"] else "")
+            )
+        ended = record.get("ended_at")
+        stamp = time.strftime("%H:%M:%S", time.localtime(ended)) if ended else "?"
+        return {
+            "finished": f"后台：{stamp} 完成，团队已空闲",
+            "expired": f"后台：{stamp} 达到 {record.get('seconds', 0) // 60} 分钟时限后暂停；"
+            "剩余工作在下一轮继续",
+            "resumed": f"后台：{stamp} 由下一轮接管",
+            "stopped": f"后台：{stamp} 会话关闭时暂停；剩余工作在下一轮继续",
+        }.get(status, f"后台：{status}")
+
+    def result_lines(self) -> list[str]:
+        """What the team produced for the user to look at, without consuming main's inbox."""
+        with self.lock:
+            if self.state is None:
+                return ["团队会话未打开"]
+            data = self.state.data
+            record = data.get("background")
+            lines = [self._background_line()] if record else ["尚无后台工作记录。"]
+            for item in (record or {}).get("activity", []):
+                stamp = time.strftime("%H:%M:%S", time.localtime(item["at"]))
+                report = f" — {_one_line(item['report'], 200)}" if item.get("report") else ""
+                lines.append(
+                    f"  {stamp} {item['agent']} {item['status']} · {item['title']}{report}"
+                )
+            mailbox = self.state.mailbox(MAIN)
+            if not mailbox:
+                lines.append("主代理没有未读结果。")
+                return lines
+            lines.append(f"发给主代理的 {len(mailbox)} 项结果（下一轮由主代理读取）：")
+            for item in mailbox:
+                entry = self._main_item(item)
+                kind = entry["type"]
+                if kind in {"message", "request", "reply"}:
+                    lines.append(
+                        f"  [{entry.get('id')}] {kind} · {entry.get('sender')}："
+                        + _one_line(entry.get("content"), 300)
+                    )
+                elif kind in {"task", "task_update", "review"}:
+                    detail = entry.get("result") or (entry.get("notes") or [""])[-1]
+                    lines.append(
+                        f"  [{entry.get('id')}] 任务 {entry.get('status')} · "
+                        f"{entry.get('assignee') or '未分配'} · {entry.get('title')}："
+                        + _one_line(detail, 300)
+                    )
+                elif kind == "protocol":
+                    lines.append(
+                        f"  协议 {entry.get('step')}：" + _one_line(entry.get("text"), 300)
+                    )
+                else:
+                    lines.append(f"  {kind}")
             return lines
 
     def event_lines(self, limit: int) -> list[str]:

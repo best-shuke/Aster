@@ -1688,3 +1688,60 @@ class TaskInputMonitorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TeamBackgroundDisplayTests(unittest.TestCase):
+    def test_toolbar_shows_background_work_then_unread_results(self):
+        console = Console()
+        console.update_team(
+            {
+                "phase": "team",
+                "background": "running",
+                "working": ["engineer"],
+                "queued": ["critic"],
+            }
+        )
+        self.assertIn("团队后台 2 人工作中", console._toolbar())
+        console.update_team({"phase": "team", "background": "finished", "unread": 2})
+        self.assertIn("团队 2 条新结果 /env results", console._toolbar())
+        console.update_team(None)
+        self.assertNotIn("团队", console._toolbar())
+
+    def test_notices_print_from_any_thread(self):
+        output = io.StringIO()
+        console = Console()
+        console.colors = False
+        with patch("sys.stdout", output):
+            worker = threading.Thread(
+                target=console.task_update,
+                args=({"phase": "team", "background": "finished", "notice": "团队后台工作已完成"},),
+            )
+            worker.start()
+            worker.join()
+        self.assertIn("◆ 团队后台工作已完成", output.getvalue())
+
+    def test_task_end_keeps_background_members_running(self):
+        output = io.StringIO()
+        console = Console()
+        console.interactive = False
+        console.colors = False
+        with patch("sys.stdout", output):
+            console.task_start("build")
+            console.task_update(
+                {
+                    "phase": "subagent",
+                    "agent_id": "engineer",
+                    "title": "t1 Build",
+                    "mode": "team",
+                    "state": "running",
+                    "activity": "model",
+                }
+            )
+            console.task_update(
+                {"phase": "team", "background": "running", "working": ["engineer"], "queued": []}
+            )
+            console.task_end(True)
+        self.assertEqual(console._agents["engineer"]["state"], "background")
+        self.assertIn("后台继续", output.getvalue())
+        self.assertIn("团队成员在后台继续工作（engineer）", output.getvalue())
+        self.assertNotIn("已取消", output.getvalue())

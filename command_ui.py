@@ -513,6 +513,9 @@ def update_effort(conversation: Conversation, console: Console, arguments: list[
 
 def sync_environment_ui(conversation: Conversation, console: Console) -> None:
     settings = conversation.settings
+    if getattr(conversation, "team", None) is None:
+        # Leaving a team environment drops its status from the toolbar.
+        console.update_team(None)
     console.environment_name = conversation.environment_id or "默认"
     console.last_environment_name = (
         conversation.last_environment_id if conversation.environment_id is None else None

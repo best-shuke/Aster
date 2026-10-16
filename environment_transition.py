@@ -12,6 +12,7 @@ from client_runtime import ClientState, configure_client, fork_client
 from config import Settings, system_prompt
 from contracts import Message, ToolRun
 from environments import ResolvedEnvironment
+from file_changes import EditLedger
 from mcp_client import McpManager
 from mcp_scope import ScopedMcp
 from reasoning import RolePromptCache
@@ -213,6 +214,7 @@ class EnvironmentTransition:
             tools.worker_allow = environment.worker_tools if environment else frozenset()
             tools.worker_roles = dict(environment.role_prompts) if environment else {}
             tools.role_loader = None
+            tools.edit_ledger = None
             tools.cache_scope = environment.environment_id if environment else "default"
             if not settings.websearch_enabled:
                 tools.detach("websearch")
@@ -295,6 +297,8 @@ class EnvironmentTransition:
                 session.with_name(f"{session.name}.lock"),
             )
         )
+        # Main and every member share one ledger, so their concurrent edits merge.
+        tools.edit_ledger = EditLedger()
         self.team = TeamRuntime(
             environment,
             settings=settings,

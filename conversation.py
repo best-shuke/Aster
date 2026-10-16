@@ -72,6 +72,8 @@ class Conversation:
         self.active_environment: ResolvedEnvironment | None = None
         # Multi-agent environments attach a team runtime; None keeps single-agent behavior.
         self.team: TeamRuntime | None = None
+        # Interactive sessions let members keep working between the user's messages.
+        self.team_background = False
         if mcp_manager is None and tools is not None and "mcp" in tools.registry:
             mcp_manager = tools.registry["mcp"].handler.__self__
         self.mcp_manager = mcp_manager
@@ -747,6 +749,7 @@ class Conversation:
             workspace=self.settings.workspace,
             ignored_paths=(self.settings.session_file, self.sessions.directory),
             deadline=deadline,
+            others=self.team.member_names() if self.team is not None else (),
         )
         note = acceptance.instructions()
         team_note = self.team.turn_context() if self.team is not None else ""
@@ -774,17 +777,25 @@ class Conversation:
                 problem = final_validator(content)
                 if problem:
                     return problem
+            background = False
             if self.team is not None:
                 problem = self.team.final_answer_problem()
                 if problem:
                     return problem
-            return acceptance.validate(content)
+                # Members' unfinished edits are verified when their work is done, not now.
+                background = self.team.continues_in_background()
+            return acceptance.validate(content, background=background)
 
         runtime = TaskRuntime(
             self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache
         )
-        # Members work only while the main agent's turn runs; pending work resumes next turn.
-        with self.team.turn(deadline) if self.team is not None else nullcontext():
+        # Members work during the turn; afterwards they pause or, interactively, continue
+        # in the background. Pending work resumes next turn.
+        with (
+            self.team.turn(deadline, background=self.team_background)
+            if self.team is not None
+            else nullcontext()
+        ):
             return self._run_turn(
                 runtime,
                 acceptance,

@@ -181,6 +181,11 @@ def recover(state: dict) -> list[str]:
             notices.append(f"{name} 有 {len(inflight)} 项中断的工作已重新排队")
         if agent.get("status") in {"running", "queued", "stopping"}:
             agent["status"] = "idle"
+    background = state.get("background")
+    if isinstance(background, dict) and background.get("status") == "running":
+        # The process ended while members worked in the background.
+        background.update(status="stopped", ended_at=now())
+        notices.append("上次进程退出时团队仍在后台工作，未完成的部分已重新排队")
     pending = sum(len(items) for items in state.get("mailboxes", {}).values())
     if pending:
         notices.append(f"恢复团队会话：{pending} 项待处理")

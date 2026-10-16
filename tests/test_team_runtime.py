@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import ClassVar
 from unittest.mock import patch
 
+from context_budget import LOCAL_METADATA
 from conversation import Conversation
 from deepseek_client import CompletionError
 from environments import EnvironmentStore
@@ -28,6 +29,7 @@ from tests.team_support import (
 from tests.test_environments import ROOT, EnvironmentTestCase
 from tools import CodingTools
 from ui import Console
+from usage import uncached_tokens
 
 MEMBERS = {
     "researcher": {
@@ -801,6 +803,44 @@ class ResourceLimitTests(TeamTestCase):
         failed = self.events(conversation, "activation_failed")
         self.assertEqual(failed[0]["status"], "timeout")
 
+    def test_token_budget_counts_uncached_prompt_and_output_tokens(self):
+        usage = {
+            "prompt_tokens": 50_000,
+            "completion_tokens": 400,
+            "prompt_tokens_details": {"cached_tokens": 48_000},
+        }
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["critic"], kind="request", content="review"),
+                team("wait", timeout=30),
+                say("done"),
+            ),
+            critic=Steps({**say("reviewed"), LOCAL_METADATA: {"usage": usage}}),
+        )
+        conversation = self.team_conversation(script)
+        self.ask(conversation)
+        turn = conversation.team.state.data["agents"]["critic"]["turn"]
+        self.assertEqual((turn["tokens"], turn["model_requests"]), (2_400, 1))
+
+    def test_uncached_tokens_prefers_reported_usage(self):
+        self.assertEqual(
+            uncached_tokens(
+                {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": {"cached_tokens": 90},
+                }
+            ),
+            17,
+        )
+        self.assertEqual(uncached_tokens({"prompt_tokens": 100, "completion_tokens": 7}), 107)
+        self.assertEqual(
+            uncached_tokens({"total_tokens": 50, "prompt_tokens_details": {"cached_tokens": 30}}),
+            20,
+        )
+        self.assertIsNone(uncached_tokens({"prompt_tokens_details": "?"}))
+        self.assertIsNone(uncached_tokens(None))
+
     def test_concurrency_limit_queues_members(self):
         self.define("serial", limits={"max_concurrent_agents": 1})
         lock = threading.Lock()
@@ -831,15 +871,16 @@ class ResourceLimitTests(TeamTestCase):
             {"researcher", "engineer", "critic"},
         )
 
-    def test_concurrent_edits_to_one_file_detect_conflicts(self):
+    def editors(self, right_edit, *, after_left=None):
+        """left and right read shared.txt; left edits first, then right edits its stale read."""
         self.define(
             "editors",
             agents={
                 "left": {"description": "edits", "tools": ["read", "edit"]},
-                "right": {"description": "edits", "tools": ["read", "edit"]},
+                "right": {"description": "edits", "tools": ["read", "edit", "write"]},
             },
         )
-        (self.workspace / "shared.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+        (self.workspace / "shared.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
         right_read, left_done = threading.Event(), threading.Event()
 
         def left(messages, tools):
@@ -851,6 +892,8 @@ class ResourceLimitTests(TeamTestCase):
                 return use(
                     "edit", path="shared.txt", edits=[{"oldText": "alpha", "newText": "ALPHA"}]
                 )
+            if after_left is not None:
+                after_left()
             left_done.set()
             return say("left edited")
 
@@ -861,17 +904,14 @@ class ResourceLimitTests(TeamTestCase):
             if step == 1:
                 right_read.set()
                 left_done.wait(5)
-                return use(
-                    "edit", path="shared.txt", edits=[{"oldText": "beta", "newText": "BETA"}]
-                )
-            if step == 2:
-                assert last_tool(messages)["error"]["code"] == "file_changed"
+                return right_edit
+            if step == 2 and last_tool(messages)["status"] != "ok":
                 return use("read", path="shared.txt")
             if step == 3:
                 return use(
-                    "edit", path="shared.txt", edits=[{"oldText": "beta", "newText": "BETA"}]
+                    "edit", path="shared.txt", edits=[{"oldText": "gamma", "newText": "GAMMA"}]
                 )
-            return say("right edited after rebasing")
+            return say("right edited")
 
         def main(messages, tools):
             if len(script.requests["main"]) == 1:
@@ -883,8 +923,47 @@ class ResourceLimitTests(TeamTestCase):
         script = TeamScript(main=main, left=left, right=right)
         conversation = self.team_conversation(script, "editors")
         self.assertEqual(self.ask(conversation), "both edited")
-        self.assertEqual((self.workspace / "shared.txt").read_text(), "ALPHA\nBETA\n")
-        self.assertIn("file_changed", script.seen("right"))
+        right_results = [
+            json.loads(message["content"])
+            for message in script.requests["right"][-1]["messages"]
+            if message["role"] == "tool"
+        ]
+        return (self.workspace / "shared.txt").read_text(), right_results[1]
+
+    def test_concurrent_edits_to_one_file_merge_automatically(self):
+        content, result = self.editors(
+            use("edit", path="shared.txt", edits=[{"oldText": "beta", "newText": "BETA"}])
+        )
+        self.assertEqual(content, "ALPHA\nBETA\ngamma\n")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("merged with theirs", result["data"]["merged"])
+
+    def test_full_file_write_from_a_stale_read_keeps_a_teammates_edit(self):
+        content, result = self.editors(
+            use("write", path="shared.txt", content="alpha\nbeta\ngamma\ndelta\n")
+        )
+        self.assertEqual(content, "ALPHA\nbeta\ngamma\ndelta\n")
+        self.assertIn("merged", result["data"])
+
+    def test_overlapping_concurrent_edits_conflict_and_rebase(self):
+        content, result = self.editors(
+            use("edit", path="shared.txt", edits=[{"oldText": "alpha", "newText": "Alpha"}])
+        )
+        self.assertEqual(result["error"]["code"], "file_changed")
+        self.assertIn("changes conflict", result["error"]["message"])
+        self.assertEqual(content, "ALPHA\nbeta\nGAMMA\n")
+
+    def test_changes_from_outside_the_team_are_never_merged(self):
+        def user_edits():
+            path = self.workspace / "shared.txt"
+            path.write_text(path.read_text() + "user line\n", encoding="utf-8")
+
+        content, result = self.editors(
+            use("edit", path="shared.txt", edits=[{"oldText": "beta", "newText": "BETA"}]),
+            after_left=user_edits,
+        )
+        self.assertEqual(result["error"]["code"], "file_changed")
+        self.assertEqual(content, "ALPHA\nbeta\nGAMMA\nuser line\n")
 
 
 class PermissionTests(TeamTestCase):
@@ -1249,3 +1328,295 @@ class TeamProgressTests(TeamTestCase):
         self.assertEqual(finished[-1]["tool_calls"], 1)
         detail = Console._tool_detail("team", {"action": "send_message", "to": ["critic", "main"]})
         self.assertEqual(detail, "send_message → critic, main")
+
+
+def wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class BackgroundWorkTests(TeamTestCase):
+    """Interactive sessions: members keep working between the user's messages."""
+
+    def background_conversation(self, script, events=None, name="crew"):
+        script.settings = self.settings
+        conversation = Conversation(
+            self.settings,
+            script,
+            CodingTools(
+                self.workspace, on_task_update=(events.append if events is not None else None)
+            ),
+        )
+        conversation.environments = EnvironmentStore(
+            self.settings, conversation.templates, user_dir=self.user
+        )
+        self.addCleanup(conversation.close)
+        conversation.apply_environment(conversation.environments.resolve(f"program:{name}"))
+        conversation.team_background = True
+        return conversation
+
+    def background(self, conversation):
+        return conversation.team.state.data.get("background") or {}
+
+    def test_members_keep_working_after_main_answers_and_results_reach_the_next_turn(self):
+        release, events = threading.Event(), []
+
+        def engineer(messages, tools):
+            release.wait(10)
+            return say("Widget built and tested.")
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build the widget"),
+                say("The engineer is building it in the background."),
+                # Nudged once while the engineer still works; main chooses to answer anyway.
+                say("The engineer is building it in the background."),
+                team("wait", timeout=30),
+                lambda messages, tools: say(
+                    "Result: " + last_tool(messages)["data"]["items"][0]["content"]
+                ),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script, events)
+        self.assertEqual(self.ask(conversation), "The engineer is building it in the background.")
+        self.assertIn("keep working in the background", script.seen("main"))
+        runtime = conversation.team
+        self.assertTrue(runtime.in_background)
+        self.assertIn("engineer", runtime.activations)
+        self.assertEqual(self.background(conversation)["status"], "running")
+        self.assertIn("后台：进行中", "\n".join(runtime.result_lines()))
+
+        release.set()
+        self.assertTrue(wait_until(lambda: self.background(conversation)["status"] == "finished"))
+        self.assertFalse(runtime.in_background)
+        lines = "\n".join(runtime.result_lines())
+        self.assertIn("engineer ok", lines)
+        self.assertIn("Widget built and tested.", lines)
+        self.assertIn("发给主代理的 1 项结果", lines)
+        notices = [event["notice"] for event in events if event.get("notice")]
+        self.assertTrue(any("engineer 完成" in notice for notice in notices))
+        self.assertTrue(any("后台工作已完成" in notice for notice in notices))
+
+        # Viewing the results did not consume them: main reads them next turn.
+        self.assertEqual(
+            self.ask(conversation, "What happened?"), "Result: Widget built and tested."
+        )
+        self.assertIn("worked in the background", script.seen("main"))
+
+    def test_background_work_pauses_at_the_time_limit_and_resumes_next_turn(self):
+        self.define("brief", limits={"background_seconds": 1})
+        calls = []
+
+        def engineer(messages, tools):
+            calls.append(1)
+            if len(calls) == 1:
+                script.options()["cancelled"].wait(10)
+                raise CompletionError("cancelled", "Model request cancelled")
+            return say("Finished after resuming.")
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Long job"),
+                say("Started."),
+                say("Started."),
+                team("wait", timeout=30),
+                lambda messages, tools: say(last_tool(messages)["data"]["items"][0]["content"]),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script, name="brief")
+        self.ask(conversation)
+        self.assertTrue(wait_until(lambda: self.background(conversation)["status"] == "expired"))
+        self.assertTrue(wait_until(lambda: not conversation.team.activations))
+        mailbox = conversation.team.state.data["mailboxes"]["engineer"]
+        self.assertTrue(mailbox and mailbox[0]["redelivered"])
+        self.assertIn("分钟时限后暂停", "\n".join(conversation.team.result_lines()))
+        self.assertEqual(self.ask(conversation, "continue"), "Finished after resuming.")
+
+    def test_next_turn_takes_over_work_still_running_in_the_background(self):
+        release = threading.Event()
+
+        def engineer(messages, tools):
+            release.wait(10)
+            return say("Done while you were typing.")
+
+        def release_then_wait(messages, tools):
+            release.set()
+            return team("wait", timeout=30)
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build"),
+                say("Building."),
+                say("Building."),
+                release_then_wait,
+                lambda messages, tools: say(last_tool(messages)["data"]["items"][0]["content"]),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        self.ask(conversation)
+        self.assertTrue(conversation.team.in_background)
+        self.assertEqual(self.ask(conversation, "Any news?"), "Done while you were typing.")
+        self.assertEqual(self.background(conversation)["status"], "resumed")
+        self.assertEqual(len(script.requests["engineer"]), 1)
+
+    def test_interrupted_turns_still_pause_members(self):
+        started = threading.Event()
+
+        def engineer(messages, tools):
+            started.set()
+            script.options()["cancelled"].wait(10)
+            raise CompletionError("cancelled", "Model request cancelled")
+
+        def interrupt(messages, tools):
+            started.wait(10)
+            raise KeyboardInterrupt
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build"),
+                interrupt,
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        with self.assertRaises(KeyboardInterrupt):
+            self.ask(conversation)
+        self.assertFalse(conversation.team.in_background)
+        self.assertFalse(conversation.team.activations)
+        self.assertTrue(self.events(conversation, "activation_cancelled"))
+        self.assertNotIn("background", conversation.team.state.data)
+
+    def test_a_background_period_cut_short_by_the_process_is_recovered(self):
+        release = threading.Event()
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build"),
+                say("Building."),
+                say("Building."),
+            ),
+            engineer=lambda messages, tools: (release.wait(10), say("built"))[1],
+        )
+        conversation = self.background_conversation(script)
+        self.ask(conversation)
+        session_id = conversation.session_id
+        runtime = conversation.team
+        # Simulate a crash: the state file still says the background period runs.
+        with runtime.lock:
+            runtime._background = None
+            runtime.accepting = False
+            runtime._persist()
+        release.set()
+        self.assertTrue(wait_until(lambda: not runtime.activations))
+        with runtime.lock:
+            runtime.state.data["background"]["status"] = "running"
+            runtime._persist()
+        runtime.store.close()
+        runtime.store = None
+        conversation.team = None
+        conversation.close()
+
+        restarted = Conversation(self.settings, TeamScript(), CodingTools(self.workspace))
+        restarted.environments = EnvironmentStore(
+            self.settings, restarted.templates, user_dir=self.user
+        )
+        self.addCleanup(restarted.close)
+        restarted.resume(session_id)
+        self.assertEqual(restarted.team.state.data["background"]["status"], "stopped")
+        self.assertIn("后台工作", restarted.recovery_notice or "")
+
+    def test_results_command_shows_background_work_without_consuming_it(self):
+        release = threading.Event()
+        script = TeamScript(
+            main=Steps(
+                team("create_task", title="Collect facts", assignee="researcher"),
+                say("Researcher is on it."),
+                say("Researcher is on it."),
+            ),
+            researcher=lambda messages, tools: (release.wait(10), say("facts: A, B"))[1],
+        )
+        conversation = self.background_conversation(script)
+        self.ask(conversation)
+        self.assertTrue(conversation.team.in_background)
+        release.set()
+        self.assertTrue(wait_until(lambda: not conversation.team.in_background))
+        console = Console()
+        console.interactive = False
+        output = io.StringIO()
+        with patch("sys.stdout", output), patch("sys.stderr", output):
+            handle_command(conversation, console, "/env results")
+            handle_command(conversation, console, "/env status")
+        text = output.getvalue()
+        self.assertIn("researcher ok · t1 Collect facts — facts: A, B", text)
+        self.assertIn("任务 completed · researcher · Collect facts：facts: A, B", text)
+        self.assertIn("团队已空闲", text)
+        self.assertEqual(len(conversation.team.state.mailbox("main")), 1)
+
+    def test_main_may_hand_off_a_change_whose_edits_are_still_in_progress(self):
+        release = threading.Event()
+        (self.workspace / "app.py").write_text("answer = 41\n", encoding="utf-8")
+
+        def engineer(messages, tools):
+            if not turn_messages(messages)[1:]:
+                return use("write", path="app.py", content="answer = 42\n")
+            release.wait(10)
+            return say("Fixed and tested.")
+
+        def write_started(messages, tools):
+            # Answer only once the engineer's first edit has landed.
+            wait_until(lambda: "42" in (self.workspace / "app.py").read_text())
+            return say("已安排 engineer 修复，它在后台继续。")
+
+        script = TeamScript(
+            main=Steps(
+                team("create_task", title="Fix app.py", assignee="engineer"),
+                write_started,
+                say("已安排 engineer 修复，它在后台继续。"),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        conversation.ask("修复 app.py：交给 engineer，不要等待它完成")
+        self.assertEqual(conversation.last_outcome["status"], "background")
+        self.assertTrue(conversation.team.in_background)
+        release.set()
+        self.assertTrue(wait_until(lambda: not conversation.team.in_background))
+
+    def test_background_can_be_disabled_per_environment(self):
+        self.define("bound", limits={"background_seconds": 0})
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build"),
+                say("Paused."),
+                say("Paused."),
+            ),
+            engineer=lambda messages, tools: (
+                script.options()["cancelled"].wait(10),
+                say("late"),
+            )[1],
+        )
+        conversation = self.background_conversation(script, name="bound")
+        self.ask(conversation)
+        self.assertFalse(conversation.team.in_background)
+        self.assertNotIn("keep working in the background", script.seen("main"))
+
+
+class AcceptanceAttributionTests(TeamTestCase):
+    def test_reporting_a_members_limitation_does_not_block_mains_answer(self):
+        script = TeamScript(
+            main=Steps(
+                team("create_task", title="Review", assignee="critic"),
+                team("wait", timeout=30),
+                say("已修复并验证。critic 只有只读工具，无法执行测试，我重新运行了测试。"),
+            ),
+            critic=Steps(say("Looks right; I could not run the tests.")),
+        )
+        conversation = self.team_conversation(script)
+        conversation.ask("检查团队结果")
+        self.assertEqual(conversation.last_outcome["status"], "completed")

@@ -23,6 +23,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from pygments.lexer import Lexer
 from rich.console import Console as RichConsole
@@ -80,6 +81,7 @@ _TASK_STATES = {
     "error": ("失败", "red"),
     "blocked": ("受阻", "yellow"),
     "incomplete": ("未完成", "yellow"),
+    "background": ("后台继续", "cyan"),
 }
 
 _SLASH_COMMANDS = {
@@ -474,6 +476,8 @@ class Console:
         self._task_elapsed = 0.0
         self._todos: list[dict[str, str]] = []
         self._agents: dict[str, dict[str, Any]] = {}
+        # Latest team status from the team runtime, shown while main is not in a turn.
+        self._team: dict[str, Any] | None = None
         self._context: dict[str, Any] | None = None
         self._performance: dict[str, dict[str, Any]] = {}
         self.mcp_provider: Callable[[], list[dict[str, Any]]] | None = None
@@ -549,6 +553,9 @@ class Console:
         if self.last_environment_name:
             environment += f"（上次 {self.last_environment_name}）"
         parts = [environment, context, self._tps_label()]
+        team = self._team_label()
+        if team:
+            parts.insert(1, team)
         if width >= 70 or not context:
             parts.append(f"MCP {self.mcp_status}")
         if width >= 110:
@@ -559,6 +566,37 @@ class Console:
                 _ellipsize(part, width) for part in (environment, context, self._tps_label())
             )
         return _ellipsize(line, width)
+
+    def _team_label(self) -> str:
+        team = self._team
+        if not team:
+            return ""
+        if team.get("background") == "running":
+            busy = {*team.get("working", []), *team.get("queued", [])}
+            label = f"团队后台 {len(busy)} 人工作中"
+            if team.get("unread"):
+                label += f" · {team['unread']} 条新结果"
+            return label
+        if team.get("unread"):
+            return f"团队 {team['unread']} 条新结果 /env results"
+        return ""
+
+    def update_team(self, event: dict[str, Any] | None) -> None:
+        """Team status from the runtime; it may arrive on a member's thread."""
+        self._team = dict(event) if event else None
+        notice = (event or {}).get("notice")
+        if notice:
+            # While the prompt is up, patch_stdout prints this above it.
+            print(self.style(f"  ◆ {notice}", CYAN))
+        self._refresh_task()
+        self._invalidate_prompt()
+
+    def _invalidate_prompt(self) -> None:
+        session = self._prompt_session
+        app = getattr(session, "app", None) if session is not None else None
+        if app is not None and app.is_running:
+            # Thread safe: redraws the bottom toolbar with the new team status.
+            app.invalidate()
 
     def style(self, text: str, *codes: str) -> str:
         if not self.colors:
@@ -913,7 +951,11 @@ class Console:
                 self._prompt_session = session
         else:
             session = self._prompt_session
-        return session.prompt(prompt)
+        if isolated:
+            return session.prompt(prompt)
+        # Team members may report from their threads while the prompt waits for input.
+        with patch_stdout(raw=True):
+            return session.prompt(prompt)
 
     @contextmanager
     def interrupt_on_escape(self):
@@ -1472,6 +1514,9 @@ class Console:
 
     def task_update(self, event: dict[str, Any]) -> None:
         phase = event.get("phase")
+        if phase == "team":
+            self.update_team(event)
+            return
         if phase == "plan":
             self._task_title = event["title"]
             self._todos = [dict(item) for item in event["steps"]]
@@ -1534,6 +1579,7 @@ class Console:
         self._task_activity = ""
         self._todos.clear()
         self._agents.clear()
+        self._team = None
         self._prompt_session = None
         self._context = dict(context) if context is not None else None
         self._performance.clear()
@@ -1578,8 +1624,14 @@ class Console:
         self._task_activity = ""
         if self._task_started is not None:
             self._task_elapsed = time.monotonic() - self._task_started
+        background = (self._team or {}).get("background") == "running"
+        continuing = []
         for agent_id, agent in tuple(self._agents.items()):
             if agent.get("state") in {"pending", "running"}:
+                if background and agent.get("mode") == "team":
+                    continuing.append(agent_id)
+                    self._agents[agent_id] = {**agent, "state": "background"}
+                    continue
                 self._agents[agent_id] = {
                     **agent,
                     "state": "cancelled",
@@ -1603,6 +1655,16 @@ class Console:
                 self.style(
                     f"  ◇ {label} · {_duration(time.monotonic() - self._task_started)}", YELLOW
                 )
+            )
+        if background:
+            team = self._team or {}
+            names = list(
+                dict.fromkeys(continuing + team.get("working", []) + team.get("queued", []))
+            )
+            self.info(
+                "团队成员在后台继续工作"
+                + (f"（{'、'.join(names)}）" if names else "")
+                + "；完成时会在这里提示，/env results 查看结果。"
             )
         self._task_started = None
 
