@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "search": {
+      "url": "https://search.example.invalid/mcp",
+      "headers": {"Authorization": "Bearer ${SEARCH_MCP_TOKEN}"}
+    }
+  }
+}

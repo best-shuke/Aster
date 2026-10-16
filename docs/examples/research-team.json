@@ -5,7 +5,7 @@
   "type": "multi-agent",
   "inherit_skills": true,
   "inherit_mcp": true,
-  "mcp_config_file": "research-team/mcp.json",
+  "mcp_config_file": "research-team/servers.json",
   "skills": {
     "team-collaboration": true,
     "independent-debate": true,
