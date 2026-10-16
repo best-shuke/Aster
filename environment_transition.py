@@ -16,6 +16,9 @@ from mcp_client import McpManager
 from mcp_scope import ScopedMcp
 from reasoning import RolePromptCache
 from skills import SkillCatalog
+from team_runtime import TeamRuntime
+from team_state import MAIN
+from team_tools import TeamTool
 from tool_runtime import ExecutionContext
 from tools import CodingTools
 from usage import CacheStats
@@ -43,6 +46,7 @@ class ConversationState:
     tool_runs: list[ToolRun]
     last_outcome: dict | None
     recovery_notice: str | None
+    team: TeamRuntime | None
 
     @classmethod
     def capture(cls, conversation: "Conversation") -> "ConversationState":
@@ -62,6 +66,7 @@ class PreparedEnvironment:
     instructions: str | None
     prompt: str
     cache_stats: CacheStats | None
+    team: TeamRuntime | None = None
 
 
 class McpRoleLoader:
@@ -98,6 +103,7 @@ class EnvironmentTransition:
         self.restore_data = restore
         self.on_connect = on_connect
         self.manager: McpManager | None = None
+        self.team: TeamRuntime | None = None
         self.warnings: list[str] = []
 
     def run(self, environment: ResolvedEnvironment | None) -> list[str]:
@@ -153,6 +159,8 @@ class EnvironmentTransition:
         settings = environment.settings if environment else conversation._baseline_settings
         skills = self.prepare_skills(environment, settings)
         tools = self.prepare_tools(environment, settings, skills)
+        if tools is not None and environment is not None and environment.multi_agent:
+            self.prepare_team(environment, settings, skills, tools)
         instructions = None if environment else conversation._baseline_instructions
         prompt = conversation._compose_prompt(
             settings,
@@ -160,6 +168,7 @@ class EnvironmentTransition:
             skills,
             instructions,
             environment.prompt_text if environment else None,
+            self.team,
         )
         old_stats = client_state.cache_stats
         stats = CacheStats() if isinstance(old_stats, CacheStats) else old_stats
@@ -170,7 +179,7 @@ class EnvironmentTransition:
         if tools is not None:
             self.prepare_workers(tools, environment, settings, skills, stats)
         return PreparedEnvironment(
-            environment, settings, skills, tools, instructions, prompt, stats
+            environment, settings, skills, tools, instructions, prompt, stats, self.team
         )
 
     def prepare_skills(self, environment, settings) -> SkillCatalog | None:
@@ -270,6 +279,35 @@ class EnvironmentTransition:
             )
         return tools
 
+    def prepare_team(self, environment, settings, skills, tools) -> None:
+        if not tools.policy.permits("team"):
+            self.warnings.append("环境工具策略禁用了 team，团队成员不可用；当前只有主代理工作。")
+            return
+        session = settings.session_file
+        # Members must not read private state: team sessions, trust records, and the
+        # main conversation's own session files.
+        protected = tuple(
+            path.resolve()
+            for path in (
+                settings.environment_state_dir,
+                session,
+                session.with_name(f"{session.stem}.sessions"),
+                session.with_name(f"{session.name}.lock"),
+            )
+        )
+        self.team = TeamRuntime(
+            environment,
+            settings=settings,
+            client=self.conversation.client,
+            base_tools=tools,
+            mcp_manager=self.manager,
+            skills=skills,
+            state_dir=settings.environment_state_dir,
+            protected_paths=protected,
+            on_progress=tools.on_task_update,
+        )
+        tools.registry["team"] = TeamTool(self.team, MAIN).spec()
+
     def prepare_workers(self, tools, environment, settings, skills, stats) -> None:
         names = tuple(item["function"]["name"] for item in tools.worker_definitions)
         tools.worker_instructions = (
@@ -300,6 +338,7 @@ class EnvironmentTransition:
         conversation.environment_ref = environment.reference if environment else None
         conversation.active_environment = environment
         conversation.mcp_manager = self.manager
+        conversation.team = prepared.team
         conversation.last_environment_id = environment_id
         conversation.last_environment_ref = conversation.environment_ref
         self.commit_messages(prepared)
@@ -395,6 +434,17 @@ class EnvironmentTransition:
                     self.warnings.append(conversation.tools.worker_status.last_error)
             except Exception as exc:
                 self.warnings.append(f"环境已提交，但子代理状态同步失败：{exc}")
+        if previous.team is not None and previous.team is not prepared.team:
+            try:
+                previous.team.close()
+            except Exception as exc:
+                self.warnings.append(f"环境已提交，但旧团队会话关闭失败：{exc}")
+        if prepared.team is not None:
+            try:
+                for notice in prepared.team.open_session(conversation.session_id):
+                    self.warnings.append(f"团队会话：{notice}")
+            except Exception as exc:
+                self.warnings.append(f"团队会话无法打开，成员暂不可用：{exc}")
         if previous.mcp_manager is not None:
             try:
                 previous.mcp_manager.close()

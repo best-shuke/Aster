@@ -36,6 +36,7 @@ from sessions import SessionStore
 from skills import SkillCatalog
 from task_acceptance import TaskAcceptance, TaskContract
 from task_runtime import RUNTIME_INSTRUCTIONS, TaskRuntime
+from team_runtime import TeamRuntime
 from templates import SavedTemplate, TemplateStore
 from tool_runtime import ToolResult, validate
 from tools import CodingTools, ToolPolicy
@@ -69,6 +70,8 @@ class Conversation:
         self.last_environment_id: str | None = None
         self.last_environment_ref: dict | None = None
         self.active_environment: ResolvedEnvironment | None = None
+        # Multi-agent environments attach a team runtime; None keeps single-agent behavior.
+        self.team: TeamRuntime | None = None
         if mcp_manager is None and tools is not None and "mcp" in tools.registry:
             mcp_manager = tools.registry["mcp"].handler.__self__
         self.mcp_manager = mcp_manager
@@ -384,6 +387,12 @@ class Conversation:
         self.last_environment_ref = self.environment_ref
         if self.tools is not None:
             self.tools.reset_task()
+        if self.team is not None:
+            # A new conversation session is a new, isolated environment session.
+            try:
+                self.recovery_notice = "\n".join(self.team.open_session(self.session_id)) or None
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.recovery_notice = f"团队会话无法打开，成员暂不可用：{exc}"
         stats = getattr(self.client, "cache_stats", None)
         if isinstance(stats, CacheStats):
             stats.reset()
@@ -425,6 +434,8 @@ class Conversation:
     def close(self) -> None:
         with self._tool_runs_lock:
             self._execution_closed = True
+        if self.team is not None:
+            self.team.close()
         if self.tools is not None:
             self.tools.close()
         if self.mcp_manager is not None:
@@ -454,7 +465,7 @@ class Conversation:
         self.save()
 
     @staticmethod
-    def _compose_prompt(settings, tools, skills, instructions, prompt_text=None) -> str:
+    def _compose_prompt(settings, tools, skills, instructions, prompt_text=None, team=None) -> str:
         names = (
             tuple(item["function"]["name"] for item in tools.definitions)
             if tools is not None
@@ -474,6 +485,8 @@ class Conversation:
             skill_section = skills.prompt_section()
             if skill_section:
                 content += "\n\n" + skill_section
+        if team is not None:
+            content += "\n\n" + team.main_instructions()
         return content
 
     def reload_prompt(self) -> None:
@@ -484,6 +497,7 @@ class Conversation:
             self.skills,
             self.system_instructions,
             self.active_environment.prompt_text if self.active_environment else None,
+            self.team,
         )
 
     def refresh_skills(self) -> None:
@@ -735,6 +749,7 @@ class Conversation:
             deadline=deadline,
         )
         note = acceptance.instructions()
+        team_note = self.team.turn_context() if self.team is not None else ""
         self.last_outcome = acceptance.outcome()
         self.messages.append({"role": "user", "content": expanded_prompt})
         # Task-specific context belongs to this turn, never to the shared prefix.
@@ -742,7 +757,8 @@ class Conversation:
             {
                 "role": "system",
                 "content": environment_context(self.settings.workspace)
-                + ("\n\n" + note if note else ""),
+                + ("\n\n" + note if note else "")
+                + ("\n\n" + team_note if team_note else ""),
             }
         )
         try:
@@ -758,11 +774,41 @@ class Conversation:
                 problem = final_validator(content)
                 if problem:
                     return problem
+            if self.team is not None:
+                problem = self.team.final_answer_problem()
+                if problem:
+                    return problem
             return acceptance.validate(content)
 
         runtime = TaskRuntime(
             self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache
         )
+        # Members work only while the main agent's turn runs; pending work resumes next turn.
+        with self.team.turn(deadline) if self.team is not None else nullcontext():
+            return self._run_turn(
+                runtime,
+                acceptance,
+                deadline,
+                on_content,
+                on_response_start,
+                on_response_end,
+                on_progress,
+                on_reasoning,
+                on_tool_result,
+            )
+
+    def _run_turn(
+        self,
+        runtime,
+        acceptance,
+        deadline,
+        on_content,
+        on_response_start,
+        on_response_end,
+        on_progress,
+        on_reasoning,
+        on_tool_result,
+    ) -> str:
         while True:
             try:
                 message = runtime.generate(

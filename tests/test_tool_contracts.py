@@ -8,6 +8,7 @@ from pathlib import Path
 
 from deepseek_client import DeepSeekClient
 from mcp_client import McpManager
+from team_tools import TeamTool
 from tests.support import make_settings
 from tool_runtime import ExecutionContext, ToolResult, validate
 from tools import TOOL_NAMES, WORKER_EXCLUDED, CodingTools, ToolPolicy
@@ -57,6 +58,7 @@ class ToolContractTests(unittest.TestCase):
         self.tools.attach_mcp(manager)
         self.tools.attach_user_input(lambda question, options: {"answer": "choice"})
         self.tools.attach_reasoning(DeepSeekClient(settings), max_workers=2)
+        self.tools.registry["team"] = TeamTool(None, "main").spec()
 
     def test_declared_names_cover_every_registered_and_optional_tool(self):
         self.assertEqual(set(self.tools.registry), TOOL_NAMES)

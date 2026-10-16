@@ -76,12 +76,13 @@ TOOL_NAMES = frozenset(
         "mcp",
         "ask_user",
         "delegate",
+        "team",
     }
 )
 
 # Subagents may never use these, even when an environment grants extra worker tools:
-# workers must not delegate, ask the user, or rewrite the parent task plan.
-WORKER_EXCLUDED = frozenset({"delegate", "ask_user", "update_plan", "monitor"})
+# workers must not delegate, ask the user, rewrite the parent task plan, or join a team.
+WORKER_EXCLUDED = frozenset({"delegate", "ask_user", "update_plan", "monitor", "team"})
 
 
 @dataclass(frozen=True)
@@ -507,6 +508,9 @@ class CodingTools:
         self._global_worker_limit = None
         self.worker_status = WorkerStatus()
         self.role_loader = None
+        # Team members get private session state hidden and, optionally, write scopes.
+        self.protected_paths: tuple[Path, ...] = ()
+        self.write_roots: tuple[Path, ...] | None = None
 
     def _registry_for(
         self,
@@ -545,6 +549,8 @@ class CodingTools:
         self.role_loader = other.role_loader
         self._global_worker_slots = other._global_worker_slots
         self._global_worker_limit = other._global_worker_limit
+        self.protected_paths = other.protected_paths
+        self.write_roots = other.write_roots
 
     @property
     def file_versions(self) -> dict[Path, str | None]:
@@ -817,7 +823,40 @@ class CodingTools:
 
     def path(self, value: str = ".") -> Path:
         path = Path(value).expanduser()
-        return path.resolve() if path.is_absolute() else (self.workspace / path).resolve()
+        resolved = path.resolve() if path.is_absolute() else (self.workspace / path).resolve()
+        if self._protected(resolved):
+            raise PermissionError(f"{resolved} holds private session state and is not accessible")
+        return resolved
+
+    def _protected(self, path: Path) -> bool:
+        for root in self.protected_paths:
+            if path == root or path.is_relative_to(root):
+                return True
+            # atomic_write_text stages content in ".<name>.<id>.tmp" next to the target.
+            if (
+                path.parent == root.parent
+                and path.name.startswith(f".{root.name}.")
+                and path.name.endswith(".tmp")
+            ):
+                return True
+        return False
+
+    def _writable(self, path: Path) -> None:
+        if self.write_roots is not None and not any(
+            path == root or path.is_relative_to(root) for root in self.write_roots
+        ):
+            allowed = ", ".join(str(root) for root in self.write_roots) or "none"
+            raise PermissionError(f"Writing {path} is outside this agent's write scope ({allowed})")
+
+    def _protected_globs(self, root: Path) -> list[str]:
+        globs = []
+        for protected in self.protected_paths:
+            if protected.is_relative_to(root) and protected != root:
+                relative = protected.relative_to(root)
+                temporary = (relative.parent / f".{relative.name}.*.tmp").as_posix()
+                globs += ["--glob", f"!{relative.as_posix()}", "--glob", f"!{relative.as_posix()}/**"]
+                globs += ["--glob", f"!{temporary}"]
+        return globs
 
     def execute(
         self,
@@ -833,6 +872,10 @@ class CodingTools:
             else time.monotonic() + (max_timeout if max_timeout is not None else 3600),
             on_progress=on_progress,
         )
+        return self._execute(tool_call, context, worker=False)
+
+    def execute_in(self, tool_call: ToolCall, context: ExecutionContext) -> str:
+        """Run as a full agent under the caller's deadline and cancellation (team members)."""
         return self._execute(tool_call, context, worker=False)
 
     def execute_workspace(self, tool_call: ToolCall, context: ExecutionContext) -> str:
@@ -1052,6 +1095,7 @@ class CodingTools:
 
     def write(self, path: str, content: str, *, _context: ExecutionContext) -> ToolResult:
         file_path = self.path(path)
+        self._writable(file_path)
         _context.remaining()
         if self.worker_changes is not None:
             if (
@@ -1090,6 +1134,7 @@ class CodingTools:
         self, path: str, edits: list[dict[str, str]], *, _context: ExecutionContext
     ) -> ToolResult:
         file_path = self.path(path)
+        self._writable(file_path)
         changes = self.worker_changes
         if changes is not None:
             original = changes.read(file_path, _context.remaining)
@@ -1323,7 +1368,9 @@ class CodingTools:
             command.append("--fixed-strings")
         if context:
             command += ["--context", str(context)]
-        command += ["-e", pattern, "--", str(self.path(path))]
+        root = self.path(path)
+        command += [*self._protected_globs(root if root.is_dir() else root.parent)]
+        command += ["-e", pattern, "--", str(root)]
         process, error = self._search(command, _context)
         if error:
             return error
@@ -1366,7 +1413,14 @@ class CodingTools:
         if not root.is_dir():
             raise NotADirectoryError(root)
         process, error = self._search(
-            [*self._rg_options(pattern), "--files", "--null", "--", str(root)],
+            [
+                *self._rg_options(pattern),
+                *self._protected_globs(root),
+                "--files",
+                "--null",
+                "--",
+                str(root),
+            ],
             _context,
             tool="find",
         )
