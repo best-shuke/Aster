@@ -586,7 +586,7 @@ class Console:
         self._team = dict(event) if event else None
         notice = (event or {}).get("notice")
         if notice:
-            # While the prompt is up, patch_stdout prints this above it.
+            # Prompts patch stdout and the task display redirects it, so this lands above.
             print(self.style(f"  ◆ {notice}", CYAN))
         self._refresh_task()
         self._invalidate_prompt()
@@ -951,8 +951,6 @@ class Console:
                 self._prompt_session = session
         else:
             session = self._prompt_session
-        if isolated:
-            return session.prompt(prompt)
         # Team members may report from their threads while the prompt waits for input.
         with patch_stdout(raw=True):
             return session.prompt(prompt)
@@ -1124,7 +1122,8 @@ class Console:
             full_screen=False,
         )
         application.ttimeoutlen = 0.1
-        return application.run()
+        with patch_stdout(raw=True):
+            return application.run()
 
     def ask_user(self, question: str, options: list[dict[str, str]]) -> dict[str, Any]:
         all_options = [
@@ -1933,7 +1932,7 @@ class Console:
         if self.interactive:
             from trace_ui import TraceInspector
 
-            with self._suspend_live():
+            with self._suspend_live(), patch_stdout(raw=True):
                 TraceInspector(
                     entries,
                     selected=selected,

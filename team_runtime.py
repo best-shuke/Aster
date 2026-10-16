@@ -42,6 +42,10 @@ STOP_GRACE_SECONDS = 10
 BACKGROUND_ACTIVITY = 50
 
 
+def _duration(seconds: int) -> str:
+    return f"{seconds // 60} 分钟" if seconds % 60 == 0 else f"{seconds} 秒"
+
+
 def _one_line(value, limit: int) -> str:
     text = " ".join(str(value or "").split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -75,6 +79,9 @@ class Activation:
         self.replied: set[str] = set()
         self.contributed: set[str] = set()
         self.updated: set[str] = set()
+        # Set when the turn's deadline, not the activation timeout, bounds this activation.
+        self.turn_bound = False
+        self.turn_number = 0
 
 
 @dataclass
@@ -358,7 +365,7 @@ class TeamRuntime:
             notice = "团队后台工作已完成" + (f"，主代理有 {unread} 条新结果" if unread else "")
         elif reason == "expired":
             notice = (
-                f"团队后台工作达到 {record.get('seconds', 0) // 60} 分钟时限，已暂停；"
+                f"团队后台工作达到 {_duration(record.get('seconds', 0))}时限，已暂停；"
                 "剩余工作在下一轮继续"
             )
         if notice is not None:
@@ -554,10 +561,10 @@ class TeamRuntime:
         mailbox = self.state.mailbox(name)
         items, rest = mailbox[:ITEMS_PER_ACTIVATION], mailbox[ITEMS_PER_ACTIVATION:]
         mailbox[:] = rest
-        deadline = min(
-            self.turn_deadline, time.monotonic() + self.limits.activation_timeout_seconds
-        )
-        activation = Activation(name, items, deadline, self.session_id)
+        own = time.monotonic() + self.limits.activation_timeout_seconds
+        activation = Activation(name, items, min(self.turn_deadline, own), self.session_id)
+        activation.turn_bound = self.turn_deadline < own
+        activation.turn_number = self.state.data["turn"]["number"]
         record = self.state.agents[name]
         record["status"] = "running"
         record["inflight"] = items
@@ -605,15 +612,32 @@ class TeamRuntime:
         record = self.state.agents[name]
         record["inflight"] = []
         title = activation_title(self, activation.items)
-        if result.status == "cancelled" or (
-            activation.cancelled.is_set() and result.status != "ok"
+        # The deadline of a turn that is over (it went to the background or a later turn
+        # began) cut this activation short: that pauses the work, it did not fail.
+        outlived = (
+            result.status == "timeout"
+            and activation.turn_bound
+            and (
+                self._background is not None
+                or activation.turn_number != self.state.data["turn"]["number"]
+            )
+        )
+        if (
+            outlived
+            or result.status == "cancelled"
+            or (activation.cancelled.is_set() and result.status != "ok")
         ):
             # Paused, not failed: the work returns to the mailbox for the next turn.
             for item in activation.items:
                 item["redelivered"] = True
             self.state.mailbox(name)[:0] = activation.items
             record["status"] = "idle"
-            self._event("activation_cancelled", name, activation=activation.id)
+            self._event(
+                "activation_cancelled",
+                name,
+                activation=activation.id,
+                **({"reason": "turn_deadline"} if outlived else {}),
+            )
             self._progress(name, state="paused", activity="finished", title=title)
             return
         ok = result.status == "ok"
@@ -1653,7 +1677,7 @@ class TeamRuntime:
         stamp = time.strftime("%H:%M:%S", time.localtime(ended)) if ended else "?"
         return {
             "finished": f"后台：{stamp} 完成，团队已空闲",
-            "expired": f"后台：{stamp} 达到 {record.get('seconds', 0) // 60} 分钟时限后暂停；"
+            "expired": f"后台：{stamp} 达到 {_duration(record.get('seconds', 0))}时限后暂停；"
             "剩余工作在下一轮继续",
             "resumed": f"后台：{stamp} 由下一轮接管",
             "stopped": f"后台：{stamp} 会话关闭时暂停；剩余工作在下一轮继续",

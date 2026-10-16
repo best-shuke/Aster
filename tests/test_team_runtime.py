@@ -1435,7 +1435,7 @@ class BackgroundWorkTests(TeamTestCase):
         self.assertTrue(wait_until(lambda: not conversation.team.activations))
         mailbox = conversation.team.state.data["mailboxes"]["engineer"]
         self.assertTrue(mailbox and mailbox[0]["redelivered"])
-        self.assertIn("分钟时限后暂停", "\n".join(conversation.team.result_lines()))
+        self.assertIn("1 秒时限后暂停", "\n".join(conversation.team.result_lines()))
         self.assertEqual(self.ask(conversation, "continue"), "Finished after resuming.")
 
     def test_next_turn_takes_over_work_still_running_in_the_background(self):
@@ -1587,6 +1587,36 @@ class BackgroundWorkTests(TeamTestCase):
         self.assertTrue(conversation.team.in_background)
         release.set()
         self.assertTrue(wait_until(lambda: not conversation.team.in_background))
+
+    def test_an_activation_outliving_its_turn_deadline_continues_in_the_background(self):
+        calls = []
+
+        def engineer(messages, tools):
+            calls.append(1)
+            if len(calls) == 1:
+                deadline = script.options()["deadline"]
+                time.sleep(max(0, deadline - time.monotonic()) + 0.05)
+                raise CompletionError("task_deadline", "Task deadline reached")
+            return say("Done after the turn deadline.")
+
+        def send_with_a_close_deadline(messages, tools):
+            # The turn's own deadline, not the activation timeout, bounds this activation.
+            conversation.team.turn_deadline = time.monotonic() + 1.5
+            return team("send_message", to=["engineer"], kind="request", content="Build")
+
+        script = TeamScript(
+            main=Steps(send_with_a_close_deadline, say("Building."), say("Building.")),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        self.ask(conversation)
+        self.assertTrue(wait_until(lambda: not conversation.team.in_background))
+        cancelled = self.events(conversation, "activation_cancelled")
+        self.assertEqual(cancelled[0]["reason"], "turn_deadline")
+        self.assertEqual(len(calls), 2)
+        lines = "\n".join(conversation.team.result_lines())
+        self.assertIn("Done after the turn deadline.", lines)
+        self.assertNotIn("no report", lines)
 
     def test_background_can_be_disabled_per_environment(self):
         self.define("bound", limits={"background_seconds": 0})

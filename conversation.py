@@ -796,7 +796,7 @@ class Conversation:
             if self.team is not None
             else nullcontext()
         ):
-            return self._run_turn(
+            answer = self._run_turn(
                 runtime,
                 acceptance,
                 deadline,
@@ -807,6 +807,15 @@ class Conversation:
                 on_reasoning,
                 on_tool_result,
             )
+        if (
+            self.team is not None
+            and acceptance.status == "background"
+            and not self.team.in_background
+        ):
+            # The members finished before the turn ended: nothing continues, nothing verified.
+            acceptance.status = "incomplete"
+            self._save_outcome(acceptance)
+        return answer
 
     def _run_turn(
         self,

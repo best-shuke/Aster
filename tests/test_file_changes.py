@@ -296,3 +296,60 @@ class EditLedgerTests(unittest.TestCase):
         self.assertIsNone(ledger.content(old))
         self.assertEqual(ledger.content(recent), "abcdef")
         self.assertLessEqual(ledger.size, 10)
+
+
+class LedgerToolTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        from tools import CodingTools
+
+        self.tools = CodingTools(self.root)
+        self.addCleanup(self.tools.close)
+        self.tools.edit_ledger = EditLedger()
+
+    def execute(self, name, arguments):
+        call = {
+            "id": "c",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        }
+        return json.loads(self.tools.execute(call))
+
+    def test_undecodable_changes_by_others_report_file_changed(self):
+        target = self.root / "data.txt"
+        target.write_text("alpha\n", encoding="utf-8")
+        self.execute("read", {"path": "data.txt"})
+        target.write_bytes(b"caf\xe9\n")
+        result = self.execute("write", {"path": "data.txt", "content": "beta\n"})
+        self.assertEqual(result["error"]["code"], "file_changed")
+        self.assertEqual(target.read_bytes(), b"caf\xe9\n")
+
+    def test_rolled_back_transactions_are_not_recorded_as_agent_writes(self):
+        written = []
+        transaction = FileTransaction(
+            ArtifactStore(self.root), lambda path, text: written.append(path)
+        )
+        check = ExecutionContext(time.monotonic() + 10).remaining
+        first, second = self.root / "a.txt", self.root / "b.txt"
+        first.write_text("a\n")
+        second.write_text("b\n")
+        transaction.write(first, "A\n", check)
+        transaction.write(second, "B\n", check)
+        original = atomic_write_text
+
+        def fail_on_second(path, content, **kwargs):
+            if path == second:
+                raise OSError("disk full")
+            return original(path, content, **kwargs)
+
+        with (
+            patch("file_changes.atomic_write_text", side_effect=fail_on_second),
+            self.assertRaises(OSError),
+        ):
+            transaction.commit(check)
+        self.assertEqual(first.read_text(), "a\n")
+        self.assertEqual(written, [])
+        transaction.commit(check)
+        self.assertEqual(sorted(written), [first, second])

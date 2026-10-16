@@ -1144,7 +1144,8 @@ class CodingTools:
                 content = self.edit_ledger.merge(file_path, version, current, content)
                 version, merged = text_digest(current), True
             atomic_write_text(file_path, content, expected=version, check=_context.remaining)
-        self._wrote(file_path, content)
+            # Inside the lock: a teammate merging next must already see this as agent-written.
+            self._wrote(file_path, content)
         return ToolResult(
             data={
                 "path": str(file_path),
@@ -1185,12 +1186,10 @@ class CodingTools:
             _context.remaining()
             if changes is not None:
                 changes.write(file_path, updated, _context.remaining)
+                self.file_versions[file_path] = text_digest(updated)
             else:
                 atomic_write_text(file_path, updated, expected=version, check=_context.remaining)
-        if changes is None:
-            self._wrote(file_path, updated)
-        else:
-            self.file_versions[file_path] = text_digest(updated)
+                self._wrote(file_path, updated)
         return ToolResult(
             data={
                 "path": str(file_path),
@@ -1227,16 +1226,21 @@ class CodingTools:
         return file_lock(path, check) if self.edit_ledger is not None else nullcontext()
 
     def _stale_content(self, path: Path, seen: str | None, check) -> str | None:
-        """The file's current content when it changed since this agent's read, if mergeable."""
-        if self.edit_ledger is None or seen is None:
+        """The current content when the file changed since this agent's read and can merge.
+
+        None when it did not change (or is gone: the write then reports the conflict).
+        Only content a teammate's file tool wrote is mergeable, and the ledger holds it, so
+        nothing else is read or decoded here.
+        """
+        ledger = self.edit_ledger
+        if ledger is None or seen is None:
             return None
         current = file_digest(path, check)
         if current in {None, seen}:
             return None
-        with path.open(encoding="utf-8", newline="") as stream:
-            content = stream.read()
-        if text_digest(content) != current:
-            raise FileChangedError(f"File changed while reading: {path}. Read it again.")
+        content = ledger.content(current) if ledger.written_by_agent(path, current) else None
+        if content is None or ledger.content(seen) is None:
+            raise FileChangedError(f"File changed since it was read: {path}. Read it again.")
         return content
 
     def _remember_read(self, path: Path, version: str | None, check) -> None:

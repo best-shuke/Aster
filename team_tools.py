@@ -219,12 +219,18 @@ After engaging members, call team action=wait to receive replies, task results a
 Limits per turn: {limits.max_concurrent_agents} members run at once, {limits.max_messages_per_turn} messages, {limits.max_activations_per_agent} activations per member, message chains up to {limits.max_message_hops} hops, task nesting up to {limits.max_task_depth} levels. Team state persists across turns of this session.{background_text(limits)}"""
 
 
+def duration_text(seconds: int) -> str:
+    if seconds % 60:
+        return f"{seconds} seconds"
+    return f"{seconds // 60} minute{'s' if seconds != 60 else ''}"
+
+
 def background_text(limits) -> str:
     if limits.background_seconds <= 0:
         return ""
     return (
         "\nIn interactive sessions, members still working when you answer keep working in the "
-        f"background for up to {limits.background_seconds // 60} minutes, within the same "
+        f"background for up to {duration_text(limits.background_seconds)}, within the same "
         "per-turn limits. What they send you waits in your mailbox for the next turn, and the "
         "user can look at it meanwhile. If you answer while members still work, tell the user "
         "they continue in the background."

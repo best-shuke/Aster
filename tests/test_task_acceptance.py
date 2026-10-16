@@ -201,10 +201,31 @@ class TaskAcceptanceTests(unittest.TestCase):
         self.assertIn("cwd argument", problem)
 
     def test_work_continuing_in_the_background_is_not_verified_yet(self):
-        self.execute("write", {"path": "app.py", "content": "answer = 41\n"})
+        # A teammate's unfinished edit (not this agent's tool call) changed the code.
+        self.execute("ls", {})
+        (self.workspace / "app.py").write_text("answer = 41\n")
         self.assertIn("no successful verification", self.acceptance.validate("已安排。"))
         self.assertIsNone(self.acceptance.validate("已安排，成员在后台继续。", background=True))
         self.assertEqual(self.acceptance.status, "background")
+
+    def test_own_edits_need_verification_even_when_work_continues(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.assertIn(
+            "verify your own change", self.acceptance.validate("已安排。", background=True)
+        )
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        (self.workspace / "other.py").write_text("unfinished = True\n")
+        self.assertIsNone(self.acceptance.validate("已安排。", background=True))
+        self.assertEqual(self.acceptance.status, "background")
+
+    def test_quoted_redirect_characters_do_not_hide_backgrounding(self):
+        self.assertEqual(
+            TaskAcceptance.shell_segments("pytest -k 'a>' & true"),
+            [["pytest", "-k", "a>"], ["true"]],
+        )
+        for command in ("pytest 2>&1", "pytest >&2", "pytest &>log", "pytest > out 2>&1"):
+            with self.subTest(command=command):
+                self.assertEqual(len(TaskAcceptance.shell_segments(command)), 1)
 
 
 class BlockerAttributionTests(unittest.TestCase):
@@ -228,6 +249,11 @@ class BlockerAttributionTests(unittest.TestCase):
             "I fixed the parser. I cannot proceed without the API key.",
             "Unable to complete the migration: the database is read-only.",
             "需要你确认 n=1 时的行为。",
+            # 之前 here means "until"; 其他 is not the pronoun 他; critic is an object.
+            "在你确认之前，我无法继续。",
+            "其他测试无法执行，所以没有验证。",
+            "我让 critic 运行测试，但无法完成验证。",
+            "I asked the critic to run them, but cannot proceed.",
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.status(text), "blocked")

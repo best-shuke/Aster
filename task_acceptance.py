@@ -26,6 +26,12 @@ UNTRUSTED_CHECK = "Run the check as a standalone command; shell composition may 
 # Quoted and code text reports what something said or contains, not the agent's own state.
 QUOTED = re.compile(r"```.*?```|`[^`\n]*`|“[^”]*”|「[^」]*」|‘[^’]*’|\"[^\"\n]{0,300}\"", re.S)
 SENTENCE_END = re.compile(r"[。！？!?；;\n]|\.(?:\s|$)")
+# A name right after these is an object ("我让 critic 运行测试"), not the subject.
+OBJECT_MARKERS = re.compile(
+    r"(?:(?:让|请|叫|派|要求|安排|交给|通知|提醒|问|向|给|和|与|跟|对|把|被)"
+    r"|\b(?:asked|told|let|had|with|to|for|from|by)(?:\s+the)?)\s*$",
+    re.I,
+)
 
 
 def _words(pattern: str) -> str:
@@ -34,12 +40,14 @@ def _words(pattern: str) -> str:
 
 
 SELF_SUBJECT = r"我|咱们|" + _words(r"I|I'm|I've|we|we're|we've")
+# 其他/其它 ("other …") are not the pronouns 他/它.
 OTHER_SUBJECT = (
-    r"他|她|它|对方|用户|成员|队友|子代理|其他代理|另一个代理|评审者|审阅者|评审员|"
+    r"(?<!其)他|她|(?<!其)它|对方|用户|成员|队友|子代理|其他代理|另一个代理|评审者|审阅者|评审员|"
     + _words(r"he|she|they|the user|teammates?|members?|reviewers?|workers?|subagents?")
 )
 # A limitation already overcome ("at first the tests could not run") is no blocker.
-EARLIER = r"之前|此前|先前|起初|最初|一开始|原先|原本|曾经|" + _words(
+# Not 之前: "在你确认之前" means "until you confirm".
+EARLIER = r"此前|先前|起初|最初|一开始|原先|原本|曾经|" + _words(
     r"previously|initially|at first|earlier"
 )
 
@@ -86,6 +94,8 @@ class TaskAcceptance:
         self.code_revision = 0
         self.verified_revision = -1
         self.failed_verifications = {}
+        # Evidence index of this agent's own latest successful write/edit, if any.
+        self.last_own_edit = -1
         self.pending_verifications = {}
         self._verification_start = 0
         self._roots = {self.workspace.resolve()} if self.workspace is not None else set()
@@ -215,6 +225,8 @@ class TaskAcceptance:
         }
         self.evidence.append(record)
         index = len(self.evidence) - 1
+        if function.get("name") in {"write", "edit"} and result.get("status") == "ok":
+            self.last_own_edit = index
         changed = self._refresh_files()
         if changed:
             record["changed_files"] = changed
@@ -278,8 +290,12 @@ class TaskAcceptance:
 
     @staticmethod
     def shell_segments(command):
-        """The command's words split at shell composition (;, &, &&, |, ||, newlines)."""
-        lexer = shlex.shlex(command.strip(), posix=True, punctuation_chars=";&|\n")
+        """The command's words split at shell composition (;, &, &&, |, ||, newlines).
+
+        "<" and ">" are punctuation too, so redirections such as 2>&1 or &>log lex as
+        tokens containing them and never count as composition; quoted text stays a word.
+        """
+        lexer = shlex.shlex(command.strip(), posix=True, punctuation_chars=";&|<>\n")
         lexer.whitespace = " \t\r"
         lexer.commenters = ""
         lexer.whitespace_split = True
@@ -288,10 +304,8 @@ class TaskAcceptance:
         except ValueError:
             return [[command]]
         segments = [[]]
-        for position, token in enumerate(tokens):
-            # "&" right after ">" or "<" duplicates a descriptor (2>&1); it runs nothing.
-            redirect = token == "&" and position and tokens[position - 1][-1:] in {">", "<"}
-            if token and set(token) <= set(";&|\n") and not redirect:
+        for token in tokens:
+            if token and set(token) <= set(";&|\n"):
                 segments.append([])
             else:
                 segments[-1].append(token)
@@ -320,7 +334,11 @@ class TaskAcceptance:
             sentence = text[ends[-1].end() if ends else 0 : match.start()]
             if re.search(EARLIER, sentence, re.I):
                 continue
-            subjects = list(subject.finditer(sentence))
+            subjects = [
+                found
+                for found in subject.finditer(sentence)
+                if found.group("self") or not OBJECT_MARKERS.search(sentence[: found.start()])
+            ]
             if not subjects or subjects[-1].group("self"):
                 return True
         return False
@@ -360,6 +378,23 @@ class TaskAcceptance:
         ):
             return "No successful tool evidence supports completion of this task. Inspect and perform the requested work, or state the concrete blocker."
         if background:
+            # Teammates' unfinished edits are not final yet, but this agent's own are.
+            if (
+                self.kind == "change"
+                and self.last_own_edit >= 0
+                and not any(
+                    record.get("verification")
+                    and record.get("status") == "ok"
+                    and not record.get("verification_untrusted")
+                    for record in self.evidence[self.last_own_edit + 1 :]
+                )
+            ):
+                return (
+                    "You changed files yourself: verify your own change with a relevant "
+                    "standalone test/build/assertion before answering, even though members "
+                    "keep working in the background."
+                )
+            # Contract checks judge finished work; this turn hands work off instead.
             self.status = "background"
             return None
         self._refresh_files()

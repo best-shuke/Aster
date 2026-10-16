@@ -255,8 +255,6 @@ class FileTransaction:
                     if current != merged:
                         atomic_write_text(path, merged, expected=text_digest(current), check=check)
                         written.append((path, current, merged))
-                        if self.on_write is not None and merged is not None:
-                            self.on_write(path, merged)
             except BaseException as error:
                 rollback_errors = []
                 for path, previous, applied in reversed(written):
@@ -274,6 +272,10 @@ class FileTransaction:
                         f"Commit failed ({error}); incomplete rollback: {'; '.join(rollback_errors)}"
                     ) from error
                 raise
+            # Only a committed transaction counts as written: a rollback leaves nothing.
+            if self.on_write is not None:
+                for path, _, merged in written:
+                    self.on_write(path, merged)
         return self.summary("merged")
 
     @staticmethod
