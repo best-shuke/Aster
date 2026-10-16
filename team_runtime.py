@@ -118,6 +118,7 @@ class TeamRuntime:
         self.nudges = 0
         self.notices: list[str] = []
         self.main_origin = MainOrigin()
+        self._titles: dict[str, str] = {}
 
     # Members -------------------------------------------------------------------------
 
@@ -315,7 +316,12 @@ class TeamRuntime:
             return
         if len(self.activations) >= self.limits.max_concurrent_agents:
             record["status"] = "queued"
-            self._progress(name, state="pending", activity="queued")
+            self._progress(
+                name,
+                state="pending",
+                activity="queued",
+                title=activation_title(self, self._wakeable(name)),
+            )
             return
         self._start(name)
 
@@ -459,11 +465,15 @@ class TeamRuntime:
             return
         ok = result.status == "ok"
         record["status"] = "idle"
-        record["last_report"] = excerpt(result.final, 4000) if result.final else None
+        previous = record.get("last_report")
+        if result.final:
+            record["last_report"] = excerpt(result.final, 4000)
         record["last_error"] = result.error
         final = result.final.strip() if ok and result.final else ""
-        fallback = (
-            final or f"(no report: {result.status}{': ' + result.error if result.error else ''})"
+        fallback = final or (
+            f"(no report: {result.status}{': ' + result.error if result.error else ''})"
+            # Keep work from an earlier activation instead of answering with nothing.
+            + (f" Latest report: {previous}" if previous else "")
         )
         succeeded = ok and bool(final)
         for item in activation.items:
@@ -628,13 +638,16 @@ class TeamRuntime:
     def _progress(self, name: str, **event: Any) -> None:
         if self.on_progress is None:
             return
+        # Keep showing what the member works on, not just its name, across its updates.
+        title = event.pop("title", None) or self._titles.get(name) or name
+        self._titles[name] = title
         # Display callbacks never change execution, as with display_callback elsewhere.
         with suppress(Exception):
             self.on_progress(
                 {
                     "phase": "subagent",
                     "agent_id": name,
-                    "title": event.pop("title", None) or name,
+                    "title": title,
                     "task": name,
                     "mode": "team",
                     **event,
@@ -1118,7 +1131,8 @@ class TeamRuntime:
                     f"{task_id} is assigned to {task['assignee']}; only the assignee updates it",
                 )
             self._task_status(task, actor, status, result)
-            if activation is not None:
+            # Only an outcome settles the task; "in_progress" still owes a result.
+            if activation is not None and status != "in_progress":
                 activation.updated.add(task_id)
             self._persist()
             return {key: task[key] for key in ("id", "title", "status", "assignee", "result")}

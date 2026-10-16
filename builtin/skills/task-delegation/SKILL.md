@@ -40,5 +40,9 @@ The creator is notified when tasks finish. Read the results, check the actual fi
 evidence for anything that matters, resolve conflicts between results, and only then
 report completion. A task status of `completed` is a claim, not proof.
 
+If plans change, cancel tasks you created and no longer need with
+`update_task status=cancelled`. A message saying "never mind" is not enough: an open
+task stays on the board and wakes its assignee again in a later turn.
+
 Nesting is limited: a task created while working on a task is one level deeper, and the
 runtime rejects tasks beyond the environment's depth limit. Prefer flat task lists.

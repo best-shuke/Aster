@@ -40,7 +40,7 @@
 
 成员定义字段：`description`、`instructions` 或 `prompt_file`（二选一）、`enabled`、`skills`（技能名数组）、`tools`（工具名数组）、`mcp`（服务名数组，或 服务 → 工具模式数组/`"*"`）、`write_paths`（允许写入的工作区相对路径）、`reasoning_effort`。
 
-示例见 [examples/research-team.json](examples/research-team.json)。
+示例见 [examples/research-team.json](examples/research-team.json)；一次真实的多代理运行记录见 [多代理演示](multi-agent-demo.md)。
 
 ## 继承与覆盖规则
 

@@ -62,6 +62,7 @@ TERM=xterm-256color uv run --locked python -m unittest discover -s tests
 
 - [架构](docs/architecture.md)：模块划分与执行链路。
 - [环境](docs/environments.md)：环境定义、能力继承、多代理运行时与协作协议。
+- [多代理演示](docs/multi-agent-demo.md)：一次真实运行的分工、直接求助与会议记录。
 - [配置入口](docs/configuration.md)：模型、目录与扩展设置。
 - [Git 与私密数据](docs/git-policy.md)：提交边界。
 - [贡献指南](CONTRIBUTING.md)：开发和验证方式。

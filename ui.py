@@ -63,6 +63,7 @@ _TOOL_LABELS = {
     "find": "查找文件",
     "ls": "查看目录",
     "delegate": "并行调查",
+    "team": "团队协作",
     "update_plan": "更新计划",
 }
 
@@ -2017,6 +2018,18 @@ class Console:
                 arguments.get("tool") or arguments.get("query") or arguments.get("server"),
             ]
             return " · ".join(str(value) for value in values if value).replace("\n", " ")
+        if name == "team":
+            target = (
+                arguments.get("to")
+                or arguments.get("assignee")
+                or arguments.get("participants")
+                or arguments.get("task_id")
+                or arguments.get("protocol_id")
+                or arguments.get("protocol")
+            )
+            target = ", ".join(target) if isinstance(target, list) else target
+            values = [arguments.get("action"), f"→ {target}" if target else None]
+            return " ".join(str(value) for value in values if value).replace("\n", " ")
         keys = {
             "read": ("path",),
             "exec": ("command",),

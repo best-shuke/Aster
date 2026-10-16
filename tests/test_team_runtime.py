@@ -525,6 +525,39 @@ class TaskDelegationTests(TeamTestCase):
         )
         self.assertLess(t1_done, engineer_start)
 
+    def test_claimed_task_is_still_owed_and_keeps_the_report_if_a_later_turn_fails(self):
+        # Reproduces a live run: the researcher marks its task in_progress, asks the
+        # engineer, ends its turn with a report, then fails in the next activation.
+        def researcher_fails(messages, tools):
+            raise CompletionError("provider_error", "synthetic outage")
+
+        script = TeamScript(
+            main=Steps(
+                team("create_task", title="Gather precedent", assignee="researcher"),
+                *[
+                    lambda messages, tools: (
+                        say("got it")
+                        if any(item["type"] == "task_update" for item in arrived(messages))
+                        else team("wait", timeout=30)
+                    )
+                ]
+                * 4,
+            ),
+            researcher=Steps(
+                team("update_task", task_id="t1", status="in_progress"),
+                team("send_message", to=["engineer"], kind="request", content="run the probe"),
+                say("Report: Excel returns #DIV/0!, statistics raises."),
+                researcher_fails,
+            ),
+            engineer=Steps(say("probe output: ok")),
+        )
+        conversation = self.team_conversation(script)
+        self.assertEqual(self.ask(conversation), "got it")
+        task = conversation.team.state.data["tasks"]["t1"]
+        self.assertEqual(task["status"], "blocked")
+        self.assertIn("Latest report: Report: Excel returns #DIV/0!", task["notes"][-1])
+        self.assertIn("Excel returns #DIV/0!", script.seen("main"))
+
     def test_review_requests_create_review_tasks_for_reviewers(self):
         script = TeamScript(
             main=Steps(
@@ -1185,3 +1218,34 @@ class TeamCommandTests(TeamTestCase):
         self.assertIn("任务 t1 · completed", text)
         self.assertIn("task_created", text)
         self.assertIn("activation_finished", text)
+
+
+class TeamProgressTests(TeamTestCase):
+    def test_dashboard_events_keep_titles_and_report_counts(self):
+        events = []
+        script = TeamScript(
+            main=Steps(
+                team("create_task", title="Build widget", assignee="engineer"),
+                team("wait", timeout=30),
+                say("done"),
+            ),
+            engineer=Steps(use("ls", path="."), say("built")),
+        )
+        script.settings = self.settings
+        conversation = Conversation(
+            self.settings, script, CodingTools(self.workspace, on_task_update=events.append)
+        )
+        conversation.environments = EnvironmentStore(
+            self.settings, conversation.templates, user_dir=self.user
+        )
+        self.addCleanup(conversation.close)
+        conversation.apply_environment(conversation.environments.resolve("program:crew"))
+        self.ask(conversation)
+        engineer = [event for event in events if event.get("agent_id") == "engineer"]
+        self.assertTrue(engineer)
+        self.assertTrue(all(event["title"] == "t1 Build widget" for event in engineer))
+        finished = [event for event in engineer if event.get("activity") == "finished"]
+        self.assertEqual(finished[-1]["model_requests"], 2)
+        self.assertEqual(finished[-1]["tool_calls"], 1)
+        detail = Console._tool_detail("team", {"action": "send_message", "to": ["critic", "main"]})
+        self.assertEqual(detail, "send_message → critic, main")
