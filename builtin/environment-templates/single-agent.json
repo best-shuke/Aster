@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "single-agent",
+  "description": "单代理环境：独立选择技能与 MCP，沿用默认代理的执行方式",
+  "type": "single-agent",
+  "inherit_skills": true,
+  "inherit_mcp": true,
+  "skills": {},
+  "mcp": {}
+}

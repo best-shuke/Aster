@@ -15,6 +15,10 @@ DEFAULT_WORKFLOWS_DIR = PROGRAM_DIR / "workflows"
 DEFAULT_ENVIRONMENTS_DIR = PROGRAM_DIR / "environments"
 DEFAULT_ENVIRONMENT_STATE_DIR = Path.home() / ".agents" / "environment-state"
 DEFAULT_MCP_CONFIG_FILE = PROGRAM_DIR / "mcp.json"
+# Framework-provided resources: collaboration skills and environment templates.
+BUILTIN_DIR = PROGRAM_DIR / "builtin"
+BUILTIN_SKILLS_DIR = BUILTIN_DIR / "skills"
+BUILTIN_TEMPLATES_DIR = BUILTIN_DIR / "environment-templates"
 DEFAULT_REASONING_EFFORT = "max"
 MAX_SUBAGENTS = 20
 REASONING_EFFORTS = ("default", "off", "low", "high", "max")
@@ -79,6 +83,7 @@ class Settings:
     workflows_dir: Path = DEFAULT_WORKFLOWS_DIR
     environments_dir: Path = DEFAULT_ENVIRONMENTS_DIR
     environment_state_dir: Path = DEFAULT_ENVIRONMENT_STATE_DIR
+    builtin_skills_dir: Path = BUILTIN_SKILLS_DIR
 
     @property
     def resolved_websearch_api_key(self) -> str | None:

@@ -805,20 +805,26 @@ class McpManager:
             data={"servers": servers, "failures": failures},
         )
 
-    def _selected_servers(self, server: str | None) -> list[McpServerConfig]:
+    def _selected_servers(self, server: str | None, permit=None) -> list[McpServerConfig]:
         if server is not None:
             config = self.servers.get(server)
             if config is None:
                 raise ValueError(f"Unknown MCP server {server!r}")
+            if permit is not None and not permit.permits_server(server):
+                raise PermissionError(f"MCP server {server!r} is not permitted for this agent")
             return [config]
-        return [config for config in self.servers.values() if not config.disabled]
+        return [
+            config
+            for config in self.servers.values()
+            if not config.disabled and (permit is None or permit.permits_server(config.name))
+        ]
 
     def _catalog(
-        self, context: ExecutionContext, server: str | None = None
+        self, context: ExecutionContext, server: str | None = None, permit=None
     ) -> tuple[list[tuple[str, dict[str, Any]]], list[dict[str, str]]]:
         catalog: list[tuple[str, dict[str, Any]]] = []
         failures = []
-        for config in self._selected_servers(server):
+        for config in self._selected_servers(server, permit):
             if config.disabled:
                 failures.append({"server": config.name, "error": "server is disabled"})
                 continue
@@ -848,12 +854,16 @@ class McpManager:
         server: str | None,
         limit: int,
         context: ExecutionContext,
+        *,
+        permit=None,
     ) -> ToolResult:
         if not query.strip():
             raise ValueError("query is required for MCP search")
-        catalog, failures = self._catalog(context, server)
+        catalog, failures = self._catalog(context, server, permit)
         matches = []
         for server_name, tool in catalog:
+            if permit is not None and not permit.permits(server_name, tool["name"]):
+                continue
             score = self._score(tool, query)
             if score:
                 matches.append(
@@ -876,15 +886,21 @@ class McpManager:
         return result
 
     def _find_tool(
-        self, name: str, server: str | None, context: ExecutionContext
+        self, name: str, server: str | None, context: ExecutionContext, permit=None
     ) -> tuple[str, dict[str, Any]]:
         if "/" in name:
             qualified_server, name = name.split("/", 1)
             if server is not None and server != qualified_server:
                 raise ValueError("server conflicts with the qualified tool path")
             server = qualified_server
-        catalog, failures = self._catalog(context, server)
+        catalog, failures = self._catalog(context, server, permit)
         matches = [(server_name, tool) for server_name, tool in catalog if tool["name"] == name]
+        if permit is not None and matches:
+            allowed = [match for match in matches if permit.permits(match[0], name)]
+            if not allowed:
+                paths = ", ".join(f"{server_name}/{name}" for server_name, _ in matches)
+                raise PermissionError(f"MCP tool {paths} is not permitted for this agent")
+            matches = allowed
         if not matches:
             detail = f"; failures: {failures}" if failures else ""
             raise ValueError(f"Unknown MCP tool {name!r}{detail}")
@@ -893,8 +909,10 @@ class McpManager:
             raise ValueError(f"Ambiguous MCP tool {name!r}; use one of: {paths}")
         return matches[0]
 
-    def describe(self, tool: str, server: str | None, context: ExecutionContext) -> ToolResult:
-        server_name, metadata = self._find_tool(tool, server, context)
+    def describe(
+        self, tool: str, server: str | None, context: ExecutionContext, *, permit=None
+    ) -> ToolResult:
+        server_name, metadata = self._find_tool(tool, server, context, permit)
         return ToolResult(data={"path": f"{server_name}/{metadata['name']}", **metadata})
 
     def call(
@@ -903,8 +921,10 @@ class McpManager:
         arguments: dict[str, Any],
         server: str | None,
         context: ExecutionContext,
+        *,
+        permit=None,
     ) -> ToolResult:
-        server_name, metadata = self._find_tool(tool, server, context)
+        server_name, metadata = self._find_tool(tool, server, context, permit)
         schema = metadata.get("inputSchema")
         if schema is not None:
             try:

@@ -8,6 +8,8 @@ from typing import cast
 from commands import CommandActions, CommandExecution, CommandName, EffectKind, ParsedCommand
 from config import REASONING_EFFORTS
 from conversation import Conversation
+from environment_commands import enter_multiagents, environment_subcommand
+from environment_definitions import SUBCOMMANDS
 from execution_history import execution_entries
 from ui import Console
 
@@ -558,11 +560,16 @@ def sync_environment_ui(conversation: Conversation, console: Console) -> None:
 
 
 def use_environment(conversation: Conversation, console: Console, arguments: list[str]) -> bool:
-    usage = "用法：/environment [名称 [keep] [--yes]|off|show 名称|trust 名称|deny 名称]"
+    usage = (
+        "用法：/environment [名称 [keep] [--yes]|off|show 名称|trust 名称|deny 名称]；"
+        "/env help 查看 create/use/exit/status/skills/mcp/agents 等子命令"
+    )
     store = conversation.environments
     request_id = None
     requested_environment = None
     try:
+        if arguments and arguments[0] in SUBCOMMANDS:
+            return environment_subcommand(conversation, console, list(arguments), use_environment)
         if not arguments and getattr(console, "interactive", False) is True:
             entries = store.list()
             selectors = ["off", *(entry.environment_id for entry in entries)]
@@ -734,6 +741,14 @@ def use_environment(conversation: Conversation, console: Console, arguments: lis
                     request=request_id,
                     error_type=type(exc).__name__,
                 )
+        console.error(exc)
+        return False
+
+
+def use_multiagents(conversation: Conversation, console: Console, arguments: list[str]) -> bool:
+    try:
+        return enter_multiagents(conversation, console, arguments, use_environment)
+    except (OSError, RuntimeError, ValueError) as exc:
         console.error(exc)
         return False
 

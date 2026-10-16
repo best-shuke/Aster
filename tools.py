@@ -609,7 +609,7 @@ class CodingTools:
         )
 
     def detach(self, name: str) -> None:
-        if name not in {"websearch", "mcp", "delegate", "ask_user"}:
+        if name not in {"websearch", "mcp", "delegate", "ask_user", "team"}:
             raise ValueError(f"Cannot detach built-in tool {name!r}")
         self.registry.pop(name, None)
 

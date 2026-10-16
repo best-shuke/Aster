@@ -13,6 +13,7 @@ from config import Settings, system_prompt
 from contracts import Message, ToolRun
 from environments import ResolvedEnvironment
 from mcp_client import McpManager
+from mcp_scope import ScopedMcp
 from reasoning import RolePromptCache
 from skills import SkillCatalog
 from tool_runtime import ExecutionContext
@@ -174,16 +175,8 @@ class EnvironmentTransition:
 
     def prepare_skills(self, environment, settings) -> SkillCatalog | None:
         if environment is not None:
-            baseline = self.conversation._baseline_skills
-            inherited = baseline if environment.inherit_skills else None
-            skills = SkillCatalog(
-                settings.workspace,
-                settings.skills_dir,
-                enabled=settings.skills_enabled,
-                extra_dirs=environment.skills_dirs
-                + (inherited.extra_dirs if inherited is not None and inherited.enabled else ()),
-                include_defaults=environment.inherit_skills
-                and (inherited is None or (inherited.enabled and inherited.include_defaults)),
+            skills = self.conversation.environments.skill_catalog(
+                environment, baseline=self.conversation._baseline_skills
             )
         elif self.conversation._baseline_skills is not None:
             skills = self.conversation._baseline_skills.fork()
@@ -235,7 +228,11 @@ class EnvironmentTransition:
                 previous=conversation.mcp_manager,
             )
             if tools is not None and self.manager.server_count:
-                tools.attach_mcp(self.manager)
+                tools.attach_mcp(
+                    ScopedMcp(self.manager, environment.mcp_scope)
+                    if environment is not None and environment.mcp_scope is not None
+                    else self.manager
+                )
                 if tools.policy.permits("mcp"):
                     result = self.manager.connect_all(on_connect=self.on_connect)
                     self.warnings.extend(

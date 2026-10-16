@@ -8,13 +8,22 @@ import re
 import shlex
 import shutil
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from config import APP_NAME, CLI_NAME, Settings, parse_reasoning_effort
+from environment_spec import (
+    McpSelection,
+    TeamSpec,
+    capability_notes,
+    parse_mcp_selection,
+    parse_skill_selection,
+    parse_team,
+    selection_scope,
+)
 from file_state import (
     GENERATED_DIRECTORIES,
     atomic_write_text,
@@ -22,6 +31,7 @@ from file_state import (
     local_code_files,
 )
 from mcp_client import McpServerConfig, load_mcp_config
+from mcp_scope import McpScope
 from skills import SkillCatalog, skill_files, skill_roots
 from tools import TOOL_NAMES, WORKER_EXCLUDED, ToolPolicy
 
@@ -46,6 +56,13 @@ FIELDS = {
     "status_file",
     "max_subagents",
     "opening_template",
+    # Environment runtime fields (all optional; definitions without them behave as before).
+    "type",
+    "skills",
+    "mcp",
+    "agents",
+    "limits",
+    "collaboration",
 }
 
 # 环境里 role_prompts 的角色名规范。
@@ -98,10 +115,27 @@ class ResolvedEnvironment:
     role_source: dict | None = None
     inherit_mcp: bool = False
     inherit_skills: bool = False
+    # None keeps legacy semantics: every discovered skill / configured server is active.
+    skill_selection: dict[str, bool] | None = None
+    mcp_selection: dict[str, McpSelection] | None = None
+    mcp_scope: McpScope | None = None
+    missing_mcp: tuple[str, ...] = ()
+    team: TeamSpec = field(default_factory=TeamSpec)
+    notes: tuple[str, ...] = ()
 
     @property
     def environment_id(self) -> str:
         return self.entry.environment_id
+
+    @property
+    def multi_agent(self) -> bool:
+        return self.team.multi_agent
+
+    @property
+    def active_skills(self) -> frozenset[str] | None:
+        if self.skill_selection is None:
+            return None
+        return frozenset(name for name, enabled in self.skill_selection.items() if enabled)
 
     @property
     def reference(self) -> dict:
@@ -219,7 +253,10 @@ class EnvironmentStore:
                 f"请退出并重新启动 {CLI_NAME}，再选择环境。/new 或重选环境不会重载程序代码。"
             )
         entry = self.find(selector)
-        data = _read_json(entry.path)
+        return self.resolve_data(entry, _read_json(entry.path))
+
+    def resolve_data(self, entry: EnvironmentEntry, data: dict) -> ResolvedEnvironment:
+        """Validate a definition's content; editors use it before writing a change."""
         if set(data) - FIELDS:
             raise ValueError(f"不支持的环境字段：{', '.join(sorted(set(data) - FIELDS))}")
         if type(data.get("version")) is not int or data["version"] != 1:
@@ -293,6 +330,21 @@ class EnvironmentStore:
                 raise ValueError(f"角色稿为空：{role_path}")
             role_prompts[role] = role_text
             role_files.append(role_path)
+        skill_selection = parse_skill_selection(data["skills"]) if "skills" in data else None
+        mcp_selection = parse_mcp_selection(data["mcp"]) if "mcp" in data else None
+        agent_files: list[Path] = []
+
+        def agent_prompt(value):
+            path = self._path(base, value)
+            agent_files.append(path)
+            return path, path.read_text(encoding="utf-8")
+
+        team = parse_team(
+            data,
+            read_prompt=agent_prompt,
+            tool_names=TOOL_NAMES,
+            startup_max_agents=baseline.max_subagents,
+        )
         mcp_enabled = baseline.mcp_enabled and inherit_mcp
         mcp_path = baseline.mcp_config_file
         if "mcp_config_file" in data:
@@ -331,6 +383,18 @@ class EnvironmentStore:
                 for name, server in inherited.items()
             }
             servers = {**inherited, **servers}
+        missing_mcp: tuple[str, ...] = ()
+        mcp_scope = None
+        if mcp_selection is not None:
+            # The selection only chooses among configured servers; credentials stay in the
+            # MCP config's ${VAR} references and never enter the environment definition.
+            missing_mcp = tuple(sorted(set(mcp_selection) - set(servers)))
+            servers = {
+                name: replace(server, disabled=server.disabled or not mcp_selection[name].enabled)
+                for name, server in servers.items()
+                if name in mcp_selection
+            }
+            mcp_scope = selection_scope(mcp_selection)
         if role_source is not None:
             server = servers.get(role_source["server"])
             if server is None or server.disabled or not policy.permits("mcp"):
@@ -373,7 +437,13 @@ class EnvironmentStore:
             template = matches[0]
             template_data = self.templates.read(template)
             template_id, template_path = template.template_id, template.path
-        files = [entry.path, prompt, *self._files(skills), *role_files]
+        files = [entry.path, prompt, *self._files(skills), *role_files, *agent_files]
+        builtin_skills = baseline.builtin_skills_dir.expanduser().resolve()
+        uses_builtin_skills = (
+            skill_selection is not None and startup_skills_enabled and builtin_skills.is_dir()
+        )
+        if uses_builtin_skills:
+            files.extend(self._files((builtin_skills,)))
         inherited_skill_roots = []
         inherited_explicit_roots = set()
         if inherit_skills and startup_skills_enabled:
@@ -459,7 +529,7 @@ class EnvironmentStore:
                         "max_subagents": workers,
                         "mcp_enabled": mcp_enabled,
                         "skills_enabled": startup_skills_enabled
-                        and (inherit_skills or bool(skills)),
+                        and (inherit_skills or bool(skills) or skill_selection is not None),
                         "inherit_mcp": inherit_mcp,
                         "inherited_skill_roots": list(map(str, inherited_skill_roots)),
                         **({"status_file": str(status_file)} if status_file is not None else {}),
@@ -473,7 +543,8 @@ class EnvironmentStore:
             baseline,
             prompt_file=prompt,
             reasoning_effort=parse_reasoning_effort(effort),
-            skills_enabled=startup_skills_enabled and (inherit_skills or bool(skills)),
+            skills_enabled=startup_skills_enabled
+            and (inherit_skills or bool(skills) or skill_selection is not None),
             websearch_enabled=websearch,
             max_subagents=workers,
             mcp_enabled=mcp_enabled,
@@ -497,6 +568,47 @@ class EnvironmentStore:
             role_source,
             inherit_mcp=inherit_mcp,
             inherit_skills=inherit_skills,
+            skill_selection=skill_selection,
+            mcp_selection=mcp_selection,
+            mcp_scope=mcp_scope,
+            missing_mcp=missing_mcp,
+            team=team,
+            notes=(
+                *(f"MCP 服务未在任何来源中配置：{name}" for name in missing_mcp),
+                *capability_notes(team, skill_selection, mcp_scope),
+            ),
+        )
+
+    def startup_skills_enabled(self) -> bool:
+        if self.baseline_skills is not None:
+            return self.baseline_skills.enabled
+        return self.baseline.skills_enabled
+
+    def skill_catalog(
+        self,
+        environment: ResolvedEnvironment,
+        *,
+        selected: bool = True,
+        baseline: SkillCatalog | None = None,
+    ) -> SkillCatalog:
+        """The environment's skills; selected=False lists every skill it could select."""
+        settings = environment.settings
+        baseline = baseline if baseline is not None else self.baseline_skills
+        inherited = baseline if environment.inherit_skills else None
+        return SkillCatalog(
+            settings.workspace,
+            settings.skills_dir,
+            enabled=settings.skills_enabled if selected else self.startup_skills_enabled(),
+            extra_dirs=environment.skills_dirs
+            + (inherited.extra_dirs if inherited is not None and inherited.enabled else ()),
+            include_defaults=environment.inherit_skills
+            and (inherited is None or (inherited.enabled and inherited.include_defaults)),
+            # Built-in collaboration skills are a lowest-priority source that only an
+            # explicit skill selection can activate.
+            fallback_dirs=(settings.builtin_skills_dir,)
+            if environment.skill_selection is not None or not selected
+            else (),
+            only=environment.active_skills if selected else None,
         )
 
     @staticmethod
@@ -656,7 +768,49 @@ class EnvironmentStore:
             ),
             f"子代理状态文件：{environment.status_file or '未启用'}",
             f"MCP 配置：{settings.mcp_config_file if settings.mcp_enabled else '关闭'}",
+            f"类型：{environment.team.kind}",
         ]
+        if environment.skill_selection is not None:
+            lines.append(
+                "技能选择："
+                + (
+                    ", ".join(
+                        f"{name}{'' if enabled else '（停用）'}"
+                        for name, enabled in environment.skill_selection.items()
+                    )
+                    or "无"
+                )
+            )
+        if environment.mcp_selection is not None:
+            lines.append(
+                "MCP 选择："
+                + (
+                    ", ".join(
+                        name
+                        + ("" if item.enabled else "（停用）")
+                        + (f" tools={','.join(item.tools)}" if item.tools is not None else "")
+                        + (f" deny={','.join(item.deny)}" if item.deny else "")
+                        for name, item in environment.mcp_selection.items()
+                    )
+                    or "无"
+                )
+            )
+        team = environment.team
+        if team.multi_agent:
+            limits = team.limits
+            lines.append(
+                f"成员：{len(team.agents)} 个；并发上限 {limits.max_concurrent_agents}；"
+                f"每轮消息上限 {limits.max_messages_per_turn}；消息链上限 {limits.max_message_hops}；"
+                f"会议轮数上限 {limits.max_meeting_rounds}；任务嵌套上限 {limits.max_task_depth}"
+            )
+            for agent in team.agents:
+                summary = agent.summary()
+                lines.append(
+                    f"  成员 {agent.name}{'' if agent.enabled else '（停用）'}：{agent.description}；"
+                    f"tools={summary['tools']}；skills={summary['skills']}；mcp={summary['mcp']}"
+                )
+            lines.append("协作协议：" + ", ".join(sorted(team.collaboration.protocols)))
+        lines.extend(f"注意：{note}" for note in environment.notes)
         for name, server in environment.servers.items():
             if server.command:
                 arguments = []
