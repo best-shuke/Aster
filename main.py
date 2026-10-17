@@ -150,7 +150,6 @@ def run_interactive(conversation: Conversation, console: Console) -> None:
     console.execution_provider = lambda: execution_entries(
         conversation.execution_snapshot(), conversation.messages
     )
-    console.cache_provider = lambda: cache_snapshot(conversation)
     sync_environment_ui(conversation, console)
     console.update_context(conversation.context_status())
     console.banner(conversation.settings.session_file, conversation_count(conversation))
@@ -206,16 +205,15 @@ def run_interactive(conversation: Conversation, console: Console) -> None:
             console.error(exc)
 
 
-def cache_snapshot(conversation: Conversation) -> dict | None:
-    stats = getattr(conversation.client, "cache_stats", None)
-    return stats.snapshot() if isinstance(stats, CacheStats) else None
+def cache_totals(conversation: Conversation) -> dict | None:
+    stats = getattr(getattr(conversation, "client", None), "cache_stats", None)
+    return stats.totals() if isinstance(stats, CacheStats) else None
 
 
 def ask(conversation: Conversation, console: Console, prompt: str) -> str:
     console.execution_provider = lambda: execution_entries(
         conversation.execution_snapshot(), conversation.messages
     )
-    console.cache_provider = lambda: cache_snapshot(conversation)
     console.update_context(conversation.context_status())
     console.task_start(prompt)
     completed = False
@@ -252,7 +250,6 @@ def ask(conversation: Conversation, console: Console, prompt: str) -> str:
             console.update_context(conversation.context_status())
         except Exception as exc:
             console.error(exc)
-        # The task summary includes the cache hit rate from console.cache_provider.
         console.task_end(completed, failed=failed, status=status)
 
 
@@ -326,6 +323,8 @@ def main() -> int:
         skills=skills,
         mcp_manager=mcp_manager,
     )
+    # The status bar, /status and task summaries show prompt cache hit rates.
+    console.cache_provider = lambda: cache_totals(conversation)
 
     screen = (
         console.session_screen() if console.interactive is True and not prompt else nullcontext()

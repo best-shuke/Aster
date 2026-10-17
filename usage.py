@@ -214,6 +214,17 @@ class CacheStats:
                 }
             return snapshot
 
+    def totals(self):
+        """Session counters for live displays, without copying every scope."""
+        with self.lock:
+            return {
+                "calls": self.calls,
+                "prompt_tokens": self.prompt,
+                "hit_tokens": self.hit,
+                "hit_rate": self.hit / self.prompt if self.prompt else None,
+                "latest_hit_rate": (self.latest or {}).get("hit_rate"),
+            }
+
     def restore(self, saved):
         if not isinstance(saved, dict):
             return

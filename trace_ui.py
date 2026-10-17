@@ -12,31 +12,14 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import SearchToolbar, TextArea
 
-from execution_history import ArtifactPages, ExecutionEntry, plain, result_summary
-
-STATUS_LABELS = {
-    "ok": "完成",
-    "completed": "完成",
-    "running": "运行中",
-    "pending": "待执行",
-    "partial": "部分完成",
-    "timeout": "超时",
-    "unknown": "结果未知",
-    "error": "失败",
-    "not_executed": "未执行",
-}
-HEALTHY = {"ok", "completed", "pending", "running"}
-STATUS_ICONS = {
-    "ok": ("✓", "class:ok"),
-    "completed": ("✓", "class:ok"),
-    "running": ("◷", "class:accent"),
-    "pending": ("○", "class:muted"),
-    "partial": ("◐", "class:warn"),
-    "timeout": ("✗", "class:error"),
-    "unknown": ("?", "class:warn"),
-    "error": ("✗", "class:error"),
-    "not_executed": ("○", "class:warn"),
-}
+from execution_history import (
+    HEALTHY_STATUSES,
+    STATUS_DISPLAY,
+    ArtifactPages,
+    ExecutionEntry,
+    plain,
+    result_summary,
+)
 
 
 class TraceInspector:
@@ -81,7 +64,7 @@ class TraceInspector:
             entry
             for entry in self.entries
             if all(word in entry.searchable for word in query.split())
-            and (not self.errors_only or entry.status not in HEALTHY)
+            and (not self.errors_only or entry.status not in HEALTHY_STATUSES)
             and (not self.latest_task or (entry.run.get("trace") or {}).get("task_id") == task_id)
         ]
         self.filtered.sort(key=lambda entry: entry.run.get("started_at", float("inf")))
@@ -152,15 +135,14 @@ class TraceInspector:
             style = "class:selected" if selected else ""
             if selected:
                 fragments.append(("[SetCursorPosition]", ""))
-            icon, icon_style = STATUS_ICONS.get(entry.status, ("?", "class:warn"))
-            label = STATUS_LABELS.get(entry.status, entry.status)
+            icon, tone, label = STATUS_DISPLAY.get(entry.status, ("?", "warn", entry.status))
             duration = entry.run.get("duration_seconds")
             timing = f"{duration:.1f}s" if isinstance(duration, (int, float)) else ""
             agent = "" if entry.agent == "主代理" else f" · {entry.agent}"
             fragments.extend(
                 [
                     (style, " › " if selected else "   "),
-                    (style or icon_style, icon),
+                    (style or f"class:{tone}", icon),
                     (style, f" #{entry.number}  {entry.run.get('tool')}{agent}\n"),
                 ]
             )
@@ -177,7 +159,7 @@ class TraceInspector:
         scopes = ["当前任务" if self.latest_task else "整个会话"]
         if self.errors_only:
             scopes.append("仅异常")
-        failures = sum(entry.status not in HEALTHY for entry in self.entries)
+        failures = sum(entry.status not in HEALTHY_STATUSES for entry in self.entries)
         heading = [
             ("class:heading", "  执行轨迹"),
             ("class:muted", f" · {' / '.join(scopes)} · "),

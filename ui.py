@@ -3,6 +3,7 @@ import os
 import select
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -40,7 +41,13 @@ from rich.text import Text
 from rich.theme import Theme
 
 from config import APP_NAME
-from execution_history import ExecutionEntry, plain, result_summary
+from execution_history import (
+    HEALTHY_STATUSES,
+    STATUS_DISPLAY,
+    ExecutionEntry,
+    plain,
+    result_summary,
+)
 from execution_trace import current_trace
 from terminal_rendering import StreamingDisplay, TaskLive
 
@@ -83,6 +90,15 @@ _TASK_STATES = {
     "blocked": ("受阻", "yellow"),
     "incomplete": ("未完成", "yellow"),
     "background": ("后台继续", "cyan"),
+}
+
+_TASK_MARKERS = {"running": "●", "completed": "✓", "error": "✗", "timeout": "✗", "pending": "○"}
+_TONE_STYLES = {
+    "ok": "green",
+    "accent": "cyan",
+    "muted": "bright_black",
+    "warn": "yellow",
+    "error": "red",
 }
 
 _SLASH_COMMANDS = {
@@ -238,46 +254,68 @@ def _git_branch(workspace: Path) -> str | None:
             marker = directory / ".git"
             if marker.is_file():
                 pointer = marker.read_text(encoding="utf-8").strip()
-                if not pointer.startswith("gitdir:"):
+                marker = (directory / pointer.removeprefix("gitdir:").strip()).resolve()
+                if not pointer.startswith("gitdir:") or not marker.is_dir():
                     break
-                marker = (directory / pointer[7:].strip()).resolve()
-            if marker.is_dir():
-                head = (marker / "HEAD").read_text(encoding="utf-8").strip()
-                if head.startswith("ref: refs/heads/"):
-                    branch = head[16:]
-                elif head:
-                    branch = head[:8]
-                break
-    except (OSError, UnicodeDecodeError):
+            elif not marker.is_dir():
+                continue
+            head = (marker / "HEAD").read_text(encoding="utf-8").strip()
+            if head == "ref: refs/heads/.invalid":
+                # Reftable repositories keep only a stub HEAD file.
+                branch = subprocess.run(
+                    ["git", "-C", str(directory), "branch", "--show-current"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                    check=False,
+                ).stdout.strip()
+            elif head.startswith("ref: refs/heads/"):
+                branch = head[16:]
+            elif head:
+                branch = head[:8]
+            break
+    except (OSError, UnicodeDecodeError, subprocess.SubprocessError):
         branch = None
-    _GIT_CACHE[workspace] = (now, branch)
-    return branch
+    _GIT_CACHE[workspace] = (now, branch or None)
+    return branch or None
 
 
 def _usage_style(ratio: float) -> str:
     return "red" if ratio >= 0.9 else "yellow" if ratio >= 0.7 else "cyan"
 
 
-def _usage_bar(ratio: float, cells: int = 10) -> Text:
+def _filled_cells(ratio: float, cells: int) -> int:
     ratio = min(1.0, max(0.0, ratio))
-    filled = min(cells, round(ratio * cells)) or (1 if ratio > 0 else 0)
+    return min(cells, round(ratio * cells)) or (1 if ratio > 0 else 0)
+
+
+def _usage_bar(ratio: float, cells: int = 10) -> Text:
+    filled = _filled_cells(ratio, cells)
     bar = Text("━" * filled, style=_usage_style(ratio))
     bar.append("━" * (cells - filled), style="bright_black")
     return bar
 
 
-def _edit_stats(name: str, arguments: dict[str, Any]) -> tuple[int, int] | None:
-    """Changed line counts for an edit or a full-file write, from the call itself."""
-    if name == "write" and isinstance(arguments.get("content"), str):
-        return len(arguments["content"].splitlines()), 0
-    if name != "edit" or not isinstance(arguments.get("edits"), list):
-        return None
+def _edit_stats(edits: Any) -> tuple[int, int]:
+    """Changed line counts for edit-tool replacements, taken from the call arguments."""
     added = removed = 0
-    for item in arguments["edits"]:
+    for item in edits if isinstance(edits, list) else []:
         if not isinstance(item, dict):
             continue
         old = str(item.get("oldText") or "").splitlines()
         new = str(item.get("newText") or "").splitlines()
+        start = 0
+        while start < min(len(old), len(new)) and old[start] == new[start]:
+            start += 1
+        end = 0
+        while end < min(len(old), len(new)) - start and old[-1 - end] == new[-1 - end]:
+            end += 1
+        old, new = old[start : len(old) - end], new[start : len(new) - end]
+        if len(old) * len(new) > 40_000:
+            # Exact matching is quadratic; runs in the display callback, so stay rough.
+            removed += len(old)
+            added += len(new)
+            continue
         matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
         for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
             if tag in {"replace", "delete"}:
@@ -573,8 +611,10 @@ class Console:
         self.cache_provider: Callable[[], dict[str, Any] | None] | None = None
         self._active_tool_number = 0
         self._active_tool: tuple[str, dict[str, Any]] | None = None
-        # Files the main agent edited in the current task: path -> [added, removed].
-        self._changed_files: dict[str, list[int]] = {}
+        # Files the main agent changed in this task: path -> [added, removed, lines written].
+        self._changed_files: dict[str, list[int | None]] = {}
+        # Cache counters (prompt, hit tokens) when the task started, for its own hit rate.
+        self._cache_base: tuple[int, int] | None = None
 
     def update_context(self, snapshot: dict[str, Any]) -> None:
         self._context = dict(snapshot)
@@ -637,12 +677,26 @@ class Console:
     def _toolbar(self) -> str:
         return "".join(text for _, text in self._toolbar_fragments())
 
-    def _cache_rate(self) -> float | None:
+    def _cache_totals(self) -> dict[str, Any] | None:
         try:
-            stats = self.cache_provider() if self.cache_provider is not None else None
+            return self.cache_provider() if self.cache_provider is not None else None
         except Exception:
+            # Display only: a failing provider must not break the prompt or task.
             return None
-        return (stats or {}).get("hit_rate")
+
+    def _cache_rate(self) -> float | None:
+        return (self._cache_totals() or {}).get("hit_rate")
+
+    def _task_cache_rate(self) -> float | None:
+        totals = self._cache_totals()
+        if not totals or self._cache_base is None:
+            return None
+        prompt = totals.get("prompt_tokens", 0) - self._cache_base[0]
+        hit = totals.get("hit_tokens", 0) - self._cache_base[1]
+        return hit / prompt if prompt > 0 else None
+
+    def _output_tokens(self) -> int:
+        return sum(item.get("tokens") or 0 for item in tuple(self._performance.values()))
 
     def _toolbar_fragments(self) -> list[tuple[str, str]]:
         """Bottom status line; lower-priority items drop out first on narrow terminals."""
@@ -656,6 +710,8 @@ class Console:
         team = self._team_label()
         if team:
             items.append((0, [("class:toolbar.accent", team)]))
+        # Labels that may be shortened, in order, when the core items do not fit.
+        shrinkable = [item[1] for item in items]
         items.append((3, [("class:toolbar.strong", self.model.rsplit("/", 1)[-1])]))
         items.append((5, [("", f"推理 {self.reasoning_effort}")]))
         if self._context:
@@ -667,7 +723,7 @@ class Console:
                 level = "class:toolbar.warn"
             segments = [("", "上下文 " if width >= 70 else "CTX ")]
             if width >= 100:
-                filled = min(8, round(ratio * 8)) or (1 if ratio > 0 else 0)
+                filled = _filled_cells(ratio, 8)
                 segments += [(level, "━" * filled), ("class:toolbar.dim", "━" * (8 - filled) + " ")]
             segments += [
                 (level, f"{ratio:.1%}" if width >= 70 else ""),
@@ -709,6 +765,12 @@ class Console:
         if measure(visible) > width and width < 40 and self._context:
             lines = [environment, self._context_label(compact=True), self._tps_label()]
             return [("", "\n".join(_ellipsize(line, width) for line in lines))]
+        for segments in shrinkable:
+            excess = measure(visible) - width
+            if excess <= 0:
+                break
+            style, text = segments[0]
+            segments[0] = (style, _ellipsize(text, max(6, _display_width(text) - excess)))
         fragments: list[tuple[str, str]] = []
         for index, (_, segments) in enumerate(visible):
             if index:
@@ -721,10 +783,13 @@ class Console:
             if room <= 0:
                 break
             if _display_width(text) > room:
-                fitted.append((style, _ellipsize(text, room)))
+                if text != " · " and room > 1:
+                    fitted.append((style, _ellipsize(text, room)))
                 break
             fitted.append((style, text))
             used += _display_width(text)
+        while fitted and fitted[-1][1] == " · ":
+            fitted.pop()
         return fitted
 
     def _team_label(self) -> str:
@@ -1069,7 +1134,7 @@ class Console:
             else:
                 usage.append(("压缩阈值", f"{snapshot['budget_tokens']:,} tokens"))
         usage.append(("速度", self._tps_label()))
-        output_tokens = sum(item.get("tokens") or 0 for item in tuple(self._performance.values()))
+        output_tokens = self._output_tokens()
         if output_tokens:
             usage.append(("输出", f"{output_tokens:,} tokens（上次任务）"))
         if self._tool_count:
@@ -1082,17 +1147,16 @@ class Console:
                     ),
                 )
             )
-        try:
-            cache = self.cache_provider() if self.cache_provider is not None else None
-        except Exception:
-            cache = None
+        cache = self._cache_totals()
         if cache and cache.get("calls"):
             rate = cache.get("hit_rate")
-            latest = (cache.get("latest") or {}).get("hit_rate")
-            text = f"会话 {rate:.1%}" if rate is not None else "会话 未知"
-            if latest is not None:
-                text += f" · 最近一次 {latest:.1%}"
-            usage.append(("缓存", text))
+            parts = [f"会话 {rate:.1%}" if rate is not None else "会话 未知"]
+            task = self._task_cache_rate()
+            if task is not None:
+                parts.append(f"上次任务 {task:.1%}")
+            if cache.get("latest_hit_rate") is not None:
+                parts.append(f"最近一次 {cache['latest_hit_rate']:.1%}")
+            usage.append(("缓存", " · ".join(parts)))
 
         session = [
             ("记录", f"{'已恢复' if history_count else '空'} · {history_count} 条"),
@@ -1185,11 +1249,14 @@ class Console:
                     event.current_buffer.cancel_completion()
 
             # Alt-Enter and Ctrl-J already mean Enter in some terminals, so a trailing
-            # backslash is the unambiguous way to continue on a new line.
+            # backslash continues the chat message; answers and paths keep a literal one.
             @bindings.add(
                 "enter",
                 filter=Condition(
-                    lambda: get_app().current_buffer.document.text_before_cursor.endswith("\\")
+                    lambda: (
+                        not isolated
+                        and get_app().current_buffer.document.text_before_cursor.endswith("\\")
+                    )
                 ),
             )
             def insert_newline(event) -> None:
@@ -1469,7 +1536,9 @@ class Console:
                 "custom": False,
             }
 
-    def _dashboard(self, *, compact: bool = True, max_height: int | None = None) -> Panel | Group:
+    def _dashboard(
+        self, *, compact: bool = True, max_height: int | None = None, metrics: bool = True
+    ) -> Panel | Group:
         width = self.terminal_width()
         if self._live is not None:
             self._live.console.width = width
@@ -1484,9 +1553,7 @@ class Console:
         if compact:
             status = f"{state} · {_duration(elapsed, compact=True)}"
             title_width = max(1, min(36, width - _display_width(status) - 7))
-            marker = {"running": "●", "completed": "✓", "error": "✗", "pending": "○"}.get(
-                self._task_state, "◇"
-            )
+            marker = _TASK_MARKERS.get(self._task_state, "◇")
             heading = Text(f"  {marker} ", style=style)
             heading.append(_ellipsize(self._task_title or "当前任务", title_width), style="bold")
             gap = max(2, width - 1 - heading.cell_len - _display_width(status))
@@ -1570,30 +1637,28 @@ class Console:
         agent_rows = content[len(header) + len(todo_rows) :]
         context = self._context_label(compact=width < 60)
         footer = " · ".join(part for part in (context, self._tps_label()) if part)
-        if compact and context and _display_width(footer) > available:
+        if metrics and compact and context and _display_width(footer) > available:
             content.append(Text(_ellipsize(f"  {context}", available), style=self._context_style()))
             content.append(Text(f"  {self._tps_label()}", style="dim"))
-        else:
-            metrics = Text("  ")
+        elif metrics:
+            row = Text("  ")
             if context:
-                metrics.append(context, style=self._context_style())
-                metrics.append(" · ", style="dim")
-            metrics.append(self._tps_label(), style="dim")
+                row.append(context, style=self._context_style())
+                row.append(" · ", style="dim")
+            row.append(self._tps_label(), style="dim")
             if width >= 70:
-                output_tokens = sum(
-                    item.get("tokens") or 0 for item in tuple(self._performance.values())
-                )
+                output_tokens = self._output_tokens()
                 if output_tokens:
-                    metrics.append(f" · 输出 {_token_count(output_tokens)}", style="dim")
+                    row.append(f" · 输出 {_token_count(output_tokens)}", style="dim")
                 if self._tool_count:
-                    metrics.append(f" · 工具 {self._tool_count}", style="dim")
+                    row.append(f" · 工具 {self._tool_count}", style="dim")
                 if self._tool_errors:
-                    metrics.append(f" · 异常 {self._tool_errors}", style="yellow")
-                cache = self._cache_rate()
+                    row.append(f" · 异常 {self._tool_errors}", style="yellow")
+                cache = self._task_cache_rate()
                 if cache is not None:
-                    metrics.append(f" · 缓存 {cache:.0%}", style="dim")
-            metrics.truncate(available, overflow="ellipsis")
-            content.append(metrics)
+                    row.append(f" · 缓存 {cache:.0%}", style="dim")
+            row.truncate(available, overflow="ellipsis")
+            content.append(row)
         if compact:
             if max_height is not None and len(content) > max_height:
                 footer_rows = content[len(header) + len(todo_rows) + len(agent_rows) :]
@@ -1912,6 +1977,10 @@ class Console:
         self._tool_errors = 0
         self._active_tool = None
         self._changed_files.clear()
+        totals = self._cache_totals()
+        self._cache_base = (
+            (totals.get("prompt_tokens", 0), totals.get("hit_tokens", 0)) if totals else None
+        )
         self._clear_preview()
         self._task_started = time.monotonic()
         if self.interactive:
@@ -1953,7 +2022,10 @@ class Console:
             self._live = None
         rich = self._rich()
         if self._todos or self._agents:
-            rich.print(self._dashboard())
+            rich.print(self._dashboard(metrics=False))
+            summary = self._task_summary(state=False)
+            if summary.plain.strip():
+                rich.print(summary)
         elif self._task_started is not None:
             rich.print(self._task_summary())
         if self._changed_files:
@@ -1979,7 +2051,7 @@ class Console:
             parts.append((f"工具 {self._tool_count}", "dim"))
             if self._tool_errors:
                 parts.append((f"异常 {self._tool_errors}", "yellow"))
-        output_tokens = sum(item.get("tokens") or 0 for item in tuple(self._performance.values()))
+        output_tokens = self._output_tokens()
         if output_tokens:
             parts.append((f"输出 {_token_count(output_tokens)}", "dim"))
         speed = self._tps_label()
@@ -1993,21 +2065,26 @@ class Console:
                     self._context_style(),
                 )
             )
-        cache = self._cache_rate()
+        cache = self._task_cache_rate()
         if cache is not None:
             parts.append((f"缓存 {cache:.0%}", "dim"))
         return parts
 
-    def _task_summary(self) -> Text:
+    def _task_summary(self, *, state: bool = True) -> Text:
+        """The task outcome and its statistics; parts that do not fit are left out."""
         width = self.terminal_width() - 1
-        label, style = _TASK_STATES.get(self._task_state, (self._task_state, "yellow"))
-        icon = {"completed": "✓", "error": "✗", "timeout": "✗"}.get(self._task_state, "◇")
-        line = Text(f"  {icon} {label}", style=f"bold {style}")
-        line.append(f" · {_duration(self._task_elapsed)}", style=style)
+        line = Text("  ")
+        if state:
+            label, style = _TASK_STATES.get(self._task_state, (self._task_state, "yellow"))
+            line.append(
+                f"{_TASK_MARKERS.get(self._task_state, '◇')} {label}", style=f"bold {style}"
+            )
+            line.append(f" · {_duration(self._task_elapsed)}", style=style)
         for text, part_style in self._metric_parts():
-            if line.cell_len + 3 + _display_width(text) > width:
+            separator = " · " if line.plain.strip() else ""
+            if line.cell_len + len(separator) + _display_width(text) > width:
                 continue
-            line.append(" · ", style="bright_black")
+            line.append(separator, style="bright_black")
             line.append(text, style=part_style)
         return line
 
@@ -2016,11 +2093,14 @@ class Console:
         files = list(self._changed_files.items())
         line = Text("  ✎ ", style="bold cyan")
         line.append(f"修改 {len(files)} 个文件", style="bold")
-        for index, (path, (added, removed)) in enumerate(files):
+        for index, (path, (added, removed, written)) in enumerate(files):
             entry = Text("  " if index == 0 else " · ", style="bright_black")
             entry.append(_short_path(path, 48))
-            entry.append(f" +{added}", style="green")
-            entry.append(f" -{removed}", style="red")
+            if written is not None:
+                entry.append(f" 写入 {written} 行", style="cyan")
+            if added or removed or written is None:
+                entry.append(f" +{added}", style="green")
+                entry.append(f" -{removed}", style="red")
             remaining = len(files) - index
             more = Text(f" · 另 {remaining} 个", style="dim")
             reserve = more.cell_len if remaining > 1 else 0
@@ -2225,19 +2305,15 @@ class Console:
         status = result.get("status") or "error"
         if status != "ok":
             self._tool_errors += 1
-        icon, style, label = {
-            "ok": ("✓", "green", ""),
-            "partial": ("◐", "yellow", "部分完成"),
-            "timeout": ("✗", "red", "超时"),
-            "unknown": ("?", "yellow", "结果未知"),
-            "error": ("✗", "red", "失败"),
-        }.get(status, ("?", "yellow", str(status)))
+        icon, tone, label = STATUS_DISPLAY.get(status, ("?", "warn", str(status)))
+        label = "" if status == "ok" else label
         data = result.get("data") or {}
         if status == "ok" and name == "monitor" and data.get("event") == "matched":
             label = "条件满足"
         elif status == "ok" and data.get("state") in {"running", "waiting"}:
-            icon, style = "◷", "cyan"
+            icon, tone, _ = STATUS_DISPLAY["running"]
             label = "等待中" if name == "monitor" else "运行中"
+        style = _TONE_STYLES[tone]
         entry = self._current_execution()
         pending, self._active_tool = self._active_tool, None
         if entry is not None:
@@ -2255,51 +2331,83 @@ class Console:
             rich.print(self._plan_line(data, number, width))
             return
 
-        stats = _edit_stats(name, arguments) if status == "ok" else None
-        if stats is not None and name in {"edit", "write"}:
+        output = data.get("output") if name in {"exec", "monitor"} else None
+        output_lines = (
+            plain(output).rstrip().splitlines()
+            if isinstance(output, str) and output.strip()
+            else []
+        )
+        folded = len(output_lines) - 3 if len(output_lines) > 4 else 0
+
+        facts = Text(style="dim")
+        if status == "ok" and name in {"edit", "write"}:
             path = _workspace_path(data.get("path") or arguments.get("path") or "", self.workspace)
-            totals = self._changed_files.setdefault(path, [0, 0])
-            totals[0] += stats[0]
-            totals[1] += stats[1]
-
-        meta = Text()
-        if label:
-            meta.append(label, style=f"bold {style}")
-        if name == "write" and stats is not None:
-            facts = f"{stats[0]} 行"
-        elif name == "edit" and stats is not None:
-            facts = ""
-            meta.append(" · " if meta else "", style="dim")
-            meta.append(f"+{stats[0]}", style="green")
-            meta.append(" ", style="dim")
-            meta.append(f"-{stats[1]}", style="red")
+            changed = self._changed_files.setdefault(path, [0, 0, None])
+            if name == "write" and isinstance(arguments.get("content"), str):
+                # A full write may replace an existing file, so it is not reported as a diff.
+                written = len(arguments["content"].splitlines())
+                self._changed_files[path] = [0, 0, written]
+                facts.append(f"{written} 行")
+            elif name == "edit":
+                added, removed = _edit_stats(arguments.get("edits"))
+                changed[0] += added
+                changed[1] += removed
+                facts.append(f"+{added}", style="green")
+                facts.append(" ")
+                facts.append(f"-{removed}", style="red")
         else:
-            facts = result_summary({**result, "error": None})
-        if data.get("merged"):
-            facts = " · ".join(part for part in (facts, "已合并并行修改") if part)
-        if isinstance(duration, (int, float)) and duration >= 0.1:
-            facts = " · ".join(part for part in (facts, _duration_short(duration)) if part)
-        if facts:
-            meta.append((" · " if meta else "") + facts, style="dim")
-        if number:
-            meta.append(("  " if meta else "") + f"#{number}", style="bright_black")
+            facts.append(result_summary({**result, "error": None}))
+        for extra in (
+            "已合并并行修改" if data.get("merged") else "",
+            _duration_short(duration)
+            if isinstance(duration, (int, float)) and duration >= 0.1
+            else "",
+        ):
+            if extra:
+                facts.append(" · " if facts else "")
+                facts.append(extra)
 
+        # Always kept: the outcome and how to open the call.
+        status_text = Text(label, style=f"bold {style}")
+        # Commands keep their output in a file even when it is short; point there only
+        # when the result shown to the model was cut.
+        if result.get("artifact_path") and result.get("truncated") and number and not folded:
+            reference = Text(f"/tool {number} 查看全文", style="bright_black")
+        else:
+            reference = Text(f"#{number}" if number else "", style="bright_black")
         line = Text("  ")
         line.append(icon, style=f"bold {style}")
         line.append(" ")
         line.append(_TOOL_LABELS.get(name, name), style="bold")
+        fixed = line.cell_len
+        fixed += (2 + status_text.cell_len) if status_text else 0
+        fixed += (2 + reference.cell_len) if reference else 0
+        room = max(0, width - fixed)
         target = self._tool_target(name, arguments)
-        room = width - line.cell_len - meta.cell_len - 4
-        if target and room >= 8:
+        target_need = 2 + _display_width(target) if target else 0
+        facts_need = ((3 if status_text else 2) + facts.cell_len) if facts else 0
+        if target_need + facts_need > room:
+            # Shrink the result facts first, then the target, keeping each readable.
+            target_room = max(min(target_need, 14), room - facts_need)
+            facts_room = room - target_room
+            if facts_room < facts_need and facts_room < (3 if status_text else 2) + 6:
+                facts = Text()
+                target_room = room
+            elif facts:
+                facts.truncate(facts_room - (3 if status_text else 2), overflow="ellipsis")
+            target = _ellipsize(target, target_room - 2) if target_room >= 5 else ""
+        if target:
             line.append("  ")
-            line.append(_ellipsize(target, room))
-        elif target:
+            line.append(target)
+        if status_text:
             line.append("  ")
-            line.append(_ellipsize(target, max(8, width - line.cell_len - 2)))
-            meta.truncate(max(0, width - line.cell_len - 2), overflow="ellipsis")
-        if meta:
+            line.append_text(status_text)
+        if facts:
+            line.append(" · " if status_text else "  ", style="dim")
+            line.append_text(facts)
+        if reference:
             line.append("  ")
-            line.append_text(meta)
+            line.append_text(reference)
         line.truncate(width, overflow="ellipsis")
         rich.print(line)
 
@@ -2310,11 +2418,8 @@ class Console:
             reason = Text("    ╰ ", style="bright_black")
             reason.append(_ellipsize(message, max(8, width - 6)), style=style)
             rich.print(reason)
-        output = data.get("output") if name in {"exec", "monitor"} else None
-        if isinstance(output, str) and output.strip():
-            lines = plain(output).rstrip().splitlines()
-            folded = len(lines) - 3
-            visible = lines if folded <= 1 else [lines[0], None, *lines[-2:]]
+        if output_lines:
+            visible = [output_lines[0], None, *output_lines[-2:]] if folded else output_lines
             for text in visible:
                 row = Text("    │ ", style="bright_black")
                 if text is None:
@@ -2399,7 +2504,7 @@ class Console:
         for entry in entries:
             if query and not all(word in entry.searchable for word in query.casefold().split()):
                 continue
-            if errors and entry.status in {"ok", "completed", "pending", "running"}:
+            if errors and entry.status in HEALTHY_STATUSES:
                 continue
             label = (
                 "完成"

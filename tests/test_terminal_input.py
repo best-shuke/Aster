@@ -701,6 +701,10 @@ print('RESULT:' + json.dumps({'status': status,
         keys = [b"first \\", (b"first", b"\r"), (b"\\", b"second\r")]
         self.assertEqual(self.read_keys(keys, width=60), {"value": "first \nsecond"})
 
+    def test_answers_and_paths_keep_a_trailing_backslash(self):
+        code = CHILD_CODE.replace("console.prompt()", "console.read_value('  You  › ')")
+        self.assertEqual(self.read_keys(b"C:\\work\\\r", code=code), {"value": "C:\\work\\"})
+
     def test_chunked_bracketed_paste_is_not_truncated(self):
         pasted = "\n".join(f"第 {index} 行：" + "内容" * 20 for index in range(24))
         payload = pasted.encode()

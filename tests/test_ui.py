@@ -2,8 +2,10 @@ import io
 import os
 import select
 import signal
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -20,6 +22,7 @@ from ui import (
     Console,
     _CommandCompleter,
     _display_width,
+    _edit_stats,
     _ellipsize,
     _git_branch,
     _reasoning_text,
@@ -1752,6 +1755,13 @@ class TeamBackgroundDisplayTests(unittest.TestCase):
 
 
 class ReadableOutputTests(unittest.TestCase):
+    def console(self, *args, **kwargs):
+        console = Console(*args, **kwargs)
+        # The same output whether or not the test runner is attached to a terminal.
+        console.interactive = False
+        console.colors = False
+        return console
+
     def render(self, action, width=100):
         output = io.StringIO()
         with (
@@ -1770,7 +1780,7 @@ class ReadableOutputTests(unittest.TestCase):
         self.assertEqual(_short_path("/tmp/a", 40), "/tmp/a")
 
     def test_each_call_is_one_line_with_its_outcome_and_number(self):
-        console = Console(workspace=Path("/work"))
+        console = self.console(workspace=Path("/work"))
 
         def run():
             console.tool("read", {"path": "/work/src/app.py", "offset": 40})
@@ -1779,8 +1789,46 @@ class ReadableOutputTests(unittest.TestCase):
         rendered = self.render(run)
         self.assertEqual(rendered.splitlines(), ["  ✓ 读取  src/app.py:40  2 行  #1"])
 
+    def test_narrow_lines_keep_the_outcome_and_call_number(self):
+        console = self.console()
+        console._active_tool_number = 57
+        result = {
+            "status": "timeout",
+            "data": {"session_id": "3f2a9c1b", "state": "running", "output": ""},
+        }
+        for width in (50, 80):
+            with self.subTest(width=width):
+                console._active_tool = (
+                    "monitor",
+                    {"action": "wait", "session_id": "3f2a9c1b", "wait_for": "Compiled ok"},
+                )
+                line = self.render(lambda: console.tool_result("monitor", result), width).split(
+                    "\n"
+                )[0]
+                self.assertIn("超时", line)
+                self.assertTrue(line.endswith("#57"), line)
+                self.assertLessEqual(_display_width(line), width - 1)
+
+    def test_truncated_results_point_to_the_retained_full_output(self):
+        console = self.console()
+
+        def run(truncated):
+            console.tool("grep", {"pattern": "TODO", "path": "."})
+            console.tool_result(
+                "grep",
+                {
+                    "status": "ok",
+                    "data": {"matches": [1, 2]},
+                    "artifact_path": "/tmp/out.txt",
+                    "truncated": truncated,
+                },
+            )
+
+        self.assertIn("当前为部分结果  /tool 1 查看全文", self.render(lambda: run(True)))
+        self.assertIn("2 条匹配  #2", self.render(lambda: run(False)))
+
     def test_failed_call_shows_the_reason_without_the_workspace_prefix(self):
-        console = Console(workspace=Path("/work"))
+        console = self.console(workspace=Path("/work"))
 
         def run():
             console.tool("read", {"path": "missing.toml"})
@@ -1800,9 +1848,8 @@ class ReadableOutputTests(unittest.TestCase):
         self.assertEqual(lines[1].strip(), "╰ No file: missing.toml")
         self.assertEqual(console._tool_errors, 1)
 
-    def test_edits_report_changed_lines_and_the_task_lists_changed_files(self):
-        console = Console(workspace=Path("/work"))
-        console.colors = False
+    def test_edits_report_changed_lines_and_writes_report_their_size(self):
+        console = self.console(workspace=Path("/work"))
         edit = {
             "path": "/work/ui.py",
             "edits": [{"oldText": "a\nb\nc\n", "newText": "a\nB\nc\nd\n"}],
@@ -1819,10 +1866,24 @@ class ReadableOutputTests(unittest.TestCase):
         rendered = self.render(run)
         self.assertIn("✓ 修改  ui.py  +2 -1  #1", rendered)
         self.assertIn("✓ 写入  new.py  2 行  #2", rendered)
-        self.assertIn("✎ 修改 2 个文件  ui.py +2 -1 · new.py +2 -0", rendered)
+        self.assertIn("✎ 修改 2 个文件  ui.py +2 -1 · new.py 写入 2 行", rendered)
+        self.assertNotIn("new.py 写入 2 行 +", rendered)
+
+    def test_large_repetitive_edits_are_counted_quickly(self):
+        old = "\n".join("}" if index % 2 else "" for index in range(6000))
+        new = "\n".join("{" if index % 3 else "" for index in range(6000))
+        started = time.monotonic()
+        added, removed = _edit_stats([{"oldText": old, "newText": new}])
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertGreater(added, 0)
+        self.assertGreater(removed, 0)
+        self.assertEqual(
+            _edit_stats([{"oldText": "keep\nold\nkeep", "newText": "keep\nnew\nkeep"}]),
+            (1, 1),
+        )
 
     def test_plan_updates_show_progress_and_the_current_step(self):
-        console = Console()
+        console = self.console()
         plan = {
             "title": "整理界面",
             "steps": [
@@ -1839,7 +1900,7 @@ class ReadableOutputTests(unittest.TestCase):
         self.assertEqual(self.render(run).splitlines(), ["  ☰ 计划  改进输出  1/3  #1"])
 
     def test_long_command_output_is_folded_with_a_pointer_to_the_full_result(self):
-        console = Console()
+        console = self.console()
 
         def run():
             console.tool("exec", {"command": "make test"})
@@ -1847,7 +1908,11 @@ class ReadableOutputTests(unittest.TestCase):
                 "exec",
                 {
                     "status": "ok",
-                    "data": {"output": "\n".join(f"line {n}" for n in range(10)), "exit_code": 0},
+                    "data": {
+                        "output": "\n".join(f"line {n}" for n in range(10)),
+                        "exit_code": 0,
+                    },
+                    "artifact_path": "/tmp/out.txt",
                 },
             )
 
@@ -1858,12 +1923,21 @@ class ReadableOutputTests(unittest.TestCase):
             ["│ line 0", "│ … 省略 7 行 · /tool 1 查看全部", "│ line 8", "│ line 9"],
         )
 
-    def test_task_summary_reports_time_tools_output_speed_context_and_cache(self):
-        console = Console()
-        console.cache_provider = lambda: {"calls": 2, "hit_rate": 0.875}
+    def cache_task(self, console, *, plan=False):
+        totals = {"calls": 2, "prompt_tokens": 1000, "hit_tokens": 100, "hit_rate": 0.1}
+        console.cache_provider = lambda: totals
 
         def run():
             console.task_start("问题")
+            totals.update(prompt_tokens=2000, hit_tokens=975, hit_rate=0.4875)
+            if plan:
+                console.task_update(
+                    {
+                        "phase": "plan",
+                        "title": "问题",
+                        "steps": [{"step": "做", "status": "completed"}],
+                    }
+                )
             console.update_context(
                 {"tokens": 12000, "window_tokens": 1000000, "budget_tokens": 983616}
             )
@@ -1880,12 +1954,25 @@ class ReadableOutputTests(unittest.TestCase):
             console.tool_result("ls", {"status": "error", "error": {"message": "denied"}})
             console.task_end(True)
 
-        summary = self.render(run).splitlines()[-1]
+        return run
+
+    def test_task_summary_reports_time_tools_output_speed_context_and_task_cache(self):
+        console = self.console()
+        summary = self.render(self.cache_task(console)).splitlines()[-1]
         for value in ("✓ 已完成", "工具 1", "异常 1", "输出 200", "TPS 50.0", "1.2%", "缓存 88%"):
             self.assertIn(value, summary)
 
+    def test_planned_task_keeps_full_statistics_on_narrow_terminals(self):
+        console = self.console()
+        lines = self.render(self.cache_task(console, plan=True), width=60).splitlines()
+        heading = lines.index(next(line for line in lines if "已完成" in line))
+        self.assertIn("Todo · 1/1", lines[heading + 1])
+        self.assertIn("缓存 88%", lines[-1])
+        self.assertNotIn("已完成", lines[-1])
+        self.assertTrue(all(_display_width(line) <= 59 for line in lines[heading:]))
+
     def test_toolbar_shows_model_effort_and_cache_then_drops_hints_when_narrow(self):
-        console = Console("provider/model-x", reasoning_effort="high")
+        console = self.console("provider/model-x", reasoning_effort="high")
         console.cache_provider = lambda: {"hit_rate": 0.5}
         console.update_context({"tokens": 900000, "window_tokens": 1000000, "budget_tokens": 1})
         with patch.object(Console, "terminal_width", return_value=160):
@@ -1902,8 +1989,26 @@ class ReadableOutputTests(unittest.TestCase):
         self.assertIn("TPS", narrow)
         self.assertLessEqual(_display_width(narrow), 69)
 
+    def test_toolbar_shortens_long_labels_before_hiding_context(self):
+        console = self.console()
+        console.environment_name = "multi-agent-research-environment"
+        console.update_team(
+            {"phase": "team", "background": "running", "working": ["a", "b", "c", "d"]}
+        )
+        console.update_context({"tokens": 950000, "window_tokens": 1000000, "budget_tokens": 1})
+        for width in (60, 70, 100):
+            with (
+                self.subTest(width=width),
+                patch.object(Console, "terminal_width", return_value=width),
+            ):
+                toolbar = console._toolbar()
+                self.assertIn("95", toolbar)
+                self.assertIn("TPS", toolbar)
+                self.assertFalse(toolbar.endswith(" · "))
+                self.assertLessEqual(_display_width(toolbar), width - 1)
+
     def test_help_groups_commands_and_keeps_bracketed_arguments(self):
-        console = Console()
+        console = self.console()
         sections = (
             ("环境", (("/env 名称 [keep] [--yes]", "切换环境"),)),
             ("快捷键", (("Ctrl-T", "轨迹"),)),
@@ -1919,8 +2024,14 @@ class ReadableOutputTests(unittest.TestCase):
         self.assertEqual(self.render(lambda: console.help("plain help")), "plain help\n")
 
     def test_status_is_grouped_and_includes_usage_and_cache(self):
-        console = Console("model-x")
-        console.cache_provider = lambda: {"calls": 3, "hit_rate": 0.5, "latest": {"hit_rate": 0.9}}
+        console = self.console("model-x")
+        console.cache_provider = lambda: {
+            "calls": 3,
+            "prompt_tokens": 100,
+            "hit_tokens": 50,
+            "hit_rate": 0.5,
+            "latest_hit_rate": 0.9,
+        }
         console.update_context({"tokens": 12000, "window_tokens": 1000000, "budget_tokens": 983616})
         rendered = self.render(lambda: console.status(Path("/tmp/session.json"), 4))
         for value in ("运行", "能力", "用量", "会话", "12k / 1M tokens · 1.2%", "会话 50.0%"):
@@ -1940,3 +2051,18 @@ class ReadableOutputTests(unittest.TestCase):
             (root / "gitdir" / "HEAD").write_text("0123456789abcdef\n")
             (root / "linked" / ".git").write_text(f"gitdir: {root / 'gitdir'}\n")
             self.assertEqual(_git_branch(root / "linked"), "01234567")
+            # A pruned worktree must not report the enclosing repository's branch.
+            (root / "repo" / "pruned").mkdir()
+            (root / "repo" / "pruned" / ".git").write_text("gitdir: ../missing/worktrees/x\n")
+            self.assertIsNone(_git_branch(root / "repo" / "pruned"))
+
+    def test_git_branch_of_a_reftable_repository_comes_from_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            created = subprocess.run(
+                ["git", "init", "-q", "--ref-format=reftable", "-b", "trunk", directory],
+                capture_output=True,
+                check=False,
+            )
+            if created.returncode:
+                self.skipTest("git without reftable support")
+            self.assertEqual(_git_branch(Path(directory)), "trunk")
