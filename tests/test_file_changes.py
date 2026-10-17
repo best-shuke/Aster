@@ -317,6 +317,32 @@ class LedgerToolTests(unittest.TestCase):
         }
         return json.loads(self.tools.execute(call))
 
+    def test_a_read_is_the_merge_base_and_hashes_the_file_once(self):
+        target = self.root / "notes.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        with patch("tools.file_digest", side_effect=file_digest) as digest:
+            page = self.execute("read", {"path": "notes.txt", "offset": 2, "limit": 1})
+        self.assertEqual(page["data"]["content"], "two\n")
+        # Only the check that the file did not change while it was read hashes it again.
+        self.assertEqual(digest.call_count, 1)
+        # A teammate writes a disjoint change; an edit based on this read merges with it.
+        self.tools.edit_ledger.record_write(target, "one\ntwo\nthree\nfour\n")
+        target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+        result = self.execute(
+            "edit", {"path": "notes.txt", "edits": [{"oldText": "one", "newText": "ONE"}]}
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("merged", result["data"])
+        self.assertEqual(target.read_text(), "ONE\ntwo\nthree\nfour\n")
+
+    def test_files_that_cannot_merge_are_still_read_page_by_page(self):
+        target = self.root / "mixed.txt"
+        # Invalid UTF-8 far past the first page: it is never merged, but its start reads.
+        target.write_bytes(b"first\n" + b"x" * 100_000 + b"\n\xff\n")
+        page = self.execute("read", {"path": "mixed.txt", "limit": 1})
+        self.assertEqual(page["data"]["content"], "first\n")
+        self.assertFalse(self.tools.edit_ledger.contents)
+
     def test_undecodable_changes_by_others_report_file_changed(self):
         target = self.root / "data.txt"
         target.write_text("alpha\n", encoding="utf-8")

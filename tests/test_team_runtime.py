@@ -14,6 +14,7 @@ from environments import EnvironmentStore
 from main import handle_command
 from skills import SkillCatalog
 from team_state import TeamStore
+from team_tools import duration_text
 from tests.team_support import (
     ANSWER,
     Steps,
@@ -1588,20 +1589,18 @@ class BackgroundWorkTests(TeamTestCase):
         release.set()
         self.assertTrue(wait_until(lambda: not conversation.team.in_background))
 
-    def test_an_activation_outliving_its_turn_deadline_continues_in_the_background(self):
-        calls = []
+    def test_work_that_may_continue_in_the_background_outlives_the_turn_deadline(self):
+        release, deadlines, close = threading.Event(), [], []
 
         def engineer(messages, tools):
-            calls.append(1)
-            if len(calls) == 1:
-                deadline = script.options()["deadline"]
-                time.sleep(max(0, deadline - time.monotonic()) + 0.05)
-                raise CompletionError("task_deadline", "Task deadline reached")
+            deadlines.append(script.options()["deadline"])
+            release.wait(10)
             return say("Done after the turn deadline.")
 
         def send_with_a_close_deadline(messages, tools):
-            # The turn's own deadline, not the activation timeout, bounds this activation.
-            conversation.team.turn_deadline = time.monotonic() + 1.5
+            # A turn deadline closer than the activation timeout no longer bounds the work.
+            close.append(time.monotonic() + 0.2)
+            conversation.team.turn_deadline = close[0]
             return team("send_message", to=["engineer"], kind="request", content="Build")
 
         script = TeamScript(
@@ -1610,13 +1609,81 @@ class BackgroundWorkTests(TeamTestCase):
         )
         conversation = self.background_conversation(script)
         self.ask(conversation)
+        self.assertTrue(wait_until(lambda: time.monotonic() > close[0] + 0.1))
+        release.set()
         self.assertTrue(wait_until(lambda: not conversation.team.in_background))
-        cancelled = self.events(conversation, "activation_cancelled")
-        self.assertEqual(cancelled[0]["reason"], "turn_deadline")
-        self.assertEqual(len(calls), 2)
+        self.assertGreater(deadlines[0], close[0] + 5)
+        self.assertFalse(self.events(conversation, "activation_cancelled"))
+        self.assertEqual(len(script.requests["engineer"]), 1)
         lines = "\n".join(conversation.team.result_lines())
         self.assertIn("Done after the turn deadline.", lines)
         self.assertNotIn("no report", lines)
+
+    def test_work_finishing_while_the_next_turn_starts_belongs_to_that_turn(self):
+        release = threading.Event()
+
+        def engineer(messages, tools):
+            release.wait(10)
+            return say("Done during compaction.")
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build"),
+                say("Building."),
+                say("Building."),
+                team("wait", timeout=30),
+                lambda messages, tools: say(last_tool(messages)["data"]["items"][0]["content"]),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        self.ask(conversation)
+        self.assertTrue(conversation.team.in_background)
+        compact = conversation.compact
+
+        def compact_while_the_engineer_finishes(*args, **kwargs):
+            release.set()
+            self.assertTrue(wait_until(lambda: not conversation.team.activations))
+            return compact(*args, **kwargs)
+
+        conversation.compact = compact_while_the_engineer_finishes
+        self.assertEqual(self.ask(conversation, "Any news?"), "Done during compaction.")
+        # The turn took the work over before its note, so it did not finish unreported in
+        # the background between the note and the turn.
+        self.assertEqual(self.background(conversation)["status"], "resumed")
+        self.assertIn("that work continues in this turn", script.seen("main"))
+        self.assertIn("Members working now: engineer", script.seen("main"))
+
+    def test_members_of_turns_that_cannot_continue_stay_bound_to_the_turn_deadline(self):
+        self.define("bound", limits={"background_seconds": 0})
+        deadlines, close = [], []
+
+        def send_with_a_close_deadline(messages, tools):
+            close.append(time.monotonic() + 30)
+            conversation.team.turn_deadline = close[0]
+            return team("send_message", to=["engineer"], kind="request", content="Build")
+
+        def engineer(messages, tools):
+            deadlines.append(script.options()["deadline"])
+            return say("Built.")
+
+        script = TeamScript(
+            main=Steps(send_with_a_close_deadline, team("wait", timeout=30), say("Done.")),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script, name="bound")
+        self.ask(conversation)
+        self.assertLessEqual(deadlines[0], close[0])
+
+    def test_limits_read_the_same_to_main_and_to_the_user(self):
+        for seconds, english, chinese in (
+            (60, "1 minute", "1 分钟"),
+            (1800, "30 minutes", "30 分钟"),
+            (90, "90 seconds", "90 秒"),
+        ):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(duration_text(seconds), english)
+                self.assertEqual(duration_text(seconds, chinese=True), chinese)
 
     def test_background_can_be_disabled_per_environment(self):
         self.define("bound", limits={"background_seconds": 0})

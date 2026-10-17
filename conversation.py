@@ -752,25 +752,7 @@ class Conversation:
             others=self.team.member_names() if self.team is not None else (),
         )
         note = acceptance.instructions()
-        team_note = self.team.turn_context() if self.team is not None else ""
         self.last_outcome = acceptance.outcome()
-        self.messages.append({"role": "user", "content": expanded_prompt})
-        # Task-specific context belongs to this turn, never to the shared prefix.
-        self.messages.append(
-            {
-                "role": "system",
-                "content": environment_context(self.settings.workspace)
-                + ("\n\n" + note if note else "")
-                + ("\n\n" + team_note if team_note else ""),
-            }
-        )
-        try:
-            self.compact(deadline, on_progress)
-        except BaseException:
-            acceptance.status = "incomplete"
-            self._save_outcome(acceptance)
-            raise
-        self.save()
 
         def validate_final(content):
             if final_validator:
@@ -786,16 +768,36 @@ class Conversation:
                 background = self.team.continues_in_background()
             return acceptance.validate(content, background=background)
 
-        runtime = TaskRuntime(
-            self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache
-        )
         # Members work during the turn; afterwards they pause or, interactively, continue
-        # in the background. Pending work resumes next turn.
+        # in the background. Pending work resumes next turn. The team's turn starts before
+        # the turn note so that it takes over background work first: nothing finishes in
+        # the background after the note reports it.
         with (
             self.team.turn(deadline, background=self.team_background)
             if self.team is not None
             else nullcontext()
         ):
+            team_note = self.team.turn_context() if self.team is not None else ""
+            self.messages.append({"role": "user", "content": expanded_prompt})
+            # Task-specific context belongs to this turn, never to the shared prefix.
+            self.messages.append(
+                {
+                    "role": "system",
+                    "content": environment_context(self.settings.workspace)
+                    + ("\n\n" + note if note else "")
+                    + ("\n\n" + team_note if team_note else ""),
+                }
+            )
+            try:
+                self.compact(deadline, on_progress)
+            except BaseException:
+                acceptance.status = "incomplete"
+                self._save_outcome(acceptance)
+                raise
+            self.save()
+            runtime = TaskRuntime(
+                self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache
+            )
             answer = self._run_turn(
                 runtime,
                 acceptance,

@@ -288,6 +288,9 @@ class BlockerAttributionTests(unittest.TestCase):
             "其他测试无法执行，所以没有验证。",
             "我让 critic 运行测试，但无法完成验证。",
             "I asked the critic to run them, but cannot proceed.",
+            # The user and critic only say where the file and tests came from.
+            "用户提供的文件无法执行。",
+            "critic 写的测试无法执行，缺少依赖。",
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.status(text), "blocked")
@@ -302,6 +305,7 @@ class BlockerAttributionTests(unittest.TestCase):
             "engineer 报告“无法完成迁移”，随后改用备用方案并已完成。",
             "Earlier I was blocked by a missing fixture; I added it and all tests pass.",
             "起初无法执行测试，安装 pytest 后全部通过。",
+            "critic 的环境无法执行测试，我补跑了全部测试。",
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.status(text), "completed")

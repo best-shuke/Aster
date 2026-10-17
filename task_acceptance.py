@@ -32,6 +32,12 @@ OBJECT_MARKERS = re.compile(
     r"|\b(?:asked|told|let|had|with|to|for|from|by)(?:\s+the)?)\s*$",
     re.I,
 )
+# A name right before these only says where something came from ("用户提供的文件无法执行"):
+# that thing, not the name, is what cannot go on. A bare 的 ("critic 的环境") stays the owner's.
+ATTRIBUTIVE = re.compile(
+    r"\s*(?:提供|给出|给|上传|发来|发送|提交|指定|要求|写|编写|生成|创建|准备)"
+    r"(?:了|过)?(?:我们|我|你)?的"
+)
 
 
 def _words(pattern: str) -> str:
@@ -330,8 +336,9 @@ class TaskAcceptance:
 
         Inability phrases are attributed to the last subject named earlier in their
         sentence, since Chinese often omits a repeated subject: "the critic is read-only
-        and cannot proceed" reports a teammate's limitation, not this agent's. Without a
-        named subject the agent is speaking about itself.
+        and cannot proceed" reports a teammate's limitation, not this agent's. A name that
+        is an object or only modifies a noun is no subject. Without a named subject the
+        agent is speaking about itself.
         """
         text = QUOTED.sub(" ", text)
         if NEEDS_USER.search(text):
@@ -351,7 +358,11 @@ class TaskAcceptance:
             subjects = [
                 found
                 for found in subject.finditer(sentence)
-                if found.group("self") or not OBJECT_MARKERS.search(sentence[: found.start()])
+                if found.group("self")
+                or not (
+                    OBJECT_MARKERS.search(sentence[: found.start()])
+                    or ATTRIBUTIVE.match(sentence, found.end())
+                )
             ]
             if not subjects or subjects[-1].group("self"):
                 return True

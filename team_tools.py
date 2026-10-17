@@ -219,10 +219,14 @@ After engaging members, call team action=wait to receive replies, task results a
 Limits per turn: {limits.max_concurrent_agents} members run at once, {limits.max_messages_per_turn} messages, {limits.max_activations_per_agent} activations per member, message chains up to {limits.max_message_hops} hops, task nesting up to {limits.max_task_depth} levels. Team state persists across turns of this session.{background_text(limits)}"""
 
 
-def duration_text(seconds: int) -> str:
-    if seconds % 60:
+def duration_text(seconds: int, *, chinese: bool = False) -> str:
+    """A limit in whole minutes when it is one, otherwise in seconds."""
+    minutes, rest = divmod(seconds, 60)
+    if chinese:
+        return f"{seconds} 秒" if rest else f"{minutes} 分钟"
+    if rest:
         return f"{seconds} seconds"
-    return f"{seconds // 60} minute{'s' if seconds != 60 else ''}"
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
 def background_text(limits) -> str:

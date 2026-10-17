@@ -33,17 +33,13 @@ from team_state import (
     excerpt,
     now,
 )
-from team_tools import activation_text, activation_title
+from team_tools import activation_text, activation_title, duration_text
 from tool_runtime import ExecutionContext
 
 ITEMS_PER_ACTIVATION = 12
 GROUP_LIMIT = 20
 STOP_GRACE_SECONDS = 10
 BACKGROUND_ACTIVITY = 50
-
-
-def _duration(seconds: int) -> str:
-    return f"{seconds // 60} 分钟" if seconds % 60 == 0 else f"{seconds} 秒"
 
 
 def _one_line(value, limit: int) -> str:
@@ -368,10 +364,8 @@ class TeamRuntime:
         elif reason == "finished":
             notice = "团队后台工作已完成" + (f"，主代理有 {unread} 条新结果" if unread else "")
         elif reason == "expired":
-            notice = (
-                f"团队后台工作达到 {_duration(record.get('seconds', 0))}时限，已暂停；"
-                "剩余工作在下一轮继续"
-            )
+            limit = duration_text(record.get("seconds", 0), chinese=True)
+            notice = f"团队后台工作达到 {limit}时限，已暂停；剩余工作在下一轮继续"
         if notice is not None:
             notice += "。/env results 查看，或直接继续对话。"
         self._team_progress(notice=notice)
@@ -566,8 +560,11 @@ class TeamRuntime:
         items, rest = mailbox[:ITEMS_PER_ACTIVATION], mailbox[ITEMS_PER_ACTIVATION:]
         mailbox[:] = rest
         own = time.monotonic() + self.limits.activation_timeout_seconds
-        activation = Activation(name, items, min(self.turn_deadline, own), self.session_id)
-        activation.turn_bound = self.turn_deadline < own
+        # Work that may continue in the background is not cut off at this turn's deadline:
+        # a turn that ends normally hands it over, any other end cancels it.
+        turn = float("inf") if self._may_continue() else self.turn_deadline
+        activation = Activation(name, items, min(turn, own), self.session_id)
+        activation.turn_bound = turn < own
         activation.turn_number = self.state.data["turn"]["number"]
         record = self.state.agents[name]
         record["status"] = "running"
@@ -1565,7 +1562,7 @@ class TeamRuntime:
                 return None
             self.nudges += 1
             working = ", ".join(summary["working"] + summary["queued"])
-            if self.turn_background and self.limits.background_seconds > 0:
+            if self._may_continue():
                 return (
                     f"Held once, not rejected: team members are still working ({working}). Call "
                     "team action=wait to collect their results, or team action=cancel to stop "
@@ -1579,15 +1576,14 @@ class TeamRuntime:
                 "answer."
             )
 
+    def _may_continue(self) -> bool:
+        """Whether work left when this turn ends may continue in the background."""
+        return self.turn_background and self.limits.background_seconds > 0
+
     def continues_in_background(self) -> bool:
         """True when work still running keeps going after this turn ends."""
         with self.lock:
-            return (
-                self.state is not None
-                and self.turn_background
-                and self.limits.background_seconds > 0
-                and not self._quiescent()
-            )
+            return self.state is not None and self._may_continue() and not self._quiescent()
 
     def main_instructions(self) -> str:
         from team_tools import main_instructions
@@ -1596,6 +1592,11 @@ class TeamRuntime:
             return main_instructions(self)
 
     def turn_context(self) -> str:
+        """The team's state for main's turn note; call it after begin_turn.
+
+        begin_turn takes over background work first, so nothing finishes in the background
+        after this reports it.
+        """
         with self.lock:
             if self.state is None:
                 return ""
@@ -1605,8 +1606,10 @@ class TeamRuntime:
             parts = [f"Team session: members {members}; unread for main: {unread}."]
             if summary["open_tasks"]:
                 parts.append("Open tasks: " + ", ".join(summary["open_tasks"]) + ".")
+            if summary["working"]:
+                parts.append("Members working now: " + ", ".join(summary["working"]) + ".")
             if summary["queued"]:
-                parts.append("Queued work resumes now: " + ", ".join(summary["queued"]) + ".")
+                parts.append("Queued for a free slot: " + ", ".join(summary["queued"]) + ".")
             if summary["running_protocols"]:
                 parts.append("Running protocols: " + ", ".join(summary["running_protocols"]) + ".")
             background = self.state.data.get("background")
@@ -1619,9 +1622,10 @@ class TeamRuntime:
                 parts.append(
                     "Since your last answer the team worked in the background"
                     + (f": {'; '.join(done)}" if done else "")
-                    + ("; still running." if background["status"] == "running" else ".")
+                    + ("; that work continues in this turn." if summary["working"] else ".")
                     + (" Call team action=wait to read what arrived for you." if unread else "")
                 )
+                self._persist()
             if self.notices:
                 parts.append("Recovered: " + "; ".join(self.notices) + ".")
                 self.notices = []
@@ -1679,10 +1683,10 @@ class TeamRuntime:
             )
         ended = record.get("ended_at")
         stamp = time.strftime("%H:%M:%S", time.localtime(ended)) if ended else "?"
+        limit = duration_text(record.get("seconds", 0), chinese=True)
         return {
             "finished": f"后台：{stamp} 完成，团队已空闲",
-            "expired": f"后台：{stamp} 达到 {_duration(record.get('seconds', 0))}时限后暂停；"
-            "剩余工作在下一轮继续",
+            "expired": f"后台：{stamp} 达到 {limit}时限后暂停；剩余工作在下一轮继续",
             "resumed": f"后台：{stamp} 由下一轮接管",
             "stopped": f"后台：{stamp} 会话关闭时暂停；剩余工作在下一轮继续",
         }.get(status, f"后台：{status}")

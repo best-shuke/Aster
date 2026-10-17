@@ -1041,8 +1041,14 @@ class CodingTools:
         else:
             if not file_path.is_file():
                 raise FileNotFoundError(f"Not a regular file: {file_path}")
-            version = file_digest(file_path, _context.remaining)
-            source = file_path.open(encoding="utf-8", newline="")
+            whole = self._mergeable_text(file_path, _context.remaining)
+            if whole is not None:
+                # One read serves the page, its version and the team's merge base.
+                version = self.edit_ledger.remember(whole)
+                source = io.StringIO(whole, newline="")
+            else:
+                version = file_digest(file_path, _context.remaining)
+                source = file_path.open(encoding="utf-8", newline="")
         with source as stream:
             current_line = 1
             while current_line < offset:
@@ -1067,8 +1073,6 @@ class CodingTools:
         if changes is None and file_digest(file_path, _context.remaining) != version:
             raise FileChangedError(f"File changed while reading: {file_path}. Read it again.")
         self.file_versions[file_path] = version
-        if changes is None and self.edit_ledger is not None:
-            self._remember_read(file_path, version, _context.remaining)
         return ToolResult(
             data={
                 "path": str(file_path),
@@ -1243,22 +1247,23 @@ class CodingTools:
             raise FileChangedError(f"File changed since it was read: {path}. Read it again.")
         return content
 
-    def _remember_read(self, path: Path, version: str | None, check) -> None:
-        """Keep the whole content this agent saw, for merging its later edits."""
-        ledger = self.edit_ledger
-        if version is None or ledger.content(version) is not None:
-            return
+    def _mergeable_text(self, path: Path, check) -> str | None:
+        """The whole file when a team may merge later edits based on this read, else None.
+
+        Larger or non-UTF-8 files are never merged, so their reads stream as usual.
+        """
+        if self.edit_ledger is None:
+            return None
         check()
         try:
-            # UTF-8 needs at most 4 bytes per character: larger files are never merged.
+            # UTF-8 needs at most 4 bytes per character.
             if path.stat().st_size > 4 * MAX_AUTO_MERGE_CHARS:
-                return
+                return None
             with path.open(encoding="utf-8", newline="") as stream:
                 content = stream.read(MAX_AUTO_MERGE_CHARS + 1)
         except (OSError, UnicodeDecodeError):
-            return
-        if len(content) <= MAX_AUTO_MERGE_CHARS and text_digest(content) == version:
-            ledger.remember(content)
+            return None
+        return content if len(content) <= MAX_AUTO_MERGE_CHARS else None
 
     def _wrote(self, path: Path, content: str) -> None:
         self.file_versions[path] = text_digest(content)
