@@ -48,46 +48,73 @@ from ui import Console
 from usage import CacheStats
 from websearch import WebSearchClient
 
-HELP = """
-  常用命令
-
-  /status             查看上下文、TPS、MCP 连接及运行配置
-  /history [数量|all] 选择范围，或直接查看指定数量 / 全部对话
-  /trace [筛选词|errors] 浏览执行轨迹、命令参数和工具结果（输入框 Ctrl-T）
-  /tool 编号|last      直接打开某次调用；详情中 o 打开保留文件
-  /resume [编号|ID|latest] [--messages-only] 恢复会话，或仅复制历史到当前环境
-  /template [编号|名称] 选择空白或模板，模板仅作为本次 /new 的起点
-  /template add 文件 [名称] 导入转换后的对话为模板
-  /template save 名称 保存当前对话为模板
-  /template off       保存当前会话并开启空白（无模板）新会话
-  /environment, /env  选择能力环境；非交互模式列出环境与当前配置
-  /environment 名称 [keep] [--yes] 切换环境，默认开启新会话
-  /environment off    恢复进程启动默认能力并开启新会话
-  /environment show 名称 查看解析摘要，不应用
-  /environment trust|deny 名称 确认或撤销指定环境的资源包信任
-  /env create 名称 [--template multi-agent] 创建环境；/env use 名称 进入；/env exit 退出
-  /env status|log     查看当前环境、团队成员、任务与事件
-  /env skills|mcp|agents|limits 管理当前环境的技能、MCP、成员与资源限制（/env help）
-  /multiagents        进入默认多代理团队环境（不存在时自动创建）
-  /workflow [编号|名称] 选择并运行 workflow，或在菜单中新建
-  /workflow new [名称] 新建可复用的任务步骤
-  /workflow add 文件 [名称] 导入 Markdown workflow
-  /workflow show 编号|名称 查看步骤，不执行任务
-  /effort [档位]      选择或直接修改推理强度
-  /cache              查看缓存命中率
-  /skills [名称|all]  选择技能查看说明，或直接列出全部
-  /skill:名称 [任务]  加载技能完整说明并执行任务
-  /tasks, /todo       查看任务标题、Todo 和子代理状态
-
-  /new, /clear        全新会话（清屏并重置所有对话状态）
-  /session            查看会话文件
-  /prompt             查看系统提示词
-  /exit, /quit        退出
-  /help               查看帮助
-
-  推理档位：default / off / low / high / max
-  输入 / 自动提示命令；Tab 补全，↑ / ↓ 选择，Esc 关闭提示。
-"""
+HELP = (
+    (
+        "对话与会话",
+        (
+            ("/new, /clear", "保存当前会话并开启全新对话（清屏）"),
+            ("/resume [编号|ID|latest]", "恢复历史会话；加 --messages-only 仅复制历史到当前环境"),
+            ("/history [数量|all]", "查看对话记录；不带参数时选择范围"),
+            ("/session", "查看会话文件位置"),
+            ("/exit, /quit", "退出（也可按 Ctrl-D）"),
+        ),
+    ),
+    (
+        "查看与诊断",
+        (
+            ("/status", "模型、能力、上下文、用量与会话总览"),
+            ("/tasks, /todo", "任务标题、Todo 和子代理状态"),
+            ("/trace [筛选词|errors]", "浏览执行轨迹、命令参数和工具结果（Ctrl-T）"),
+            ("/tool 编号|last", "打开某次调用；详情中按 o 打开保留的完整输出"),
+            ("/cache", "查看提示缓存命中率"),
+            ("/prompt", "查看系统提示词"),
+        ),
+    ),
+    (
+        "环境与团队",
+        (
+            ("/env, /environment", "选择能力环境；切换默认开启新会话"),
+            ("/env 名称 [keep] [--yes]", "切换环境；keep 保留当前上下文"),
+            ("/env off", "恢复进程启动时的默认能力"),
+            ("/env show|trust|deny 名称", "查看解析摘要 / 确认 / 撤销资源包信任"),
+            ("/env create 名称 [--template 模板]", "创建环境，如 --template multi-agent"),
+            ("/env use 名称, /env exit", "进入或退出环境"),
+            ("/env status|log|results", "当前环境、团队成员、任务、事件与后台结果"),
+            ("/env skills|mcp|agents|limits", "管理技能、MCP、成员与资源限制（/env help）"),
+            ("/multiagents", "进入默认多代理团队环境（不存在时自动创建）"),
+        ),
+    ),
+    (
+        "模板、Workflow 与技能",
+        (
+            ("/template [编号|名称]", "选择空白或模板，作为本次 /new 的起点"),
+            ("/template add 文件 [名称]", "导入转换后的对话为模板"),
+            ("/template save 名称", "保存当前对话为模板"),
+            ("/template off", "保存当前会话并开启空白（无模板）新会话"),
+            ("/workflow [编号|名称]", "选择并运行 workflow，或在菜单中新建"),
+            ("/workflow new [名称]", "新建可复用的任务步骤"),
+            ("/workflow add 文件 [名称]", "导入 Markdown workflow"),
+            ("/workflow show 编号|名称", "查看步骤，不执行任务"),
+            ("/skills [名称|all]", "选择技能查看说明，或列出全部"),
+            ("/skill:名称 [任务]", "加载技能完整说明并执行任务"),
+        ),
+    ),
+    (
+        "设置",
+        (("/effort [档位]", "推理强度：default / off / low / high / max"),),
+    ),
+    (
+        "快捷键",
+        (
+            ("Enter", "发送"),
+            ("\\ + Enter", "行尾输入 \\ 再回车即换行；也可以直接粘贴多行内容"),
+            ("/ 与 Tab", "命令提示与补全；↑ ↓ 选择，Esc 关闭提示"),
+            ("Esc, Ctrl-C", "任务运行中：暂停并保存可恢复的进展"),
+            ("Ctrl-T", "打开执行轨迹"),
+            ("Ctrl-D", "退出"),
+        ),
+    ),
+)
 
 
 def use_workflow(conversation: Conversation, console: Console, arguments: list[str]) -> None:
@@ -178,6 +205,11 @@ def run_interactive(conversation: Conversation, console: Console) -> None:
             console.error(exc)
 
 
+def cache_totals(conversation: Conversation) -> dict | None:
+    stats = getattr(getattr(conversation, "client", None), "cache_stats", None)
+    return stats.totals() if isinstance(stats, CacheStats) else None
+
+
 def ask(conversation: Conversation, console: Console, prompt: str) -> str:
     console.execution_provider = lambda: execution_entries(
         conversation.execution_snapshot(), conversation.messages
@@ -219,9 +251,6 @@ def ask(conversation: Conversation, console: Console, prompt: str) -> str:
         except Exception as exc:
             console.error(exc)
         console.task_end(completed, failed=failed, status=status)
-        stats = getattr(conversation.client, "cache_stats", None)
-        if isinstance(stats, CacheStats):
-            console.cache(stats.snapshot(), compact=True)
 
 
 def main() -> int:
@@ -294,6 +323,8 @@ def main() -> int:
         skills=skills,
         mcp_manager=mcp_manager,
     )
+    # The status bar, /status and task summaries show prompt cache hit rates.
+    console.cache_provider = lambda: cache_totals(conversation)
 
     screen = (
         console.session_screen() if console.interactive is True and not prompt else nullcontext()

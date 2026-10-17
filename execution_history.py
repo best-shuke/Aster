@@ -10,6 +10,19 @@ from typing import Any
 
 _CONTROLS = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|[\x00-\x08\x0b-\x1f\x7f]")
 ARTIFACT_PAGE_CHARS = 32_000
+# Tool call status as shown in the transcript and the trace inspector: icon, tone, label.
+STATUS_DISPLAY = {
+    "ok": ("✓", "ok", "完成"),
+    "completed": ("✓", "ok", "完成"),
+    "running": ("◷", "accent", "运行中"),
+    "pending": ("○", "muted", "待执行"),
+    "partial": ("◐", "warn", "部分完成"),
+    "timeout": ("✗", "error", "超时"),
+    "unknown": ("?", "warn", "结果未知"),
+    "error": ("✗", "error", "失败"),
+    "not_executed": ("○", "warn", "未执行"),
+}
+HEALTHY_STATUSES = frozenset({"ok", "completed", "pending", "running"})
 
 
 def plain(value: Any) -> str:
@@ -104,6 +117,7 @@ class ExecutionEntry:
                 "session_id",
                 "action",
                 "wait_for",
+                "title",
             )
         ]
         return plain(" · ".join(str(value) for value in values if value)).replace("\n", " ↵ ")

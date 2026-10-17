@@ -38,6 +38,8 @@ uv sync --locked
 
 常用命令：`/help`、`/status`、`/new`、`/history`、`/resume`、`/trace`、`/tasks`、`/skills`、`/environment`（`/env`）、`/multiagents`。完整说明可在运行后用 `/help` 与 `/env help` 查看。
 
+快捷键：行尾输入 `\` 再回车换行，`Tab` 补全命令，`Ctrl-T` 打开执行轨迹，任务运行中按 `Esc` 或 `Ctrl-C` 暂停。
+
 ```text
 /env create research-team --template multi-agent
 /env use research-team
