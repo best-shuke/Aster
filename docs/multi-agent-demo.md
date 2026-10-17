@@ -8,13 +8,13 @@
 
 ```sh
 cd demo-workspace
-agent "/env create stats-team --template multi-agent --scope workspace"
+agent "/env create stats-team --template coding-team --scope workspace"
 agent /env limits max_activations_per_agent=5 max_tool_calls_per_agent=30 token_budget_per_agent=250000 --env stats-team
 agent --environment stats-team --yes \
   "stats.py 的测试失败了。请团队自主决定如何调查、讨论和分工：找出根因，按 SPEC.md 修复，运行测试验证，并在交付前做一次独立评审。"
 ```
 
-环境来自 `multi-agent` 模板：researcher（只读 + 联网搜索）、engineer（读写与执行）、critic（只读），以及 6 个内置协作技能。
+这次演示使用当时的三成员 `multi-agent` 模板：researcher（只读 + 联网搜索）、engineer（读写与执行）、critic（只读），以及 6 个内置协作技能。当前默认模板是[通用团队](environments.md#默认团队)，上面的复现命令使用八成员的 `coding-team`；以下分工与时间线保留当时的运行记录，重新运行时参与成员和过程可能不同。
 
 ## 第一轮：分工、依赖与独立评审
 
@@ -71,7 +71,7 @@ printf '%s\n' "/resume latest" \
 - 主代理在需要权衡时召集了正式会议；两人第 1 轮各自给出带证据的立场，第 2 轮 engineer 因预算缺席，会议照常收敛，主持人（main）记录 5 条决策并生成会议产物。
 - engineer 预算耗尽后由 main 实现（`stats.py` 守卫、`SPEC.md` 契约一行、3 个新测试），critic 只读复核后同意交付；最终 7/7 测试通过。
 
-本次演示把 `token_budget_per_agent` 设为 25 万，researcher 与 engineer 都触发了限制，运行时自动替它们答复，没有代理无限等待。当时预算按每次请求的完整输入（含缓存命中部分）加输出计算；之后改为只计未命中缓存的输入加输出，默认值相应设为 40 万。
+本次演示把 `token_budget_per_agent` 设为 25 万，researcher 与 engineer 都触发了限制，运行时自动替它们答复，没有代理无限等待。当时预算按每次请求的完整输入（含缓存命中部分）加输出计算；之后改为只计未命中缓存的输入加输出。当前默认预算见[资源限制](environments.md#安全与资源限制)。
 
 ## 后台工作：两次提问之间（另一次运行）
 

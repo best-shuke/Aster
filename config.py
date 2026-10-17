@@ -123,7 +123,7 @@ class Settings:
             session_file=session_file.resolve(),
             max_context_chars=optional_limit("DEEPSEEK_MAX_CONTEXT_CHARS", int),
             keep_recent_turns=max(1, int(os.environ.get("DEEPSEEK_KEEP_RECENT_TURNS", "6"))),
-            max_task_seconds=optional_limit("DEEPSEEK_MAX_TASK_SECONDS", int, default="3600"),
+            max_task_seconds=optional_limit("DEEPSEEK_MAX_TASK_SECONDS", int, default="unlimited"),
             max_subagents=max(
                 1,
                 min(

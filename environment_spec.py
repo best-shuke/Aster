@@ -78,33 +78,52 @@ class AgentSpec:
 
 @dataclass(frozen=True)
 class TeamLimits:
-    max_concurrent_agents: int = 3
-    max_agents: int = 8
-    max_messages_per_turn: int = 200
-    max_activations_per_agent: int = 8
-    max_message_hops: int = 10
-    max_meeting_rounds: int = 4
-    max_task_depth: int = 3
-    max_tool_calls_per_agent: int = 80
-    token_budget_per_agent: int = 400_000
-    activation_timeout_seconds: int = 600
+    max_concurrent_agents: int = 20
+    max_agents: int = 128
+    max_messages_per_turn: int | None = None
+    max_activations_per_agent: int | None = None
+    max_message_hops: int = 100
+    max_meeting_rounds: int = 32
+    max_task_depth: int = 32
+    max_tool_calls_per_agent: int | None = None
+    token_budget_per_agent: int | None = None
+    activation_timeout_seconds: int | None = None
     # Interactive sessions: how long members keep working after main answers (0 = never).
-    background_seconds: int = 1800
+    background_seconds: int | None = None
 
 
 LIMIT_RANGES = {
     "max_concurrent_agents": (1, 20),
-    "max_agents": (1, 32),
-    "max_messages_per_turn": (1, 5000),
-    "max_activations_per_agent": (1, 200),
-    "max_message_hops": (1, 50),
-    "max_meeting_rounds": (1, 10),
-    "max_task_depth": (1, 10),
-    "max_tool_calls_per_agent": (1, 5000),
-    "token_budget_per_agent": (1000, 50_000_000),
-    "activation_timeout_seconds": (10, 7200),
-    "background_seconds": (0, 86400),
+    "max_agents": (1, 1024),
+    "max_messages_per_turn": (1, 1_000_000_000),
+    "max_activations_per_agent": (1, 1_000_000),
+    "max_message_hops": (1, 10000),
+    "max_meeting_rounds": (1, 100),
+    "max_task_depth": (1, 128),
+    "max_tool_calls_per_agent": (1, 1_000_000_000),
+    "token_budget_per_agent": (1000, 1_000_000_000_000),
+    "activation_timeout_seconds": (10, 31_536_000),
+    "background_seconds": (0, 31_536_000),
 }
+
+UNLIMITED_LIMITS = frozenset(
+    {
+        "max_messages_per_turn",
+        "max_activations_per_agent",
+        "max_tool_calls_per_agent",
+        "token_budget_per_agent",
+        "activation_timeout_seconds",
+        "background_seconds",
+    }
+)
+
+
+def limit_reached(used: int, limit: int | None) -> bool:
+    return limit is not None and used >= limit
+
+
+def format_limit(value: int | None) -> str:
+    return "unlimited" if value is None else str(value)
 
 
 @dataclass(frozen=True)
@@ -304,6 +323,12 @@ def parse_limits(value: Any, startup_max_agents: int) -> TeamLimits:
         raise ValueError(f"不支持的 limits 字段：{', '.join(sorted(unknown))}")
     values = {}
     for name, item in value.items():
+        if name in UNLIMITED_LIMITS and (
+            item is None
+            or (isinstance(item, str) and item.strip().lower() in {"unlimited", "none"})
+        ):
+            values[name] = None
+            continue
         low, high = LIMIT_RANGES[name]
         if name == "max_concurrent_agents":
             high = min(high, startup_max_agents)

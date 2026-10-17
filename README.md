@@ -1,6 +1,6 @@
 # Aster · 星芒
 
-Aster 是一个终端编程助手框架，提供流式模型调用、文件和命令工具、任务编排、子代理协作、上下文管理、会话恢复及终端界面。
+Aster 是一个支持研究、分析、写作、规划和编程等任务的终端助手框架，提供流式模型调用、文件和命令工具、任务编排、子代理协作、上下文管理、会话恢复及终端界面。
 
 本仓库只包含框架源码、通用测试、依赖锁文件和文档。用户自行选择模型服务、MCP、skills 和环境配置；仓库不附带任何实际服务配置、凭据、会话、个人技能或具体能力包。
 
@@ -39,11 +39,11 @@ uv sync --locked
 常用命令：`/help`、`/status`、`/new`、`/history`、`/resume`、`/trace`、`/tasks`、`/skills`、`/environment`（`/env`）、`/multiagents`。完整说明可在运行后用 `/help` 与 `/env help` 查看。
 
 ```text
-/env create product-team --template multi-agent
-/env use product-team
+/env create research-team --template multi-agent
+/env use research-team
 /env skills add brainstorming
 /env status
-设计并开发一个 AI 产品，让团队自主决定如何调研、讨论、分工和执行。
+根据我提供的论文材料完成一份研究综述，让团队自主分工、比较方法、核查引用并独立评审。
 /env exit
 ```
 

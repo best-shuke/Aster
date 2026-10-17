@@ -5,6 +5,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from environment_definitions import EnvironmentEditor, check_credentials, parse_server_options
+from environment_spec import UNLIMITED_LIMITS
 from environments import EnvironmentStore
 from main import handle_command
 from mcp_client import McpManager
@@ -60,9 +61,19 @@ class EnvironmentCreationTests(EditorTestCase):
         self.assertTrue(team.environment.multi_agent)
         self.assertEqual(
             [agent.name for agent in team.environment.team.agents],
-            ["researcher", "engineer", "critic"],
+            [
+                "researcher",
+                "analyst",
+                "planner",
+                "executor",
+                "writer",
+                "editor",
+                "fact-checker",
+                "critic",
+            ],
         )
         self.assertEqual(team.environment.description, "Synthetic crew")
+        self.assertTrue(team.environment.team.collaboration.dynamic_agents)
         self.assertTrue(self.store.approved(team.environment))
 
     def test_create_rejects_duplicates_reserved_words_and_unknown_templates(self):
@@ -179,6 +190,55 @@ class McpEditingTests(EditorTestCase):
             self.editor.define_mcp_server("solo", "bad", {"url": "ftp://example.invalid"})
         self.assertFalse((self.user / "solo" / "mcp.json").exists())
         self.assertNotIn("mcp_config_file", json.loads((self.user / "solo.json").read_text()))
+
+
+class LimitEditingTests(EditorTestCase):
+    def test_unlimited_support_still_rejects_invalid_numbers_and_types(self):
+        result = self.editor.create("crew", template="multi-agent")
+        definition = json.loads(result.entry.path.read_text())
+        for key, value in (
+            ("token_budget_per_agent", True),
+            ("token_budget_per_agent", -1),
+            ("token_budget_per_agent", 1.5),
+            ("token_budget_per_agent", "forever"),
+            ("background_seconds", -1),
+            ("max_concurrent_agents", None),
+        ):
+            candidate = {**definition, "limits": {key: value}}
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                self.store.resolve_data(result.entry, candidate)
+
+    def test_unlimited_is_persisted_and_distinct_from_resetting_a_field(self):
+        self.editor.create("crew", template="multi-agent")
+        result = self.editor.set_limits(
+            "crew", ["token_budget_per_agent=250000", "background_seconds=0"]
+        )
+        self.assertEqual(result.environment.team.limits.token_budget_per_agent, 250000)
+        result = self.editor.set_limits("crew", ["token_budget_per_agent=unlimited"])
+        self.assertIsNone(result.environment.team.limits.token_budget_per_agent)
+        data = json.loads(result.entry.path.read_text())
+        self.assertIn("token_budget_per_agent", data["limits"])
+        self.assertIsNone(data["limits"]["token_budget_per_agent"])
+        self.assertEqual(data["limits"]["background_seconds"], 0)
+        result = self.editor.set_limits("crew", ["token_budget_per_agent=default"])
+        self.assertNotIn("token_budget_per_agent", json.loads(result.entry.path.read_text())["limits"])
+        self.assertIsNone(result.environment.team.limits.token_budget_per_agent)
+        self.assertTrue(result.approved)
+
+    def test_json_accepts_unlimited_budgets_but_preserves_bounded_capacity(self):
+        for index, value in enumerate((None, "unlimited", "none")):
+            with self.subTest(value=value):
+                environment = self.environment(
+                    f"unlimited-{index}", limits=dict.fromkeys(UNLIMITED_LIMITS, value)
+                )
+                for name in UNLIMITED_LIMITS:
+                    self.assertIsNone(getattr(environment.team.limits, name))
+        self.editor.create("crew", template="multi-agent")
+        before = (self.user / "crew.json").read_text()
+        for assignment in ("max_concurrent_agents=unlimited", "max_agents=unlimited"):
+            with self.subTest(assignment=assignment), self.assertRaises(ValueError):
+                self.editor.set_limits("crew", [assignment])
+        self.assertEqual((self.user / "crew.json").read_text(), before)
 
 
 class TrustCarryOverTests(EditorTestCase):
@@ -326,8 +386,9 @@ class EnvironmentCommandTests(EditorTestCase):
             "/env use crew",
             "/env skills add research",
             "/env mcp add alpha --tools echo",
-            "/env agents add analyst --description 'Synthetic analyst' --mcp alpha:echo",
+            "/env agents add statistician --description 'Synthetic statistician' --mcp alpha:echo",
             "/env limits max_meeting_rounds=2",
+            "/env limits",
             "/env status",
             "/env exit",
         ]
@@ -342,11 +403,12 @@ class EnvironmentCommandTests(EditorTestCase):
             active = conversation.active_environment
             self.assertIn("research", active.active_skills)
             self.assertEqual(set(conversation.mcp_manager.servers), {"alpha"})
-            self.assertEqual(active.team.agent("analyst").description, "Synthetic analyst")
+            self.assertEqual(active.team.agent("statistician").description, "Synthetic statistician")
             self.assertEqual(active.team.limits.max_meeting_rounds, 2)
             handle_command(conversation, console, commands[-1])
         self.assertIsNone(conversation.environment_id)
         self.assertNotIn("错误", output.getvalue())
+        self.assertIn("token_budget_per_agent = unlimited", output.getvalue())
 
     def test_edit_commands_require_a_target(self):
         conversation = self.conversation()
@@ -400,7 +462,7 @@ class ShippedResourceTests(EditorTestCase):
 
     def test_builtin_templates_and_skills_load(self):
         templates = EnvironmentEditor(self.store).templates()
-        self.assertEqual(set(templates), {"single-agent", "multi-agent"})
+        self.assertEqual(set(templates), {"single-agent", "multi-agent", "coding-team"})
         result = self.editor.create("crew", template="multi-agent")
         catalog = self.store.skill_catalog(result.environment)
         self.assertEqual(catalog.diagnostics, [])

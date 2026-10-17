@@ -10,6 +10,8 @@ from unittest.mock import patch
 from context_budget import LOCAL_METADATA
 from conversation import Conversation
 from deepseek_client import CompletionError
+from environment_definitions import EnvironmentEditor
+from environment_spec import UNLIMITED_LIMITS
 from environments import EnvironmentStore
 from main import handle_command
 from skills import SkillCatalog
@@ -235,6 +237,150 @@ class SingleAgentTests(TeamTestCase):
         conversation = self.team_conversation(script, "pair")
         self.assertEqual(self.ask(conversation), "done")
         self.assertIn("README checked", script.seen("main"))
+
+
+class DefaultTeamTemplateTests(TeamTestCase):
+    def test_research_team_shares_evidence_writes_and_gets_a_dynamic_specialist_review(self):
+        EnvironmentEditor(self.store).create("research", template="multi-agent", scope="program")
+        self.resource(
+            self.workspace / "papers.txt",
+            "Study A: observational, n=24. Study B: observational, n=8. "
+            "Neither establishes causality.\n",
+        )
+        review = (
+            "# 文献综述\n\nStudy A（n=24）与 Study B（n=8）均为观察性研究，"
+            "提供的材料不足以得出因果结论。\n"
+        )
+        assignments = [
+            team(
+                "spawn_agent",
+                name="methodologist",
+                description="Independently checks study design and causal claims.",
+                instructions="Check the draft against the provided study notes.",
+                tools=["read"],
+            ),
+            team("create_task", title="Read the study notes", assignee="researcher"),
+            team(
+                "create_task",
+                title="Write literature-review.md using evidence artifact a1",
+                assignee="writer",
+                depends_on=["t1"],
+            ),
+            team(
+                "create_task",
+                title="Review the draft against papers.txt",
+                assignee="methodologist",
+                depends_on=["t2"],
+            ),
+        ]
+
+        def main(messages, tools):
+            index = len(script.requests["main"]) - 1
+            if index < len(assignments):
+                return assignments[index]
+            if "Evidence check complete" in json.dumps(arrived(messages)):
+                return say("综述已保存，样本量和因果表述已经独立核查。")
+            return team("wait", timeout=30)
+
+        script = TeamScript(
+            main=main,
+            researcher=Steps(
+                use("read", path="papers.txt"),
+                team(
+                    "share_artifact",
+                    title="Study evidence",
+                    content="papers.txt: Study A n=24, Study B n=8; observational, no causal proof.",
+                ),
+                say("Evidence is available in artifact a1, based on papers.txt."),
+            ),
+            writer=Steps(
+                team("get_artifact", artifact_id="a1"),
+                use("write", path="literature-review.md", content=review),
+                say("Draft saved to literature-review.md using evidence a1."),
+            ),
+            methodologist=Steps(
+                use("read", path="papers.txt"),
+                use("read", path="literature-review.md"),
+                say("Evidence check complete: sample sizes agree; no causal conclusion is claimed."),
+            ),
+        )
+        conversation = self.team_conversation(script, "research")
+        answer = conversation.ask("根据提供的论文材料写一份文献综述，并独立核查方法与结论。")
+        self.assertEqual(answer, "综述已保存，样本量和因果表述已经独立核查。")
+        self.assertEqual((self.workspace / "literature-review.md").read_text(), review)
+        self.assertEqual(script.tool_names("methodologist"), {"read", "team"})
+        agents = conversation.team.state.data["agents"]
+        self.assertEqual(agents["methodologist"]["dynamic"]["spawned_by"], "main")
+        self.assertTrue(
+            all(
+                record["activations_total"] == 0
+                for name, record in agents.items()
+                if name not in {"researcher", "writer", "methodologist"}
+            )
+        )
+        events = self.events(conversation)
+        written = next(
+            index
+            for index, event in enumerate(events)
+            if event["type"] == "task_updated"
+            and event["task_id"] == "t2"
+            and event["status"] == "completed"
+        )
+        reviewed = next(
+            index
+            for index, event in enumerate(events)
+            if event["type"] == "activation_started" and event["actor"] == "methodologist"
+        )
+        self.assertLess(written, reviewed)
+
+    def test_specialists_have_distinct_permissions_and_activate_only_when_addressed(self):
+        EnvironmentEditor(self.store).create(
+            "specialists", template="coding-team", scope="program"
+        )
+
+        def main(messages, tools):
+            if len(script.requests["main"]) == 1:
+                return team(
+                    "send_message",
+                    to=["tester", "security"],
+                    kind="request",
+                    content="Check your assigned capabilities and report the result.",
+                )
+            if sum(item["type"] == "reply" for item in arrived(messages)) >= 2:
+                return say("Specialists checked.")
+            return team("wait", timeout=30)
+
+        def tester_report(messages, tools):
+            result = last_tool(messages)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["data"]["exit_code"], 0)
+            self.assertEqual(result["data"]["output"].strip(), "42")
+            return say("Verified 6*7=42 with a local command.")
+
+        script = TeamScript(
+            main=main,
+            tester=Steps(
+                use("exec", command=f'"{sys.executable}" -c "print(6 * 7)"'), tester_report
+            ),
+            security=Steps(
+                use("write", path="forbidden.txt", content="must not be written"),
+                say("Write was rejected; the review remains read-only."),
+            ),
+        )
+        conversation = self.team_conversation(script, "specialists")
+        self.assertEqual(self.ask(conversation), "Specialists checked.")
+        self.assertTrue({"write", "edit", "exec"} <= script.tool_names("tester"))
+        self.assertFalse({"write", "edit", "exec"} & script.tool_names("security"))
+        self.assertFalse((self.workspace / "forbidden.txt").exists())
+        self.assertIn("Requested a tool that is not available", script.seen("security"))
+        self.assertIn("Verified 6*7=42", script.seen("main"))
+        self.assertTrue(
+            all(
+                record["activations_total"] == 0
+                for name, record in conversation.team.state.data["agents"].items()
+                if name not in {"tester", "security"}
+            )
+        )
 
 
 class InformalDiscussionTests(TeamTestCase):
@@ -724,6 +870,32 @@ class ResourceLimitTests(TeamTestCase):
 
     limits: ClassVar[dict] = {"max_message_hops": 4, "max_activations_per_agent": 6}
 
+    def test_unlimited_budgets_keep_working_past_the_previous_caps(self):
+        self.define("unlimited", limits=dict.fromkeys(UNLIMITED_LIMITS))
+        self.resource(self.workspace / "evidence.txt", "available evidence\n")
+
+        def begin_with_large_usage(messages, tools):
+            with conversation.team.lock:
+                data = conversation.team.state.data
+                data["turn"]["messages"] = 10_000_000
+                data["agents"]["engineer"]["turn"].update(
+                    activations=1_000_000, tool_calls=1_000_000_000, tokens=1_000_000_000_000
+                )
+            return team("send_message", to=["engineer"], kind="request", content="Read evidence")
+
+        script = TeamScript(
+            main=Steps(begin_with_large_usage, team("wait", timeout=30), say("Complete.")),
+            engineer=Steps(use("read", path="evidence.txt"), say("Evidence checked.")),
+        )
+        conversation = self.team_conversation(script, "unlimited")
+        self.assertEqual(self.ask(conversation), "Complete.")
+        self.assertIn("Evidence checked.", script.seen("main"))
+        usage = conversation.team.state.data["agents"]["engineer"]["turn"]
+        self.assertGreater(usage["activations"], 1_000_000)
+        self.assertGreater(usage["tool_calls"], 1_000_000_000)
+        self.assertGreater(usage["tokens"], 1_000_000_000_000)
+        self.assertFalse(self.events(conversation, "budget_exhausted"))
+
     def test_circular_requests_terminate(self):
         def ping(other):
             def behavior(messages, tools):
@@ -871,6 +1043,43 @@ class ResourceLimitTests(TeamTestCase):
             {name for name in ("researcher", "engineer", "critic") if script.requests[name]},
             {"researcher", "engineer", "critic"},
         )
+
+    def test_default_capacity_runs_twenty_members_and_queues_the_rest(self):
+        self.settings = replace(self.settings, max_subagents=20)
+        self.store = EnvironmentStore(self.settings, user_dir=self.user)
+        members = {f"worker-{index}": {"description": "Reports in."} for index in range(128)}
+        self.define("large", agents=members)
+        barrier = threading.Barrier(20)
+        lock = threading.Lock()
+        active = {"now": 0, "peak": 0, "started": 0}
+
+        def member(messages, tools):
+            with lock:
+                active["now"] += 1
+                active["started"] += 1
+                active["peak"] = max(active["peak"], active["now"])
+                first_batch = active["started"] <= 20
+            try:
+                if first_batch:
+                    barrier.wait(timeout=10)
+                return say("done")
+            finally:
+                with lock:
+                    active["now"] -= 1
+
+        def main(messages, tools):
+            if len(script.requests["main"]) == 1:
+                return team("send_message", to=["all"], kind="request", content="report in")
+            if sum(item["type"] == "reply" for item in arrived(messages)) == len(members):
+                return say("all reported")
+            return team("wait", timeout=30)
+
+        script = TeamScript(main=main, **dict.fromkeys(members, member))
+        conversation = self.team_conversation(script, "large")
+        self.assertEqual(self.ask(conversation), "all reported")
+        self.assertEqual(active["peak"], 20)
+        self.assertTrue(all(len(script.requests[name]) == 1 for name in members))
+        self.assertFalse(self.events(conversation, "budget_exhausted"))
 
     def editors(self, right_edit, *, after_left=None):
         """left and right read shared.txt; left edits first, then right edits its stale read."""
@@ -1363,6 +1572,37 @@ class BackgroundWorkTests(TeamTestCase):
     def background(self, conversation):
         return conversation.team.state.data.get("background") or {}
 
+    def test_unlimited_background_and_activation_have_no_expiry_timer(self):
+        release = threading.Event()
+        deadlines = []
+
+        def engineer(messages, tools):
+            deadlines.append(script.options()["deadline"])
+            release.wait(10)
+            return say("Background result ready.")
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Continue work"),
+                say("Working in the background."),
+                say("Working in the background."),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        try:
+            self.ask(conversation)
+            self.assertTrue(conversation.team.in_background)
+            self.assertEqual(deadlines, [float("inf")])
+            self.assertIsNone(conversation.team._background_timer)
+            self.assertIsNone(self.background(conversation)["seconds"])
+            self.assertIn("without a fixed time limit", script.seen("main"))
+        finally:
+            release.set()
+        self.assertTrue(wait_until(lambda: not conversation.team.in_background))
+        self.assertIn("Background result ready.", "\n".join(conversation.team.result_lines()))
+        self.assertFalse(self.events(conversation, "activation_cancelled"))
+
     def test_members_keep_working_after_main_answers_and_results_reach_the_next_turn(self):
         release, events = threading.Event(), []
 
@@ -1677,6 +1917,7 @@ class BackgroundWorkTests(TeamTestCase):
 
     def test_limits_read_the_same_to_main_and_to_the_user(self):
         for seconds, english, chinese in (
+            (None, "unlimited", "不限时"),
             (60, "1 minute", "1 分钟"),
             (1800, "30 minutes", "30 分钟"),
             (90, "90 seconds", "90 秒"),

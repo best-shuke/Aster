@@ -80,12 +80,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(hasattr(settings, "max_tool_rounds"))
         self.assertFalse(hasattr(settings, "max_subagent_tool_rounds"))
 
-    def test_task_time_configuration_supports_unlimited_and_keeps_default(self):
+    def test_task_time_defaults_to_unlimited_and_preserves_explicit_limits(self):
         with (
             patch("config.load_env"),
             patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test"}, clear=True),
         ):
-            self.assertEqual(Settings.from_env().max_task_seconds, 3600)
+            self.assertIsNone(Settings.from_env().max_task_seconds)
             with patch.dict(os.environ, {"DEEPSEEK_MAX_TASK_SECONDS": " unlimited "}):
                 self.assertIsNone(Settings.from_env().max_task_seconds)
             with patch.dict(os.environ, {"DEEPSEEK_MAX_TASK_SECONDS": "150"}):

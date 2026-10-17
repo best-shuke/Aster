@@ -225,7 +225,7 @@ def ask(conversation: Conversation, console: Console, prompt: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog=CLI_NAME, description=f"{APP_NAME} — 终端编程助手")
+    parser = argparse.ArgumentParser(prog=CLI_NAME, description=f"{APP_NAME} — 终端任务助手")
     parser.add_argument("--environment", metavar="NAME", help="显式选择能力环境")
     parser.add_argument("--yes", action="store_true", help="确认指定环境当前能力包")
     parser.add_argument(

@@ -8,12 +8,13 @@ from collections.abc import Callable
 
 from commands import CommandActions
 from environment_definitions import SUBCOMMANDS, EnvironmentEditor, parse_server_options
+from environment_spec import format_limit
 from environments import ResolvedEnvironment
 
 Switch = Callable[..., bool]
 
 USAGE = """  /env list                          列出全部环境
-  /env create 名称 [--template single-agent|multi-agent] [--description 文本] [--scope user|workspace|program]
+  /env create 名称 [--template single-agent|multi-agent|coding-team] [--description 文本] [--scope user|workspace|program]
   /env use 名称 [keep] [--yes]        切换环境（同 /env 名称）
   /env exit                          退出环境，恢复默认代理（同 /env off）
   /env status                        查看当前环境、会话与团队状态
@@ -29,7 +30,7 @@ USAGE = """  /env list                          列出全部环境
   /env agents add|set 名称 [--description 文本] [--instructions 文本] [--tools a,b] [--skills a,b]
                      [--mcp 服务[:模式],…] [--write-paths 目录,…] [--effort 档位]
   /env agents remove|enable|disable 名称
-  /env limits [键=整数|default …]   查看或修改资源限制
+  /env limits [键=整数|unlimited|default …]   查看或修改资源限制
   /env log [数量]                    查看团队事件
   /env results                       查看成员在后台完成的工作和发给主代理的结果（不消耗）
   以上编辑命令默认作用于当前环境；用 --env 名称 指定其他环境。"""
@@ -140,7 +141,7 @@ class EnvironmentCommands:
         scope = _take(arguments, "--scope") or "user"
         if len(arguments) != 1:
             raise ValueError(
-                "用法：/env create 名称 [--template single-agent|multi-agent] "
+                "用法：/env create 名称 [--template single-agent|multi-agent|coding-team] "
                 "[--description 文本] [--scope user|workspace|program]"
             )
         result = self.editor.create(
@@ -414,7 +415,7 @@ class EnvironmentCommands:
         if not arguments:
             environment: ResolvedEnvironment = self.store.resolve(selector)
             for key, value in environment.team.limits.__dict__.items():
-                self.console.info(f"  {key} = {value}")
+                self.console.info(f"  {key} = {format_limit(value)}")
             return True
         result = self.editor.set_limits(selector, arguments)
         return self.applied(result, "资源限制已更新。")

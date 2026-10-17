@@ -320,11 +320,15 @@ class EnvironmentEditor:
 
     def set_limits(self, selector: str, assignments: list[str]) -> EditResult:
         values = {}
+        reset = object()
         for item in assignments:
             key, separator, raw = item.partition("=")
             if not separator or key not in LIMIT_RANGES:
-                raise ValueError(f"用法：/env limits 键=整数；可设置：{', '.join(LIMIT_RANGES)}")
+                raise ValueError(f"用法：/env limits 键=整数|unlimited|default；可设置：{', '.join(LIMIT_RANGES)}")
             if raw == "default":
+                values[key] = reset
+                continue
+            if raw.lower() in {"unlimited", "none", "null"}:
                 values[key] = None
                 continue
             try:
@@ -335,7 +339,7 @@ class EnvironmentEditor:
         def mutate(data):
             limits = data.setdefault("limits", {})
             for key, value in values.items():
-                if value is None:
+                if value is reset:
                     limits.pop(key, None)
                 else:
                     limits[key] = value

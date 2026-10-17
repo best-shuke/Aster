@@ -19,6 +19,7 @@ from environment_spec import (
     McpSelection,
     TeamSpec,
     capability_notes,
+    format_limit,
     parse_mcp_selection,
     parse_skill_selection,
     parse_team,
@@ -800,7 +801,7 @@ class EnvironmentStore:
             limits = team.limits
             lines.append(
                 f"成员：{len(team.agents)} 个；并发上限 {limits.max_concurrent_agents}；"
-                f"每轮消息上限 {limits.max_messages_per_turn}；消息链上限 {limits.max_message_hops}；"
+                f"每轮消息上限 {format_limit(limits.max_messages_per_turn)}；消息链上限 {limits.max_message_hops}；"
                 f"会议轮数上限 {limits.max_meeting_rounds}；任务嵌套上限 {limits.max_task_depth}"
             )
             for agent in team.agents:

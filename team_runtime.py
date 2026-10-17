@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from environment_spec import AgentSpec, parse_agent
+from environment_spec import AgentSpec, format_limit, limit_reached, parse_agent
 from skills import SkillCatalog, skill_block
 from team_protocols import ProtocolEngine
 from team_state import (
@@ -37,7 +37,7 @@ from team_tools import activation_text, activation_title, duration_text
 from tool_runtime import ExecutionContext
 
 ITEMS_PER_ACTIVATION = 12
-GROUP_LIMIT = 20
+GROUP_LIMIT = 1024
 STOP_GRACE_SECONDS = 10
 BACKGROUND_ACTIVITY = 50
 
@@ -308,13 +308,15 @@ class TeamRuntime:
     def _start_background(self) -> bool:
         """Keep the team working after main answered (caller holds the lock)."""
         seconds = self.limits.background_seconds
-        if seconds <= 0 or self._quiescent():
+        if seconds == 0 or self._quiescent():
             return False
         # Activations get their own timeouts; the timer bounds the whole period.
         self.turn_deadline = float("inf")
         token = self._background = object()
-        timer = threading.Timer(seconds, self._background_expired, args=(token,))
-        timer.daemon = True
+        timer = None
+        if seconds is not None:
+            timer = threading.Timer(seconds, self._background_expired, args=(token,))
+            timer.daemon = True
         self._background_timer = timer
         summary = self._summary()
         self.state.data["background"] = {
@@ -333,7 +335,8 @@ class TeamRuntime:
             queued=summary["queued"],
             seconds=seconds,
         )
-        timer.start()
+        if timer is not None:
+            timer.start()
         self._team_progress()
         return True
 
@@ -451,9 +454,9 @@ class TeamRuntime:
     def _exhausted(self, name: str) -> str | None:
         turn = self.state.agents[name]["turn"]
         limits = self.limits
-        if turn["activations"] >= limits.max_activations_per_agent:
+        if limit_reached(turn["activations"], limits.max_activations_per_agent):
             return f"{name} reached its limit of {limits.max_activations_per_agent} activations this turn"
-        if turn["tokens"] >= limits.token_budget_per_agent:
+        if limit_reached(turn["tokens"], limits.token_budget_per_agent):
             return f"{name} exhausted its token budget for this turn"
         return None
 
@@ -559,7 +562,8 @@ class TeamRuntime:
         mailbox = self.state.mailbox(name)
         items, rest = mailbox[:ITEMS_PER_ACTIVATION], mailbox[ITEMS_PER_ACTIVATION:]
         mailbox[:] = rest
-        own = time.monotonic() + self.limits.activation_timeout_seconds
+        seconds = self.limits.activation_timeout_seconds
+        own = float("inf") if seconds is None else time.monotonic() + seconds
         # Work that may continue in the background is not cut off at this turn's deadline:
         # a turn that ends normally hands it over, any other end cancels it.
         turn = float("inf") if self._may_continue() else self.turn_deadline
@@ -982,7 +986,7 @@ class TeamRuntime:
             )
 
     def _message_budget(self) -> None:
-        if self.state.data["turn"]["messages"] >= self.limits.max_messages_per_turn:
+        if limit_reached(self.state.data["turn"]["messages"], self.limits.max_messages_per_turn):
             raise TeamError(
                 "message_budget",
                 f"The team reached {self.limits.max_messages_per_turn} messages this turn. "
@@ -995,7 +999,7 @@ class TeamRuntime:
         with self.lock:
             record = self.state.agents[name]["turn"]
             if before:
-                if record["tokens"] >= self.limits.token_budget_per_agent:
+                if limit_reached(record["tokens"], self.limits.token_budget_per_agent):
                     raise TeamError("token_budget", f"{name} exhausted its token budget this turn")
                 return
             record["tokens"] += max(0, int(tokens))
@@ -1004,7 +1008,7 @@ class TeamRuntime:
     def charge_tool_call(self, name: str) -> None:
         with self.lock:
             record = self.state.agents[name]["turn"]
-            if record["tool_calls"] >= self.limits.max_tool_calls_per_agent:
+            if limit_reached(record["tool_calls"], self.limits.max_tool_calls_per_agent):
                 raise TeamError(
                     "tool_budget",
                     f"Tool-call budget ({self.limits.max_tool_calls_per_agent}) exhausted this turn. "
@@ -1578,7 +1582,7 @@ class TeamRuntime:
 
     def _may_continue(self) -> bool:
         """Whether work left when this turn ends may continue in the background."""
-        return self.turn_background and self.limits.background_seconds > 0
+        return self.turn_background and self.limits.background_seconds != 0
 
     def continues_in_background(self) -> bool:
         """True when work still running keeps going after this turn ends."""
@@ -1638,7 +1642,7 @@ class TeamRuntime:
             data = self.state.data
             lines = [
                 f"团队会话：第 {data['turn']['number']} 轮 · 本轮消息 {data['turn']['messages']}"
-                f"/{self.limits.max_messages_per_turn} · 主代理未读 {len(self.state.mailbox(MAIN))}",
+                f"/{format_limit(self.limits.max_messages_per_turn)} · 主代理未读 {len(self.state.mailbox(MAIN))}",
             ]
             for name, record in data["agents"].items():
                 turn = record["turn"]

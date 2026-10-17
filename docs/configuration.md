@@ -24,6 +24,9 @@
 
 配置先从进程环境读取；本地文件只补充尚未设置的值。直接运行 Python 入口时，未指定配置文件则读取当前目录的 `.env`；`bin/agent` 则使用程序目录的 `.env`。
 
+`DEEPSEEK_MAX_TASK_SECONDS` 默认 `unlimited`，主任务不因固定总时长结束。已有配置中的数字仍生效；
+希望持续工作时将该项改为 `unlimited` 并重启。网络空闲、单个工具操作的超时和用户取消分别处理。
+
 环境定义的字段、技能与 MCP 的继承规则、团队成员与资源限制见 [环境](environments.md)；示例在 [docs/examples](examples/)。
 
 默认资源目录位于程序目录下：`skills/`、`environments/`、`templates/`、`workflows/` 和 `mcp.json`。本仓库的这些目录只放说明文件，实际资源默认被 Git 忽略。自定义路径与其他参数的具体解析方式见源码；为避免相对路径歧义，可使用自己机器上的绝对路径。
