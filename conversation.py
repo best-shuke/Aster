@@ -810,7 +810,7 @@ class Conversation:
         if (
             self.team is not None
             and acceptance.status == "background"
-            and not self.team.in_background
+            and not self.team.went_background
         ):
             # The members finished before the turn ended: nothing continues, nothing verified.
             acceptance.status = "incomplete"

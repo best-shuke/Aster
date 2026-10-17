@@ -139,6 +139,8 @@ class TeamRuntime:
         # Token of the running background period; a stale timer must not end a newer one.
         self._background: object | None = None
         self._background_timer: threading.Timer | None = None
+        # Whether the last turn handed work to the background, even if it has since finished.
+        self.went_background = False
 
     # Members -------------------------------------------------------------------------
 
@@ -266,6 +268,7 @@ class TeamRuntime:
             self.accepting = True
             self.turn_deadline = deadline
             self.turn_background = background
+            self.went_background = False
             self.nudges = 0
             data = self.state.data
             data["turn"] = {"number": data["turn"]["number"] + 1, "messages": 0}
@@ -288,6 +291,7 @@ class TeamRuntime:
             if self.state is None:
                 return 0
             if self.turn_background and not interrupted and self._start_background():
+                self.went_background = True
                 self._event("turn_ended", MAIN, paused=0, interrupted=False, background=True)
                 self._persist()
                 self.changed.notify_all()

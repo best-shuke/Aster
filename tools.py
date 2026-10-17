@@ -1230,7 +1230,7 @@ class CodingTools:
 
         None when it did not change (or is gone: the write then reports the conflict).
         Only content a teammate's file tool wrote is mergeable, and the ledger holds it, so
-        nothing else is read or decoded here.
+        nothing else is read or decoded here; EditLedger.merge checks the rest.
         """
         ledger = self.edit_ledger
         if ledger is None or seen is None:
@@ -1238,8 +1238,8 @@ class CodingTools:
         current = file_digest(path, check)
         if current in {None, seen}:
             return None
-        content = ledger.content(current) if ledger.written_by_agent(path, current) else None
-        if content is None or ledger.content(seen) is None:
+        content = ledger.content(current)
+        if content is None:
             raise FileChangedError(f"File changed since it was read: {path}. Read it again.")
         return content
 

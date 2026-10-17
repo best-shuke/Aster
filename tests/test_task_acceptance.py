@@ -218,6 +218,40 @@ class TaskAcceptanceTests(unittest.TestCase):
         self.assertIsNone(self.acceptance.validate("已安排。", background=True))
         self.assertEqual(self.acceptance.status, "background")
 
+    def test_a_failed_monitored_check_does_not_verify_own_edits_for_the_background(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        started = self.execute("exec", {**self.command("input(); assert True"), "background": True})
+        self.execute("monitor", {"action": "stop", "session_id": started["data"]["session_id"]})
+        self.assertIn(
+            "verify your own change", self.acceptance.validate("已安排。", background=True)
+        )
+
+    def test_a_check_started_before_an_own_edit_does_not_verify_it_for_the_background(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        arguments = {**self.command("input(); assert True"), "background": True}
+        session_id = self.execute("exec", arguments)["data"]["session_id"]
+        self.execute("edit", {"path": "app.py", "edits": [{"oldText": "42", "newText": "43"}]})
+        self.execute("monitor", {"action": "input", "session_id": session_id, "input": "\n"})
+        self.execute("monitor", {"action": "wait", "session_id": session_id})
+        self.assertIn(
+            "verify your own change", self.acceptance.validate("已安排。", background=True)
+        )
+        self.execute("exec", self.command("assert True"))
+        self.assertIsNone(self.acceptance.validate("已安排。", background=True))
+
+    def test_editing_a_document_needs_no_check_when_work_continues(self):
+        self.execute("write", {"path": "notes.md", "content": "plan\n"})
+        self.assertIsNone(self.acceptance.validate("已安排。", background=True))
+        self.assertEqual(self.acceptance.status, "background")
+
+    def test_a_command_that_cannot_be_lexed_is_no_trusted_check(self):
+        # The shell ignores the comment, so "; true" would hide a failing pytest.
+        self.assertIsNone(TaskAcceptance.shell_segments("pytest tests; true #it's"))
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        quoted = shlex.quote(sys.executable)
+        self.execute("exec", {"command": f"{quoted} -m pytest --co -q; true #it's"})
+        self.assertNotEqual(self.acceptance.verified_revision, self.acceptance.code_revision)
+
     def test_quoted_redirect_characters_do_not_hide_backgrounding(self):
         self.assertEqual(
             TaskAcceptance.shell_segments("pytest -k 'a>' & true"),

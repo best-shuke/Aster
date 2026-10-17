@@ -94,8 +94,11 @@ class TaskAcceptance:
         self.code_revision = 0
         self.verified_revision = -1
         self.failed_verifications = {}
-        # Evidence index of this agent's own latest successful write/edit, if any.
+        # Evidence indexes of this agent's own latest successful source write/edit and of
+        # where its latest passing standalone check started (a background check finishes
+        # later), whatever the code revision then was.
         self.last_own_edit = -1
+        self.last_passed_check = -1
         self.pending_verifications = {}
         self._verification_start = 0
         self._roots = {self.workspace.resolve()} if self.workspace is not None else set()
@@ -225,37 +228,44 @@ class TaskAcceptance:
         }
         self.evidence.append(record)
         index = len(self.evidence) - 1
-        if function.get("name") in {"write", "edit"} and result.get("status") == "ok":
-            self.last_own_edit = index
-        changed = self._refresh_files()
-        if changed:
-            record["changed_files"] = changed
-        if (
-            self._files is None
-            and result.get("status") == "ok"
+        own_source_edit = (
+            result.get("status") == "ok"
             and function.get("name") in {"write", "edit"}
             and (
                 Path(arguments.get("path", "")).suffix.lower() in SOURCE_SUFFIXES
                 or Path(arguments.get("path", "")).name in SOURCE_NAMES
             )
-        ):
+        )
+        if own_source_edit:
+            self.last_own_edit = index
+        changed = self._refresh_files()
+        if changed:
+            record["changed_files"] = changed
+        if self._files is None and own_source_edit:
             self.code_revision += 1
             self.last_code_change = index
         record["code_revision"] = self.code_revision
         verification_start = self._verification_start
+        started_at = index
         verification_result = result
         data = result.get("data") or {}
         if function.get("name") == "monitor":
             pending = self.pending_verifications.get(data.get("session_id"))
             if pending and data.get("state") in {"completed", "failed", "timed_out", "stopped"}:
-                arguments, verification_start = self.pending_verifications.pop(data["session_id"])
+                arguments, verification_start, started_at = self.pending_verifications.pop(
+                    data["session_id"]
+                )
                 record["verification_session_id"] = data["session_id"]
                 verification_result = {"status": "ok" if data["state"] == "completed" else "error"}
         is_verification = (
             function.get("name") == "exec" or "verification_session_id" in record
         ) and self.verification_command(arguments.get("command", ""))
         if is_verification and data.get("state") == "running" and data.get("session_id"):
-            self.pending_verifications[data["session_id"]] = (dict(arguments), verification_start)
+            self.pending_verifications[data["session_id"]] = (
+                dict(arguments),
+                verification_start,
+                index,
+            )
             record["verification_pending"] = True
         elif is_verification:
             record["verification"] = True
@@ -272,18 +282,20 @@ class TaskAcceptance:
                 self.failed_verifications[identity] = record
                 self.verified_revision = -1
             else:
-                standalone = len(self.shell_segments(arguments.get("command", ""))) == 1
+                segments = self.shell_segments(arguments.get("command", ""))
+                standalone = segments is not None and len(segments) == 1
                 if not standalone:
                     self.verified_revision = -1
                     record["verification_untrusted"] = UNTRUSTED_CHECK
                 else:
                     self.failed_verifications.pop(identity, None)
+                    self.last_passed_check = started_at
                 if standalone and (self._files is None or verification_start == self.code_revision):
                     self.last_verification = index
                     self.verified_revision = self.code_revision
         elif function.get("name") == "exec" and any(
             self.verification_command(shlex.join(segment))
-            for segment in self.shell_segments(arguments.get("command", ""))
+            for segment in self.shell_segments(arguments.get("command", "")) or ()
         ):
             # A check hidden behind "cd … &&" is no verification, but say why it is not.
             record["verification_untrusted"] = UNTRUSTED_CHECK
@@ -294,6 +306,8 @@ class TaskAcceptance:
 
         "<" and ">" are punctuation too, so redirections such as 2>&1 or &>log lex as
         tokens containing them and never count as composition; quoted text stays a word.
+        None when the command cannot be lexed (e.g. a quote inside a shell comment), so
+        its composition is unknown.
         """
         lexer = shlex.shlex(command.strip(), posix=True, punctuation_chars=";&|<>\n")
         lexer.whitespace = " \t\r"
@@ -302,7 +316,7 @@ class TaskAcceptance:
         try:
             tokens = list(lexer)
         except ValueError:
-            return [[command]]
+            return None
         segments = [[]]
         for token in tokens:
             if token and set(token) <= set(";&|\n"):
@@ -379,16 +393,7 @@ class TaskAcceptance:
             return "No successful tool evidence supports completion of this task. Inspect and perform the requested work, or state the concrete blocker."
         if background:
             # Teammates' unfinished edits are not final yet, but this agent's own are.
-            if (
-                self.kind == "change"
-                and self.last_own_edit >= 0
-                and not any(
-                    record.get("verification")
-                    and record.get("status") == "ok"
-                    and not record.get("verification_untrusted")
-                    for record in self.evidence[self.last_own_edit + 1 :]
-                )
-            ):
+            if self.kind == "change" and self.last_passed_check < self.last_own_edit:
                 return (
                     "You changed files yourself: verify your own change with a relevant "
                     "standalone test/build/assertion before answering, even though members "
