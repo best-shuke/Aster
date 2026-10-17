@@ -24,6 +24,9 @@ from command_ui import (
     use_environment as use_environment,
 )
 from command_ui import (
+    use_multiagents as use_multiagents,
+)
+from command_ui import (
     use_workflow as present_workflow,
 )
 from commands import (
@@ -62,6 +65,10 @@ HELP = """
   /environment off    恢复进程启动默认能力并开启新会话
   /environment show 名称 查看解析摘要，不应用
   /environment trust|deny 名称 确认或撤销指定环境的资源包信任
+  /env create 名称 [--template multi-agent] 创建环境；/env use 名称 进入；/env exit 退出
+  /env status|log     查看当前环境、团队成员、任务与事件
+  /env skills|mcp|agents|limits 管理当前环境的技能、MCP、成员与资源限制（/env help）
+  /multiagents        进入默认多代理团队环境（不存在时自动创建）
   /workflow [编号|名称] 选择并运行 workflow，或在菜单中新建
   /workflow new [名称] 新建可复用的任务步骤
   /workflow add 文件 [名称] 导入 Markdown workflow
@@ -101,6 +108,7 @@ def handle_command(conversation: Conversation, console: Console, prompt: str) ->
             CommandName.RESUME: resume_conversation,
             CommandName.TEMPLATE: use_template,
             CommandName.ENVIRONMENT: use_environment,
+            CommandName.MULTIAGENTS: use_multiagents,
             CommandName.WORKFLOW: use_workflow,
             CommandName.SKILLS: show_skills,
             CommandName.EFFORT: update_effort,
@@ -110,6 +118,8 @@ def handle_command(conversation: Conversation, console: Console, prompt: str) ->
 
 
 def run_interactive(conversation: Conversation, console: Console) -> None:
+    # Another message may follow, so team members can keep working between turns.
+    conversation.team_background = True
     console.execution_provider = lambda: execution_entries(
         conversation.execution_snapshot(), conversation.messages
     )
@@ -215,7 +225,7 @@ def ask(conversation: Conversation, console: Console, prompt: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog=CLI_NAME, description=f"{APP_NAME} — 终端编程助手")
+    parser = argparse.ArgumentParser(prog=CLI_NAME, description=f"{APP_NAME} — 终端任务助手")
     parser.add_argument("--environment", metavar="NAME", help="显式选择能力环境")
     parser.add_argument("--yes", action="store_true", help="确认指定环境当前能力包")
     parser.add_argument(

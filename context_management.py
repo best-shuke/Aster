@@ -7,6 +7,7 @@ import time
 from client_runtime import client_event
 from config import TASK_CONTEXT_PREFIX, Settings
 from context_budget import (
+    WireCache,
     estimate_context,
     estimate_text_tokens,
     estimate_tokens,
@@ -96,12 +97,15 @@ class _CompactionBudget:
         settings: Settings,
         reserve_chars: int,
         reserve_tokens: int,
+        cache: WireCache | None = None,
     ) -> None:
         self.system_message = system_message
         self.definitions = definitions
         self.settings = settings
+        self.cache = cache
         self.legacy = settings.max_context_chars is not None
-        self.overhead = self.size([system_message]) + self.size(definitions or [])
+        # Tool definitions are not messages; never key them in the message cache.
+        self.overhead = self.size([system_message]) + self._direct_size(definitions or [])
         self.limit = (
             settings.max_context_chars - reserve_chars
             if self.legacy
@@ -111,18 +115,25 @@ class _CompactionBudget:
             MAX_SUMMARY_CHARS if self.legacy else estimate_text_tokens("中" * MAX_SUMMARY_CHARS)
         )
 
-    def size(self, items) -> int:
+    def _direct_size(self, items) -> int:
         visible = wire_messages(items)
         if self.legacy:
             return len(json.dumps(visible, ensure_ascii=False))
         return estimate_tokens(visible)
 
+    def size(self, items) -> int:
+        if self.cache is None:
+            return self._direct_size(items)
+        return self.cache.pretty_list_len(items) if self.legacy else self.cache.list_tokens(items)
+
     def context_size(self, messages: list[Message]) -> int:
+        visible = [self.system_message, *messages]
+        if self.cache is not None:
+            # Always the whole live history: drop what an earlier compaction removed.
+            self.cache.sync(visible)
         if self.legacy:
             return self.overhead + self.size(messages)
-        return estimate_context([self.system_message, *messages], self.definitions, self.settings)[
-            "tokens"
-        ]
+        return estimate_context(visible, self.definitions, self.settings, self.cache)["tokens"]
 
     def recent_budget(self) -> int:
         if self.legacy:
@@ -301,9 +312,12 @@ def compact_messages(
     *,
     reserve_chars=0,
     reserve_tokens=0,
+    cache: WireCache | None = None,
 ):
     """Keep the current task verbatim and whole assistant/tool groups together."""
-    budget = _CompactionBudget(system_message, definitions, settings, reserve_chars, reserve_tokens)
+    budget = _CompactionBudget(
+        system_message, definitions, settings, reserve_chars, reserve_tokens, cache
+    )
     compacted = False
     while budget.context_size(messages) > budget.limit:
         before_context = budget.context_size(messages)

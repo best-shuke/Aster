@@ -87,6 +87,7 @@ def skill_roots(
     *,
     extra_dirs: tuple[Path, ...] = (),
     include_defaults: bool = True,
+    fallback_dirs: tuple[Path, ...] = (),
 ) -> list[Path]:
     workspace = workspace.resolve()
     candidates = [*extra_dirs]
@@ -106,6 +107,8 @@ def skill_roots(
                 Path.home() / ".pi" / "agent" / "skills",
             ]
         )
+    # Fallback roots (framework built-ins) lose every name conflict to user skills.
+    candidates.extend(fallback_dirs)
     roots: list[Path] = []
     seen: set[Path] = set()
     for candidate in candidates:
@@ -125,13 +128,19 @@ class SkillCatalog:
         enabled: bool = True,
         extra_dirs: tuple[Path, ...] = (),
         include_defaults: bool = True,
+        fallback_dirs: tuple[Path, ...] = (),
+        only: frozenset[str] | None = None,
     ):
         self.workspace = workspace.resolve()
         self.program_skills_dir = program_skills_dir.resolve()
         self.enabled = enabled
         self.extra_dirs = extra_dirs
         self.include_defaults = include_defaults
+        self.fallback_dirs = fallback_dirs
+        # An environment's skill selection: None keeps every discovered skill.
+        self.only = only
         self.skills: list[Skill] = []
+        self.available: list[Skill] = []
         self.diagnostics: list[SkillDiagnostic] = []
         self.reload()
 
@@ -142,7 +151,12 @@ class SkillCatalog:
             enabled=self.enabled,
             extra_dirs=self.extra_dirs,
             include_defaults=self.include_defaults,
+            fallback_dirs=self.fallback_dirs,
+            only=self.only,
         )
+
+    def find(self, name: str) -> Skill | None:
+        return next((skill for skill in self.skills if skill.name == name), None)
 
     def mcp_registry(self) -> dict[str, Any]:
         return {
@@ -166,10 +180,12 @@ class SkillCatalog:
             self.program_skills_dir,
             extra_dirs=self.extra_dirs,
             include_defaults=self.include_defaults,
+            fallback_dirs=self.fallback_dirs,
         )
 
     def reload(self) -> None:
         self.skills = []
+        self.available = []
         self.diagnostics = []
         if not self.enabled:
             return
@@ -177,7 +193,8 @@ class SkillCatalog:
         by_name: dict[str, Skill] = {}
         seen_files: set[Path] = set()
         explicit_roots = {
-            (self.workspace / path.expanduser()).resolve() for path in self.extra_dirs
+            (self.workspace / path.expanduser()).resolve()
+            for path in (*self.extra_dirs, *self.fallback_dirs)
         }
         for root in self.roots:
             if root in explicit_roots and not root.exists():
@@ -201,7 +218,15 @@ class SkillCatalog:
                     )
                     continue
                 by_name[skill.name] = skill
-        self.skills = list(by_name.values())
+        self.available = list(by_name.values())
+        if self.only is None:
+            self.skills = list(self.available)
+            return
+        self.skills = [skill for skill in self.available if skill.name in self.only]
+        for name in sorted(self.only - set(by_name)):
+            self.diagnostics.append(
+                SkillDiagnostic(Path(name), "selected skill was not found in any skill source")
+            )
 
     def _load(self, file_path: Path) -> Skill | None:
         declared = file_path.name == "SKILL.md"
@@ -244,25 +269,7 @@ class SkillCatalog:
         )
 
     def prompt_section(self) -> str:
-        visible = [skill for skill in self.skills if not skill.disable_model_invocation]
-        if not visible:
-            return ""
-        lines = [
-            "For a matching skill, read its complete file before acting; resolve references from its directory.",
-            "<available_skills>",
-        ]
-        for skill in visible:
-            lines.extend(
-                [
-                    "  <skill>",
-                    f"    <name>{html.escape(skill.name)}</name>",
-                    f"    <description>{html.escape(skill.description)}</description>",
-                    f"    <location>{html.escape(str(skill.file_path))}</location>",
-                    "  </skill>",
-                ]
-            )
-        lines.append("</available_skills>")
-        return "\n".join(lines)
+        return skills_prompt_section(self.skills)
 
     def expand_command(self, prompt: str) -> str:
         if not prompt.lstrip().startswith("/skill:"):
@@ -273,15 +280,43 @@ class SkillCatalog:
         if not self.enabled:
             raise ValueError("Skills 已关闭")
         name, arguments = match.group(1), (match.group(2) or "").strip()
-        skill = next((item for item in self.skills if item.name == name), None)
+        skill = self.find(name)
         if skill is None:
             raise ValueError(f"没有找到 skill：{name}；用 /skills 查看可用技能。")
-        try:
-            _, body = _frontmatter(skill.file_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
-            raise ValueError(f"无法加载 skill {name}（{skill.file_path}）：{exc}") from exc
-        block = (
-            f'<skill name="{html.escape(skill.name)}" location="{html.escape(str(skill.file_path))}">\n'
-            f"References are relative to {skill.base_dir}.\n\n{body}\n</skill>"
-        )
+        block = skill_block(skill)
         return f"{block}\n\nUser request:\n{arguments}" if arguments else block
+
+
+def skills_prompt_section(
+    skills: list[Skill],
+    instruction: str = "For a matching skill, read its complete file before acting; "
+    "resolve references from its directory.",
+) -> str:
+    visible = [skill for skill in skills if not skill.disable_model_invocation]
+    if not visible:
+        return ""
+    lines = [instruction, "<available_skills>"]
+    for skill in visible:
+        lines.extend(
+            [
+                "  <skill>",
+                f"    <name>{html.escape(skill.name)}</name>",
+                f"    <description>{html.escape(skill.description)}</description>",
+                f"    <location>{html.escape(str(skill.file_path))}</location>",
+                "  </skill>",
+            ]
+        )
+    lines.append("</available_skills>")
+    return "\n".join(lines)
+
+
+def skill_block(skill: Skill) -> str:
+    """Load one skill's full instructions on demand, as /skill: and team members do."""
+    try:
+        _, body = _frontmatter(skill.file_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
+        raise ValueError(f"无法加载 skill {skill.name}（{skill.file_path}）：{exc}") from exc
+    return (
+        f'<skill name="{html.escape(skill.name)}" location="{html.escape(str(skill.file_path))}">\n'
+        f"References are relative to {skill.base_dir}.\n\n{body}\n</skill>"
+    )

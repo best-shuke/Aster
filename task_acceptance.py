@@ -15,6 +15,48 @@ from pathlib import Path
 
 from file_state import SOURCE_NAMES, SOURCE_SUFFIXES, file_digest, source_snapshot
 
+# The agent cannot go on, or it waits on the user.
+INABILITY = re.compile(
+    r"(?:无法|不能|未能).{0,12}(?:完成|继续|执行)"
+    r"|\b(?:blocked by|cannot proceed|unable to complete)\b",
+    re.I,
+)
+NEEDS_USER = re.compile(r"需要你.{0,20}(?:提供|确认)|\bneed your clarification\b", re.I)
+UNTRUSTED_CHECK = "Run the check as a standalone command; shell composition may hide failures."
+# Quoted and code text reports what something said or contains, not the agent's own state.
+QUOTED = re.compile(r"```.*?```|`[^`\n]*`|“[^”]*”|「[^」]*」|‘[^’]*’|\"[^\"\n]{0,300}\"", re.S)
+SENTENCE_END = re.compile(r"[。！？!?；;\n]|\.(?:\s|$)")
+# A name right after these is an object ("我让 critic 运行测试"), not the subject.
+OBJECT_MARKERS = re.compile(
+    r"(?:(?:让|请|叫|派|要求|安排|交给|通知|提醒|问|向|给|和|与|跟|对|把|被)"
+    r"|\b(?:asked|told|let|had|with|to|for|from|by)(?:\s+the)?)\s*$",
+    re.I,
+)
+# A name right before these only says where something came from ("用户提供的文件无法执行"):
+# that thing, not the name, is what cannot go on. A bare 的 ("critic 的环境") stays the owner's.
+ATTRIBUTIVE = re.compile(
+    r"\s*(?:提供|给出|给|上传|发来|发送|提交|指定|要求|写|编写|生成|创建|准备)"
+    r"(?:了|过)?(?:我们|我|你)?的"
+)
+
+
+def _words(pattern: str) -> str:
+    # ASCII boundaries: Chinese text often puts Latin names right next to CJK characters.
+    return rf"(?<![A-Za-z0-9_-])(?:{pattern})(?![A-Za-z0-9_-])"
+
+
+SELF_SUBJECT = r"我|咱们|" + _words(r"I|I'm|I've|we|we're|we've")
+# 其他/其它 ("other …") are not the pronouns 他/它.
+OTHER_SUBJECT = (
+    r"(?<!其)他|她|(?<!其)它|对方|用户|成员|队友|子代理|其他代理|另一个代理|评审者|审阅者|评审员|"
+    + _words(r"he|she|they|the user|teammates?|members?|reviewers?|workers?|subagents?")
+)
+# A limitation already overcome ("at first the tests could not run") is no blocker.
+# Not 之前: "在你确认之前" means "until you confirm".
+EARLIER = r"此前|先前|起初|最初|一开始|原先|原本|曾经|" + _words(
+    r"previously|initially|at first|earlier"
+)
+
 
 @dataclass
 class TaskContract:
@@ -31,6 +73,8 @@ class TaskAcceptance:
     workspace: Path | None = None
     ignored_paths: tuple[Path, ...] = ()
     deadline: float | None = None
+    # Other agents (team members) whose limitations the answer may report.
+    others: tuple[str, ...] = ()
 
     def __post_init__(self):
         self.kind = self.contract.kind
@@ -56,6 +100,11 @@ class TaskAcceptance:
         self.code_revision = 0
         self.verified_revision = -1
         self.failed_verifications = {}
+        # Evidence indexes of this agent's own latest successful source write/edit and of
+        # where its latest passing standalone check started (a background check finishes
+        # later), whatever the code revision then was.
+        self.last_own_edit = -1
+        self.last_passed_check = -1
         self.pending_verifications = {}
         self._verification_start = 0
         self._roots = {self.workspace.resolve()} if self.workspace is not None else set()
@@ -185,35 +234,44 @@ class TaskAcceptance:
         }
         self.evidence.append(record)
         index = len(self.evidence) - 1
-        changed = self._refresh_files()
-        if changed:
-            record["changed_files"] = changed
-        if (
-            self._files is None
-            and result.get("status") == "ok"
+        own_source_edit = (
+            result.get("status") == "ok"
             and function.get("name") in {"write", "edit"}
             and (
                 Path(arguments.get("path", "")).suffix.lower() in SOURCE_SUFFIXES
                 or Path(arguments.get("path", "")).name in SOURCE_NAMES
             )
-        ):
+        )
+        if own_source_edit:
+            self.last_own_edit = index
+        changed = self._refresh_files()
+        if changed:
+            record["changed_files"] = changed
+        if self._files is None and own_source_edit:
             self.code_revision += 1
             self.last_code_change = index
         record["code_revision"] = self.code_revision
         verification_start = self._verification_start
+        started_at = index
         verification_result = result
         data = result.get("data") or {}
         if function.get("name") == "monitor":
             pending = self.pending_verifications.get(data.get("session_id"))
             if pending and data.get("state") in {"completed", "failed", "timed_out", "stopped"}:
-                arguments, verification_start = self.pending_verifications.pop(data["session_id"])
+                arguments, verification_start, started_at = self.pending_verifications.pop(
+                    data["session_id"]
+                )
                 record["verification_session_id"] = data["session_id"]
                 verification_result = {"status": "ok" if data["state"] == "completed" else "error"}
         is_verification = (
             function.get("name") == "exec" or "verification_session_id" in record
         ) and self.verification_command(arguments.get("command", ""))
         if is_verification and data.get("state") == "running" and data.get("session_id"):
-            self.pending_verifications[data["session_id"]] = (dict(arguments), verification_start)
+            self.pending_verifications[data["session_id"]] = (
+                dict(arguments),
+                verification_start,
+                index,
+            )
             record["verification_pending"] = True
         elif is_verification:
             record["verification"] = True
@@ -230,32 +288,95 @@ class TaskAcceptance:
                 self.failed_verifications[identity] = record
                 self.verified_revision = -1
             else:
-                lexer = shlex.shlex(
-                    arguments.get("command", "").strip(), posix=True, punctuation_chars=";&|\n"
-                )
-                lexer.whitespace = " \t\r"
-                lexer.commenters = ""
-                lexer.whitespace_split = True
-                standalone = not any(token and set(token) <= set(";&|\n") for token in lexer)
+                segments = self.shell_segments(arguments.get("command", ""))
+                standalone = segments is not None and len(segments) == 1
                 if not standalone:
                     self.verified_revision = -1
-                    record["verification_untrusted"] = (
-                        "Run the check as a standalone command; shell composition may hide failures."
-                    )
+                    record["verification_untrusted"] = UNTRUSTED_CHECK
                 else:
                     self.failed_verifications.pop(identity, None)
+                    self.last_passed_check = started_at
                 if standalone and (self._files is None or verification_start == self.code_revision):
                     self.last_verification = index
                     self.verified_revision = self.code_revision
+        elif function.get("name") == "exec" and any(
+            self.verification_command(shlex.join(segment))
+            for segment in self.shell_segments(arguments.get("command", "")) or ()
+        ):
+            # A check hidden behind "cd … &&" is no verification, but say why it is not.
+            record["verification_untrusted"] = UNTRUSTED_CHECK
 
-    def validate(self, content):
-        self.status = "in_progress"
-        text = content.strip()
-        blocked = re.search(
-            r"(?:无法|不能|未能).{0,12}(?:完成|继续|执行)|需要你.{0,20}(?:提供|确认)|\b(?:blocked by|cannot proceed|unable to complete|need your clarification)\b",
-            text,
+    @staticmethod
+    def shell_segments(command):
+        """The command's words split at shell composition (;, &, &&, |, ||, newlines).
+
+        "<" and ">" are punctuation too, so redirections such as 2>&1 or &>log lex as
+        tokens containing them and never count as composition; quoted text stays a word.
+        None when the command cannot be lexed (e.g. a quote inside a shell comment), so
+        its composition is unknown.
+        """
+        lexer = shlex.shlex(command.strip(), posix=True, punctuation_chars=";&|<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.commenters = ""
+        lexer.whitespace_split = True
+        try:
+            tokens = list(lexer)
+        except ValueError:
+            return None
+        segments = [[]]
+        for token in tokens:
+            if token and set(token) <= set(";&|\n"):
+                segments.append([])
+            else:
+                segments[-1].append(token)
+        return segments
+
+    def reports_blocker(self, text):
+        """True when the answer says the agent itself is blocked or waits on the user.
+
+        Inability phrases are attributed to the last subject named earlier in their
+        sentence, since Chinese often omits a repeated subject: "the critic is read-only
+        and cannot proceed" reports a teammate's limitation, not this agent's. A name that
+        is an object or only modifies a noun is no subject. Without a named subject the
+        agent is speaking about itself.
+        """
+        text = QUOTED.sub(" ", text)
+        if NEEDS_USER.search(text):
+            return True
+        names = "|".join(re.escape(name) for name in self.others if name)
+        subject = re.compile(
+            rf"(?P<self>{SELF_SUBJECT})|(?P<other>{OTHER_SUBJECT}"
+            + (f"|{_words(names)}" if names else "")
+            + ")",
             re.I,
         )
+        for match in INABILITY.finditer(text):
+            ends = list(SENTENCE_END.finditer(text, 0, match.start()))
+            sentence = text[ends[-1].end() if ends else 0 : match.start()]
+            if re.search(EARLIER, sentence, re.I):
+                continue
+            subjects = [
+                found
+                for found in subject.finditer(sentence)
+                if found.group("self")
+                or not (
+                    OBJECT_MARKERS.search(sentence[: found.start()])
+                    or ATTRIBUTIVE.match(sentence, found.end())
+                )
+            ]
+            if not subjects or subjects[-1].group("self"):
+                return True
+        return False
+
+    def validate(self, content, *, background=False):
+        """None when the answer may be published; otherwise what to repair.
+
+        ``background`` means delegated work keeps running after this turn: its edits are
+        not final yet, so they are not required to be verified now.
+        """
+        self.status = "in_progress"
+        text = content.strip()
+        blocked = self.reports_blocker(text)
         work_task = (
             self.kind in {"change", "inspect"} or bool(self.evidence) or bool(self.contract.checks)
         )
@@ -281,6 +402,17 @@ class TaskAcceptance:
             e["status"] == "ok" for e in self.evidence
         ):
             return "No successful tool evidence supports completion of this task. Inspect and perform the requested work, or state the concrete blocker."
+        if background:
+            # Teammates' unfinished edits are not final yet, but this agent's own are.
+            if self.kind == "change" and self.last_passed_check < self.last_own_edit:
+                return (
+                    "You changed files yourself: verify your own change with a relevant "
+                    "standalone test/build/assertion before answering, even though members "
+                    "keep working in the background."
+                )
+            # Contract checks judge finished work; this turn hands work off instead.
+            self.status = "background"
+            return None
         self._refresh_files()
         if self.kind == "change" and self._tracking_error:
             return (
@@ -297,6 +429,16 @@ class TaskAcceptance:
             and self.verified_revision != self.code_revision
             and not self.contract.checks
         ):
+            if any(
+                record.get("verification_untrusted")
+                for record in self.evidence[max(self.last_code_change, 0) :]
+            ):
+                return (
+                    "Code was changed but no successful verification followed the last edit: "
+                    "the check you ran was not counted because it was combined with other shell "
+                    "commands (&&, ;, |, newlines), which can hide a failure. Run the check alone "
+                    "in its own exec call, with the cwd argument instead of cd."
+                )
             return "Code was changed but no successful verification followed the last edit. Run a relevant standalone test/build/assertion, or explicitly report why validation is blocked."
         self.check_results = []
         for check in self.contract.checks:

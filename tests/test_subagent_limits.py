@@ -9,6 +9,18 @@ from reasoning import ReasoningTools
 
 
 class SubagentLimitTests(unittest.TestCase):
+    def test_task_deadline_defaults_to_unlimited_and_respects_explicit_settings(self):
+        for configured, expected in ((None, None), ("60", 60), ("unlimited", None), ("0", None)):
+            settings = {"DEEPSEEK_API_KEY": "test"}
+            if configured is not None:
+                settings["DEEPSEEK_MAX_TASK_SECONDS"] = configured
+            with (
+                self.subTest(configured=configured),
+                patch("config.load_env"),
+                patch.dict("os.environ", settings, clear=True),
+            ):
+                self.assertEqual(Settings.from_env().max_task_seconds, expected)
+
     def test_default_configuration_allows_twenty_subagents(self):
         with (
             patch("config.load_env"),

@@ -1,5 +1,4 @@
 import base64
-import hashlib
 import io
 import json
 import os
@@ -9,7 +8,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from itertools import pairwise
@@ -21,8 +20,8 @@ from client_runtime import snapshot_client
 from config import MAX_SUBAGENTS
 from contracts import CompletionClient, ProgressCallback, ToolCall, ToolDefinition
 from execution_trace import display_callback, emit_event, trace_scope
-from file_changes import FileTransaction, text_digest
-from file_state import FileChangedError, atomic_write_text, file_digest
+from file_changes import MAX_AUTO_MERGE_CHARS, EditLedger, FileTransaction, text_digest
+from file_state import FileChangedError, atomic_write_text, file_digest, file_lock
 from mcp_client import McpManager
 from process_monitor import ProcessMonitor
 from reasoning import ReasoningTools
@@ -76,12 +75,17 @@ TOOL_NAMES = frozenset(
         "mcp",
         "ask_user",
         "delegate",
+        "team",
     }
 )
 
 # Subagents may never use these, even when an environment grants extra worker tools:
-# workers must not delegate, ask the user, or rewrite the parent task plan.
-WORKER_EXCLUDED = frozenset({"delegate", "ask_user", "update_plan", "monitor"})
+# workers must not delegate, ask the user, rewrite the parent task plan, or join a team.
+WORKER_EXCLUDED = frozenset({"delegate", "ask_user", "update_plan", "monitor", "team"})
+MERGED_NOTE = (
+    "Another agent changed this file since you read it; your change was merged with theirs. "
+    "Read the file before relying on its exact contents."
+)
 
 
 @dataclass(frozen=True)
@@ -507,6 +511,11 @@ class CodingTools:
         self._global_worker_limit = None
         self.worker_status = WorkerStatus()
         self.role_loader = None
+        # Team members get private session state hidden and, optionally, write scopes.
+        self.protected_paths: tuple[Path, ...] = ()
+        self.write_roots: tuple[Path, ...] | None = None
+        # Shared by a team's agents: stale edits merge with teammates' writes.
+        self.edit_ledger: EditLedger | None = None
 
     def _registry_for(
         self,
@@ -527,6 +536,7 @@ class CodingTools:
         snapshot.processes = self.processes
         snapshot._file_versions = self._file_versions
         snapshot.worker_status = self.worker_status
+        snapshot.edit_ledger = self.edit_ledger
         snapshot.apply_configuration(self)
         if registry is not None:
             snapshot.registry = self._registry_for(snapshot, registry)
@@ -545,6 +555,8 @@ class CodingTools:
         self.role_loader = other.role_loader
         self._global_worker_slots = other._global_worker_slots
         self._global_worker_limit = other._global_worker_limit
+        self.protected_paths = other.protected_paths
+        self.write_roots = other.write_roots
 
     @property
     def file_versions(self) -> dict[Path, str | None]:
@@ -567,7 +579,12 @@ class CodingTools:
         writable = any(
             name in self.worker_allow and self.policy.permits(name) for name in ("write", "edit")
         )
-        changes = FileTransaction(self.artifacts) if writable else None
+        ledger = self.edit_ledger
+        changes = (
+            FileTransaction(self.artifacts, ledger.record_write if ledger else None)
+            if writable
+            else None
+        )
         self._file_versions.transaction = changes
         self._file_versions.worker_versions = {}
         self._file_versions.worker = True
@@ -609,7 +626,7 @@ class CodingTools:
         )
 
     def detach(self, name: str) -> None:
-        if name not in {"websearch", "mcp", "delegate", "ask_user"}:
+        if name not in {"websearch", "mcp", "delegate", "ask_user", "team"}:
             raise ValueError(f"Cannot detach built-in tool {name!r}")
         self.registry.pop(name, None)
 
@@ -817,7 +834,40 @@ class CodingTools:
 
     def path(self, value: str = ".") -> Path:
         path = Path(value).expanduser()
-        return path.resolve() if path.is_absolute() else (self.workspace / path).resolve()
+        resolved = path.resolve() if path.is_absolute() else (self.workspace / path).resolve()
+        if self._protected(resolved):
+            raise PermissionError(f"{resolved} holds private session state and is not accessible")
+        return resolved
+
+    def _protected(self, path: Path) -> bool:
+        for root in self.protected_paths:
+            if path == root or path.is_relative_to(root):
+                return True
+            # atomic_write_text stages content in ".<name>.<id>.tmp" next to the target.
+            if (
+                path.parent == root.parent
+                and path.name.startswith(f".{root.name}.")
+                and path.name.endswith(".tmp")
+            ):
+                return True
+        return False
+
+    def _writable(self, path: Path) -> None:
+        if self.write_roots is not None and not any(
+            path == root or path.is_relative_to(root) for root in self.write_roots
+        ):
+            allowed = ", ".join(str(root) for root in self.write_roots) or "none"
+            raise PermissionError(f"Writing {path} is outside this agent's write scope ({allowed})")
+
+    def _protected_globs(self, root: Path) -> list[str]:
+        globs = []
+        for protected in self.protected_paths:
+            if protected.is_relative_to(root) and protected != root:
+                relative = protected.relative_to(root)
+                temporary = (relative.parent / f".{relative.name}.*.tmp").as_posix()
+                globs += ["--glob", f"!{relative.as_posix()}", "--glob", f"!{relative.as_posix()}/**"]
+                globs += ["--glob", f"!{temporary}"]
+        return globs
 
     def execute(
         self,
@@ -833,6 +883,10 @@ class CodingTools:
             else time.monotonic() + (max_timeout if max_timeout is not None else 3600),
             on_progress=on_progress,
         )
+        return self._execute(tool_call, context, worker=False)
+
+    def execute_in(self, tool_call: ToolCall, context: ExecutionContext) -> str:
+        """Run as a full agent under the caller's deadline and cancellation (team members)."""
         return self._execute(tool_call, context, worker=False)
 
     def execute_workspace(self, tool_call: ToolCall, context: ExecutionContext) -> str:
@@ -987,8 +1041,14 @@ class CodingTools:
         else:
             if not file_path.is_file():
                 raise FileNotFoundError(f"Not a regular file: {file_path}")
-            version = file_digest(file_path, _context.remaining)
-            source = file_path.open(encoding="utf-8", newline="")
+            whole = self._mergeable_text(file_path, _context.remaining)
+            if whole is not None:
+                # One read serves the page, its version and the team's merge base.
+                version = self.edit_ledger.remember(whole)
+                source = io.StringIO(whole, newline="")
+            else:
+                version = file_digest(file_path, _context.remaining)
+                source = file_path.open(encoding="utf-8", newline="")
         with source as stream:
             current_line = 1
             while current_line < offset:
@@ -1052,6 +1112,7 @@ class CodingTools:
 
     def write(self, path: str, content: str, *, _context: ExecutionContext) -> ToolResult:
         file_path = self.path(path)
+        self._writable(file_path)
         _context.remaining()
         if self.worker_changes is not None:
             if (
@@ -1080,29 +1141,75 @@ class CodingTools:
             return ToolResult.failure(
                 "read_required", "Read the existing file before a full-file overwrite."
             )
-        atomic_write_text(file_path, content, expected=version, check=_context.remaining)
-        self.file_versions[file_path] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        merged = False
+        with self._merge_lock(file_path, _context.remaining):
+            current = self._stale_content(file_path, version, _context.remaining)
+            if current is not None:
+                content = self.edit_ledger.merge(file_path, version, current, content)
+                version, merged = text_digest(current), True
+            atomic_write_text(file_path, content, expected=version, check=_context.remaining)
+            # Inside the lock: a teammate merging next must already see this as agent-written.
+            self._wrote(file_path, content)
         return ToolResult(
-            data={"path": str(file_path), "bytes_written": len(content.encode("utf-8"))}
+            data={
+                "path": str(file_path),
+                "bytes_written": len(content.encode("utf-8")),
+                **({"merged": MERGED_NOTE} if merged else {}),
+            }
         )
 
     def edit(
         self, path: str, edits: list[dict[str, str]], *, _context: ExecutionContext
     ) -> ToolResult:
         file_path = self.path(path)
+        self._writable(file_path)
         changes = self.worker_changes
-        if changes is not None:
-            original = changes.read(file_path, _context.remaining)
-            version = text_digest(original)
-        else:
-            version = file_digest(file_path, _context.remaining)
-            with file_path.open(encoding="utf-8", newline="") as stream:
-                original = stream.read()
-        if file_path in self.file_versions and self.file_versions[file_path] != version:
-            raise FileChangedError(f"File changed since it was read: {file_path}. Read it again.")
+        merged = False
+        with self._merge_lock(file_path, _context.remaining) if changes is None else nullcontext():
+            if changes is not None:
+                original = changes.read(file_path, _context.remaining)
+                version = text_digest(original)
+            else:
+                version = file_digest(file_path, _context.remaining)
+                with file_path.open(encoding="utf-8", newline="") as stream:
+                    original = stream.read()
+            seen = self.file_versions.get(file_path, version)
+            base = original
+            if seen != version:
+                stale = changes is None and self.edit_ledger is not None
+                base = self.edit_ledger.content(seen) if stale else None
+                if base is None:
+                    raise FileChangedError(
+                        f"File changed since it was read: {file_path}. Read it again."
+                    )
+            # Edits apply to the content this agent saw; a teammate's newer write is merged.
+            updated = self._apply_edits(base, edits, _context.remaining)
+            if base is not original:
+                updated = self.edit_ledger.merge(file_path, seen, original, updated)
+                merged = True
+            _context.remaining()
+            if changes is not None:
+                changes.write(file_path, updated, _context.remaining)
+                self.file_versions[file_path] = text_digest(updated)
+            else:
+                atomic_write_text(file_path, updated, expected=version, check=_context.remaining)
+                self._wrote(file_path, updated)
+        return ToolResult(
+            data={
+                "path": str(file_path),
+                "edits_applied": len(edits),
+                "bytes_written": len(updated.encode("utf-8")),
+                "staged": changes is not None,
+                "commit_required": changes is not None,
+                **({"merged": MERGED_NOTE} if merged else {}),
+            }
+        )
+
+    @staticmethod
+    def _apply_edits(original: str, edits: list[dict[str, str]], check) -> str:
         replacements = []
         for item in edits:
-            _context.remaining()
+            check()
             old_text, new_text = item["oldText"], item["newText"]
             if original.count(old_text) != 1:
                 raise ValueError(
@@ -1116,21 +1223,52 @@ class CodingTools:
         updated = original
         for start, end, replacement in reversed(replacements):
             updated = updated[:start] + replacement + updated[end:]
-        _context.remaining()
-        if changes is not None:
-            changes.write(file_path, updated, _context.remaining)
-        else:
-            atomic_write_text(file_path, updated, expected=version, check=_context.remaining)
-        self.file_versions[file_path] = hashlib.sha256(updated.encode("utf-8")).hexdigest()
-        return ToolResult(
-            data={
-                "path": str(file_path),
-                "edits_applied": len(edits),
-                "bytes_written": len(updated.encode("utf-8")),
-                "staged": changes is not None,
-                "commit_required": changes is not None,
-            }
-        )
+        return updated
+
+    def _merge_lock(self, path: Path, check):
+        # Read, merge and write under one lock so concurrent teammates serialize.
+        return file_lock(path, check) if self.edit_ledger is not None else nullcontext()
+
+    def _stale_content(self, path: Path, seen: str | None, check) -> str | None:
+        """The current content when the file changed since this agent's read and can merge.
+
+        None when it did not change (or is gone: the write then reports the conflict).
+        Only content a teammate's file tool wrote is mergeable, and the ledger holds it, so
+        nothing else is read or decoded here; EditLedger.merge checks the rest.
+        """
+        ledger = self.edit_ledger
+        if ledger is None or seen is None:
+            return None
+        current = file_digest(path, check)
+        if current in {None, seen}:
+            return None
+        content = ledger.content(current)
+        if content is None:
+            raise FileChangedError(f"File changed since it was read: {path}. Read it again.")
+        return content
+
+    def _mergeable_text(self, path: Path, check) -> str | None:
+        """The whole file when a team may merge later edits based on this read, else None.
+
+        Larger or non-UTF-8 files are never merged, so their reads stream as usual.
+        """
+        if self.edit_ledger is None:
+            return None
+        check()
+        try:
+            # UTF-8 needs at most 4 bytes per character.
+            if path.stat().st_size > 4 * MAX_AUTO_MERGE_CHARS:
+                return None
+            with path.open(encoding="utf-8", newline="") as stream:
+                content = stream.read(MAX_AUTO_MERGE_CHARS + 1)
+        except (OSError, UnicodeDecodeError):
+            return None
+        return content if len(content) <= MAX_AUTO_MERGE_CHARS else None
+
+    def _wrote(self, path: Path, content: str) -> None:
+        self.file_versions[path] = text_digest(content)
+        if self.edit_ledger is not None:
+            self.edit_ledger.record_write(path, content)
 
     def run_command(
         self,
@@ -1323,7 +1461,9 @@ class CodingTools:
             command.append("--fixed-strings")
         if context:
             command += ["--context", str(context)]
-        command += ["-e", pattern, "--", str(self.path(path))]
+        root = self.path(path)
+        command += [*self._protected_globs(root if root.is_dir() else root.parent)]
+        command += ["-e", pattern, "--", str(root)]
         process, error = self._search(command, _context)
         if error:
             return error
@@ -1366,7 +1506,14 @@ class CodingTools:
         if not root.is_dir():
             raise NotADirectoryError(root)
         process, error = self._search(
-            [*self._rg_options(pattern), "--files", "--null", "--", str(root)],
+            [
+                *self._rg_options(pattern),
+                *self._protected_globs(root),
+                "--files",
+                "--null",
+                "--",
+                str(root),
+            ],
             _context,
             tool="find",
         )

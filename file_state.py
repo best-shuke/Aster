@@ -180,6 +180,18 @@ def _atomic_write_text(path: Path, content: str, *, expected=_UNSPECIFIED, check
         temporary.unlink(missing_ok=True)
 
 
+# Filesystem timestamps have limited resolution, so two same-size writes within the same
+# tick can produce an identical (size, mtime, ctime) identity. A cached digest is only safe
+# to trust once that tick has passed; until then a later write could reuse the same identity
+# with different content. 2s covers coarse-resolution filesystems (FAT, some NFS) as well.
+_DIGEST_CACHE_SKEW_NS = 2_000_000_000
+
+
+def _digest_identity_is_settled(info) -> bool:
+    newest = max(info.st_mtime_ns, info.st_ctime_ns)
+    return time.time_ns() - newest > _DIGEST_CACHE_SKEW_NS
+
+
 def cached_file_digest(path: Path, cache: dict, check=None) -> str | None:
     for _attempt in range(3):
         if check:
@@ -212,7 +224,10 @@ def cached_file_digest(path: Path, cache: dict, check=None) -> str | None:
             after.st_mtime_ns,
             after.st_ctime_ns,
         ):
-            cache[str(path)] = (identity, digest)
+            # Only cache the identity once its timestamps can no longer collide with a
+            # future same-size write; otherwise recompute next time to avoid a stale digest.
+            if _digest_identity_is_settled(after):
+                cache[str(path)] = (identity, digest)
             return digest
     raise OSError(f"File kept changing while tracking its version: {path}")
 

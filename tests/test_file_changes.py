@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from file_changes import FileMergeConflict, FileTransaction, merge_text
+from file_changes import EditLedger, FileMergeConflict, FileTransaction, merge_text, text_digest
 from file_state import FileChangedError, atomic_write_text, file_digest, file_lock
 from tool_runtime import ArtifactStore, ExecutionContext
 
@@ -260,3 +260,122 @@ class FileLockTests(unittest.TestCase):
             )
         self.assertEqual(process.stdout.strip(), "timeout")
         self.assertEqual(self.target.read_text(), "original")
+
+
+class EditLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.path = Path("/workspace/app.py")
+
+    def test_merges_only_onto_content_another_agent_wrote(self):
+        ledger = EditLedger()
+        base = ledger.remember("alpha\nbeta\n")
+        ledger.record_write(self.path, "ALPHA\nbeta\n")
+        self.assertTrue(ledger.written_by_agent(self.path, text_digest("ALPHA\nbeta\n")))
+        self.assertEqual(
+            ledger.merge(self.path, base, "ALPHA\nbeta\n", "alpha\nBETA\n"), "ALPHA\nBETA\n"
+        )
+        with self.assertRaisesRegex(FileChangedError, "Read it again"):
+            ledger.merge(self.path, base, "alpha\nbeta\nuser\n", "alpha\nBETA\n")
+        with self.assertRaisesRegex(FileChangedError, "Read it again"):
+            ledger.merge(self.path, text_digest("unseen"), "ALPHA\nbeta\n", "alpha\nBETA\n")
+        with self.assertRaisesRegex(FileMergeConflict, "changes conflict"):
+            ledger.merge(self.path, base, "ALPHA\nbeta\n", "Alpha\nbeta\n")
+
+    def test_writes_are_tracked_per_path(self):
+        ledger = EditLedger()
+        ledger.record_write(self.path, "content")
+        self.assertFalse(
+            ledger.written_by_agent(Path("/workspace/other.py"), text_digest("content"))
+        )
+        self.assertFalse(ledger.written_by_agent(self.path, None))
+
+    def test_memory_stays_bounded_and_keeps_recent_contents(self):
+        ledger = EditLedger(limit_chars=10)
+        old = ledger.remember("123456")
+        recent = ledger.remember("abcdef")
+        self.assertIsNone(ledger.content(old))
+        self.assertEqual(ledger.content(recent), "abcdef")
+        self.assertLessEqual(ledger.size, 10)
+
+
+class LedgerToolTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        from tools import CodingTools
+
+        self.tools = CodingTools(self.root)
+        self.addCleanup(self.tools.close)
+        self.tools.edit_ledger = EditLedger()
+
+    def execute(self, name, arguments):
+        call = {
+            "id": "c",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        }
+        return json.loads(self.tools.execute(call))
+
+    def test_a_read_is_the_merge_base_and_hashes_the_file_once(self):
+        target = self.root / "notes.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        with patch("tools.file_digest", side_effect=file_digest) as digest:
+            page = self.execute("read", {"path": "notes.txt", "offset": 2, "limit": 1})
+        self.assertEqual(page["data"]["content"], "two\n")
+        # Only the check that the file did not change while it was read hashes it again.
+        self.assertEqual(digest.call_count, 1)
+        # A teammate writes a disjoint change; an edit based on this read merges with it.
+        self.tools.edit_ledger.record_write(target, "one\ntwo\nthree\nfour\n")
+        target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+        result = self.execute(
+            "edit", {"path": "notes.txt", "edits": [{"oldText": "one", "newText": "ONE"}]}
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("merged", result["data"])
+        self.assertEqual(target.read_text(), "ONE\ntwo\nthree\nfour\n")
+
+    def test_files_that_cannot_merge_are_still_read_page_by_page(self):
+        target = self.root / "mixed.txt"
+        # Invalid UTF-8 far past the first page: it is never merged, but its start reads.
+        target.write_bytes(b"first\n" + b"x" * 100_000 + b"\n\xff\n")
+        page = self.execute("read", {"path": "mixed.txt", "limit": 1})
+        self.assertEqual(page["data"]["content"], "first\n")
+        self.assertFalse(self.tools.edit_ledger.contents)
+
+    def test_undecodable_changes_by_others_report_file_changed(self):
+        target = self.root / "data.txt"
+        target.write_text("alpha\n", encoding="utf-8")
+        self.execute("read", {"path": "data.txt"})
+        target.write_bytes(b"caf\xe9\n")
+        result = self.execute("write", {"path": "data.txt", "content": "beta\n"})
+        self.assertEqual(result["error"]["code"], "file_changed")
+        self.assertEqual(target.read_bytes(), b"caf\xe9\n")
+
+    def test_rolled_back_transactions_are_not_recorded_as_agent_writes(self):
+        written = []
+        transaction = FileTransaction(
+            ArtifactStore(self.root), lambda path, text: written.append(path)
+        )
+        check = ExecutionContext(time.monotonic() + 10).remaining
+        first, second = self.root / "a.txt", self.root / "b.txt"
+        first.write_text("a\n")
+        second.write_text("b\n")
+        transaction.write(first, "A\n", check)
+        transaction.write(second, "B\n", check)
+        original = atomic_write_text
+
+        def fail_on_second(path, content, **kwargs):
+            if path == second:
+                raise OSError("disk full")
+            return original(path, content, **kwargs)
+
+        with (
+            patch("file_changes.atomic_write_text", side_effect=fail_on_second),
+            self.assertRaises(OSError),
+        ):
+            transaction.commit(check)
+        self.assertEqual(first.read_text(), "a\n")
+        self.assertEqual(written, [])
+        transaction.commit(check)
+        self.assertEqual(sorted(written), [first, second])

@@ -12,9 +12,14 @@ from client_runtime import ClientState, configure_client, fork_client
 from config import Settings, system_prompt
 from contracts import Message, ToolRun
 from environments import ResolvedEnvironment
+from file_changes import EditLedger
 from mcp_client import McpManager
+from mcp_scope import ScopedMcp
 from reasoning import RolePromptCache
 from skills import SkillCatalog
+from team_runtime import TeamRuntime
+from team_state import MAIN
+from team_tools import TeamTool
 from tool_runtime import ExecutionContext
 from tools import CodingTools
 from usage import CacheStats
@@ -42,6 +47,7 @@ class ConversationState:
     tool_runs: list[ToolRun]
     last_outcome: dict | None
     recovery_notice: str | None
+    team: TeamRuntime | None
 
     @classmethod
     def capture(cls, conversation: "Conversation") -> "ConversationState":
@@ -61,6 +67,7 @@ class PreparedEnvironment:
     instructions: str | None
     prompt: str
     cache_stats: CacheStats | None
+    team: TeamRuntime | None = None
 
 
 class McpRoleLoader:
@@ -97,6 +104,7 @@ class EnvironmentTransition:
         self.restore_data = restore
         self.on_connect = on_connect
         self.manager: McpManager | None = None
+        self.team: TeamRuntime | None = None
         self.warnings: list[str] = []
 
     def run(self, environment: ResolvedEnvironment | None) -> list[str]:
@@ -152,6 +160,8 @@ class EnvironmentTransition:
         settings = environment.settings if environment else conversation._baseline_settings
         skills = self.prepare_skills(environment, settings)
         tools = self.prepare_tools(environment, settings, skills)
+        if tools is not None and environment is not None and environment.multi_agent:
+            self.prepare_team(environment, settings, skills, tools)
         instructions = None if environment else conversation._baseline_instructions
         prompt = conversation._compose_prompt(
             settings,
@@ -159,6 +169,7 @@ class EnvironmentTransition:
             skills,
             instructions,
             environment.prompt_text if environment else None,
+            self.team,
         )
         old_stats = client_state.cache_stats
         stats = CacheStats() if isinstance(old_stats, CacheStats) else old_stats
@@ -169,21 +180,13 @@ class EnvironmentTransition:
         if tools is not None:
             self.prepare_workers(tools, environment, settings, skills, stats)
         return PreparedEnvironment(
-            environment, settings, skills, tools, instructions, prompt, stats
+            environment, settings, skills, tools, instructions, prompt, stats, self.team
         )
 
     def prepare_skills(self, environment, settings) -> SkillCatalog | None:
         if environment is not None:
-            baseline = self.conversation._baseline_skills
-            inherited = baseline if environment.inherit_skills else None
-            skills = SkillCatalog(
-                settings.workspace,
-                settings.skills_dir,
-                enabled=settings.skills_enabled,
-                extra_dirs=environment.skills_dirs
-                + (inherited.extra_dirs if inherited is not None and inherited.enabled else ()),
-                include_defaults=environment.inherit_skills
-                and (inherited is None or (inherited.enabled and inherited.include_defaults)),
+            skills = self.conversation.environments.skill_catalog(
+                environment, baseline=self.conversation._baseline_skills
             )
         elif self.conversation._baseline_skills is not None:
             skills = self.conversation._baseline_skills.fork()
@@ -211,6 +214,7 @@ class EnvironmentTransition:
             tools.worker_allow = environment.worker_tools if environment else frozenset()
             tools.worker_roles = dict(environment.role_prompts) if environment else {}
             tools.role_loader = None
+            tools.edit_ledger = None
             tools.cache_scope = environment.environment_id if environment else "default"
             if not settings.websearch_enabled:
                 tools.detach("websearch")
@@ -235,7 +239,11 @@ class EnvironmentTransition:
                 previous=conversation.mcp_manager,
             )
             if tools is not None and self.manager.server_count:
-                tools.attach_mcp(self.manager)
+                tools.attach_mcp(
+                    ScopedMcp(self.manager, environment.mcp_scope)
+                    if environment is not None and environment.mcp_scope is not None
+                    else self.manager
+                )
                 if tools.policy.permits("mcp"):
                     result = self.manager.connect_all(on_connect=self.on_connect)
                     self.warnings.extend(
@@ -273,6 +281,37 @@ class EnvironmentTransition:
             )
         return tools
 
+    def prepare_team(self, environment, settings, skills, tools) -> None:
+        if not tools.policy.permits("team"):
+            self.warnings.append("环境工具策略禁用了 team，团队成员不可用；当前只有主代理工作。")
+            return
+        session = settings.session_file
+        # Members must not read private state: team sessions, trust records, and the
+        # main conversation's own session files.
+        protected = tuple(
+            path.resolve()
+            for path in (
+                settings.environment_state_dir,
+                session,
+                session.with_name(f"{session.stem}.sessions"),
+                session.with_name(f"{session.name}.lock"),
+            )
+        )
+        # Main and every member share one ledger, so their concurrent edits merge.
+        tools.edit_ledger = EditLedger()
+        self.team = TeamRuntime(
+            environment,
+            settings=settings,
+            client=self.conversation.client,
+            base_tools=tools,
+            mcp_manager=self.manager,
+            skills=skills,
+            state_dir=settings.environment_state_dir,
+            protected_paths=protected,
+            on_progress=tools.on_task_update,
+        )
+        tools.registry["team"] = TeamTool(self.team, MAIN).spec()
+
     def prepare_workers(self, tools, environment, settings, skills, stats) -> None:
         names = tuple(item["function"]["name"] for item in tools.worker_definitions)
         tools.worker_instructions = (
@@ -303,6 +342,7 @@ class EnvironmentTransition:
         conversation.environment_ref = environment.reference if environment else None
         conversation.active_environment = environment
         conversation.mcp_manager = self.manager
+        conversation.team = prepared.team
         conversation.last_environment_id = environment_id
         conversation.last_environment_ref = conversation.environment_ref
         self.commit_messages(prepared)
@@ -398,6 +438,17 @@ class EnvironmentTransition:
                     self.warnings.append(conversation.tools.worker_status.last_error)
             except Exception as exc:
                 self.warnings.append(f"环境已提交，但子代理状态同步失败：{exc}")
+        if previous.team is not None and previous.team is not prepared.team:
+            try:
+                previous.team.close()
+            except Exception as exc:
+                self.warnings.append(f"环境已提交，但旧团队会话关闭失败：{exc}")
+        if prepared.team is not None:
+            try:
+                for notice in prepared.team.open_session(conversation.session_id):
+                    self.warnings.append(f"团队会话：{notice}")
+            except Exception as exc:
+                self.warnings.append(f"团队会话无法打开，成员暂不可用：{exc}")
         if previous.mcp_manager is not None:
             try:
                 previous.mcp_manager.close()

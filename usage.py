@@ -71,6 +71,27 @@ class UsageAccumulator:
         return usage or None
 
 
+def uncached_tokens(usage) -> int | None:
+    """Prompt tokens not served from the provider's cache, plus output tokens.
+
+    This is what a request newly costs: a long, stable prompt prefix is mostly cache
+    hits and should not count again on every request. None when usage is unknown.
+    """
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    if not number(cached):
+        cached = 0
+    prompt, output = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    if number(prompt) and number(output):
+        return math.ceil(max(0, prompt - cached) + output)
+    total = usage.get("total_tokens")
+    if number(total):
+        return math.ceil(max(0, total - cached))
+    return None
+
+
 def response_usage(objects):
     accumulator = UsageAccumulator()
     for obj in objects:

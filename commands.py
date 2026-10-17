@@ -40,6 +40,7 @@ class CommandName(Enum):
     HELP = "help"
     EFFORT = "effort"
     PROMPT = "prompt"
+    MULTIAGENTS = "multiagents"
 
 
 class EffectKind(Enum):

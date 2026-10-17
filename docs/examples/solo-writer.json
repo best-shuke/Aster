@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "name": "solo-writer",
+  "description": "Single agent for documentation work: no shell, two skills",
+  "type": "single-agent",
+  "inherit_skills": true,
+  "inherit_mcp": true,
+  "skills": {"writing": true, "brainstorming": true},
+  "mcp": {},
+  "tools": {"deny": ["exec", "monitor"]}
+}

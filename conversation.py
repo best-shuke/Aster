@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from config import Settings, environment_context, parse_reasoning_effort, system_prompt
-from context_budget import context_snapshot
+from context_budget import WireCache, context_snapshot
 from context_management import compact_messages, summarize
 from contracts import (
     CompletionClient,
@@ -36,6 +36,7 @@ from sessions import SessionStore
 from skills import SkillCatalog
 from task_acceptance import TaskAcceptance, TaskContract
 from task_runtime import RUNTIME_INSTRUCTIONS, TaskRuntime
+from team_runtime import TeamRuntime
 from templates import SavedTemplate, TemplateStore
 from tool_runtime import ToolResult, validate
 from tools import CodingTools, ToolPolicy
@@ -69,6 +70,10 @@ class Conversation:
         self.last_environment_id: str | None = None
         self.last_environment_ref: dict | None = None
         self.active_environment: ResolvedEnvironment | None = None
+        # Multi-agent environments attach a team runtime; None keeps single-agent behavior.
+        self.team: TeamRuntime | None = None
+        # Interactive sessions let members keep working between the user's messages.
+        self.team_background = False
         if mcp_manager is None and tools is not None and "mcp" in tools.registry:
             mcp_manager = tools.registry["mcp"].handler.__self__
         self.mcp_manager = mcp_manager
@@ -87,6 +92,7 @@ class Conversation:
         self.reload_prompt()
         self.tool_runs: list[ToolRun] = []
         self._tool_runs_lock = threading.RLock()
+        self._wire_cache = WireCache()
         self._execution_title = ""
         self._execution_closed = False
         self.recovery_notice = None
@@ -132,7 +138,10 @@ class Conversation:
 
     def context_status(self) -> dict:
         return context_snapshot(
-            [self._runtime_system_message(), *self.messages], self.definitions, self.settings
+            [self._runtime_system_message(), *self.messages],
+            self.definitions,
+            self.settings,
+            self._wire_cache,
         )
 
     def _load(self) -> list[Message]:
@@ -380,6 +389,12 @@ class Conversation:
         self.last_environment_ref = self.environment_ref
         if self.tools is not None:
             self.tools.reset_task()
+        if self.team is not None:
+            # A new conversation session is a new, isolated environment session.
+            try:
+                self.recovery_notice = "\n".join(self.team.open_session(self.session_id)) or None
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.recovery_notice = f"团队会话无法打开，成员暂不可用：{exc}"
         stats = getattr(self.client, "cache_stats", None)
         if isinstance(stats, CacheStats):
             stats.reset()
@@ -421,6 +436,8 @@ class Conversation:
     def close(self) -> None:
         with self._tool_runs_lock:
             self._execution_closed = True
+        if self.team is not None:
+            self.team.close()
         if self.tools is not None:
             self.tools.close()
         if self.mcp_manager is not None:
@@ -445,11 +462,12 @@ class Conversation:
             self.settings,
             deadline,
             on_progress=on_progress,
+            cache=self._wire_cache,
         )
         self.save()
 
     @staticmethod
-    def _compose_prompt(settings, tools, skills, instructions, prompt_text=None) -> str:
+    def _compose_prompt(settings, tools, skills, instructions, prompt_text=None, team=None) -> str:
         names = (
             tuple(item["function"]["name"] for item in tools.definitions)
             if tools is not None
@@ -469,6 +487,8 @@ class Conversation:
             skill_section = skills.prompt_section()
             if skill_section:
                 content += "\n\n" + skill_section
+        if team is not None:
+            content += "\n\n" + team.main_instructions()
         return content
 
     def reload_prompt(self) -> None:
@@ -479,6 +499,7 @@ class Conversation:
             self.skills,
             self.system_instructions,
             self.active_environment.prompt_text if self.active_environment else None,
+            self.team,
         )
 
     def refresh_skills(self) -> None:
@@ -728,34 +749,88 @@ class Conversation:
             workspace=self.settings.workspace,
             ignored_paths=(self.settings.session_file, self.sessions.directory),
             deadline=deadline,
+            others=self.team.member_names() if self.team is not None else (),
         )
         note = acceptance.instructions()
         self.last_outcome = acceptance.outcome()
-        self.messages.append({"role": "user", "content": expanded_prompt})
-        # Task-specific context belongs to this turn, never to the shared prefix.
-        self.messages.append(
-            {
-                "role": "system",
-                "content": environment_context(self.settings.workspace)
-                + ("\n\n" + note if note else ""),
-            }
-        )
-        try:
-            self.compact(deadline, on_progress)
-        except BaseException:
-            acceptance.status = "incomplete"
-            self._save_outcome(acceptance)
-            raise
-        self.save()
 
         def validate_final(content):
             if final_validator:
                 problem = final_validator(content)
                 if problem:
                     return problem
-            return acceptance.validate(content)
+            background = False
+            if self.team is not None:
+                problem = self.team.final_answer_problem()
+                if problem:
+                    return problem
+                # Members' unfinished edits are verified when their work is done, not now.
+                background = self.team.continues_in_background()
+            return acceptance.validate(content, background=background)
 
-        runtime = TaskRuntime(self.client, self.settings, deadline, validate_final)
+        # Members work during the turn; afterwards they pause or, interactively, continue
+        # in the background. Pending work resumes next turn. The team's turn starts before
+        # the turn note so that it takes over background work first: nothing finishes in
+        # the background after the note reports it.
+        with (
+            self.team.turn(deadline, background=self.team_background)
+            if self.team is not None
+            else nullcontext()
+        ):
+            team_note = self.team.turn_context() if self.team is not None else ""
+            self.messages.append({"role": "user", "content": expanded_prompt})
+            # Task-specific context belongs to this turn, never to the shared prefix.
+            self.messages.append(
+                {
+                    "role": "system",
+                    "content": environment_context(self.settings.workspace)
+                    + ("\n\n" + note if note else "")
+                    + ("\n\n" + team_note if team_note else ""),
+                }
+            )
+            try:
+                self.compact(deadline, on_progress)
+            except BaseException:
+                acceptance.status = "incomplete"
+                self._save_outcome(acceptance)
+                raise
+            self.save()
+            runtime = TaskRuntime(
+                self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache
+            )
+            answer = self._run_turn(
+                runtime,
+                acceptance,
+                deadline,
+                on_content,
+                on_response_start,
+                on_response_end,
+                on_progress,
+                on_reasoning,
+                on_tool_result,
+            )
+        if (
+            self.team is not None
+            and acceptance.status == "background"
+            and not self.team.went_background
+        ):
+            # The members finished before the turn ended: nothing continues, nothing verified.
+            acceptance.status = "incomplete"
+            self._save_outcome(acceptance)
+        return answer
+
+    def _run_turn(
+        self,
+        runtime,
+        acceptance,
+        deadline,
+        on_content,
+        on_response_start,
+        on_response_end,
+        on_progress,
+        on_reasoning,
+        on_tool_result,
+    ) -> str:
         while True:
             try:
                 message = runtime.generate(

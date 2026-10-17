@@ -1,5 +1,8 @@
 import hashlib
 import json
+import threading
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from difflib import SequenceMatcher, unified_diff
@@ -9,6 +12,8 @@ from file_state import FileChangedError, atomic_write_text, file_digest, file_lo
 from tool_runtime import ArtifactStore
 
 MAX_AUTO_MERGE_CHARS = 1_000_000
+LEDGER_CHARS = 16_000_000
+WRITES_PER_PATH = 32
 
 
 def text_digest(content: str | None) -> str | None:
@@ -76,6 +81,67 @@ def merge_text(base: str, current: str, proposed: str) -> str:
     return "".join(merged)
 
 
+class EditLedger:
+    """Contents the agents of a team read and wrote, shared by all of them.
+
+    An agent whose read is stale may still apply its edit when the file has since been
+    written by another agent's file tool: the edit is merged three-way with the content
+    the agent read. Changes from anywhere else (the user, a shell command) are unknown
+    here and still require a fresh read; overlapping changes always conflict.
+    """
+
+    def __init__(self, limit_chars: int = LEDGER_CHARS):
+        self.lock = threading.Lock()
+        self.limit_chars = limit_chars
+        self.contents: OrderedDict[str, str] = OrderedDict()
+        self.size = 0
+        self.written: dict[Path, deque[str]] = {}
+
+    def remember(self, content: str) -> str:
+        digest = text_digest(content)
+        if len(content) > MAX_AUTO_MERGE_CHARS:
+            return digest
+        with self.lock:
+            if digest in self.contents:
+                self.contents.move_to_end(digest)
+                return digest
+            self.contents[digest] = content
+            self.size += len(content)
+            while self.size > self.limit_chars and len(self.contents) > 1:
+                _, dropped = self.contents.popitem(last=False)
+                self.size -= len(dropped)
+        return digest
+
+    def content(self, digest: str | None) -> str | None:
+        with self.lock:
+            return self.contents.get(digest) if digest is not None else None
+
+    def record_write(self, path: Path, content: str) -> None:
+        digest = self.remember(content)
+        with self.lock:
+            writes = self.written.setdefault(path.resolve(), deque(maxlen=WRITES_PER_PATH))
+            if digest in writes:
+                writes.remove(digest)
+            writes.append(digest)
+
+    def written_by_agent(self, path: Path, digest: str | None) -> bool:
+        with self.lock:
+            return digest is not None and digest in self.written.get(path.resolve(), ())
+
+    def merge(self, path: Path, base_digest: str, current: str, proposed: str) -> str:
+        """Merge an edit based on a stale read with a teammate's newer content."""
+        base = self.content(base_digest)
+        if base is None or not self.written_by_agent(path, text_digest(current)):
+            raise FileChangedError(f"File changed since it was read: {path}. Read it again.")
+        try:
+            return merge_text(base, current, proposed)
+        except FileMergeConflict as error:
+            raise FileMergeConflict(
+                f"Another agent changed {path} since you read it and the changes conflict "
+                f"({error}). Read it again and reapply your edit."
+            ) from error
+
+
 @dataclass
 class FileChange:
     path: Path
@@ -84,8 +150,13 @@ class FileChange:
 
 
 class FileTransaction:
-    def __init__(self, artifacts: ArtifactStore):
+    def __init__(
+        self,
+        artifacts: ArtifactStore,
+        on_write: Callable[[Path, str], None] | None = None,
+    ):
         self.artifacts = artifacts
+        self.on_write = on_write
         self.entries: dict[Path, FileChange] = {}
         self.artifact_path: Path | None = None
 
@@ -201,6 +272,10 @@ class FileTransaction:
                         f"Commit failed ({error}); incomplete rollback: {'; '.join(rollback_errors)}"
                     ) from error
                 raise
+            # Only a committed transaction counts as written: a rollback leaves nothing.
+            if self.on_write is not None:
+                for path, _, merged in written:
+                    self.on_write(path, merged)
         return self.summary("merged")
 
     @staticmethod
