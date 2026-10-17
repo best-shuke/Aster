@@ -2,6 +2,7 @@ import io
 import os
 import select
 import signal
+import tempfile
 import threading
 import unittest
 from contextlib import nullcontext
@@ -20,7 +21,9 @@ from ui import (
     _CommandCompleter,
     _display_width,
     _ellipsize,
+    _git_branch,
     _reasoning_text,
+    _short_path,
     _TaskInputMonitor,
 )
 
@@ -1122,7 +1125,7 @@ class ConsoleLayoutTests(unittest.TestCase):
 
         self.assertIs(console._prompt_session, original_session)
         original_session.prompt.assert_not_called()
-        session.return_value.prompt.assert_called_once_with("回答")
+        session.return_value.prompt.assert_called_once_with([("class:prompt.marker", "回答")])
         self.assertIsNone(session.call_args.kwargs["completer"])
         self.assertFalse(session.call_args.kwargs["complete_while_typing"]())
 
@@ -1501,8 +1504,9 @@ class ConsoleLayoutTests(unittest.TestCase):
             )
 
         rendered = output.getvalue()
-        self.assertIn("读取  ui.py", rendered)
-        self.assertIn("完成", rendered)
+        self.assertIn("✓ 读取  ui.py", rendered)
+        self.assertIn("#1", rendered)
+        self.assertEqual(len(rendered.splitlines()), 1)
         self.assertNotIn("private and very long payload", rendered)
 
     def test_tool_result_surfaces_failure_reason(self):
@@ -1745,3 +1749,194 @@ class TeamBackgroundDisplayTests(unittest.TestCase):
         self.assertIn("后台继续", output.getvalue())
         self.assertIn("团队成员在后台继续工作（engineer）", output.getvalue())
         self.assertNotIn("已取消", output.getvalue())
+
+
+class ReadableOutputTests(unittest.TestCase):
+    def render(self, action, width=100):
+        output = io.StringIO()
+        with (
+            patch("sys.stdout", output),
+            patch.object(Console, "terminal_width", return_value=width),
+        ):
+            action()
+        return output.getvalue()
+
+    def test_long_paths_keep_their_root_and_final_directories(self):
+        path = "/tmp/claude-1000/-home-opc-project/0123456789abcdef/scratchpad/workspace"
+        shortened = _short_path(path, 40)
+        self.assertTrue(shortened.startswith("/tmp/…/"))
+        self.assertTrue(shortened.endswith("/scratchpad/workspace"))
+        self.assertLessEqual(_display_width(shortened), 40)
+        self.assertEqual(_short_path("/tmp/a", 40), "/tmp/a")
+
+    def test_each_call_is_one_line_with_its_outcome_and_number(self):
+        console = Console(workspace=Path("/work"))
+
+        def run():
+            console.tool("read", {"path": "/work/src/app.py", "offset": 40})
+            console.tool_result("read", {"status": "ok", "data": {"content": "a\nb\n"}})
+
+        rendered = self.render(run)
+        self.assertEqual(rendered.splitlines(), ["  ✓ 读取  src/app.py:40  2 行  #1"])
+
+    def test_failed_call_shows_the_reason_without_the_workspace_prefix(self):
+        console = Console(workspace=Path("/work"))
+
+        def run():
+            console.tool("read", {"path": "missing.toml"})
+            console.tool_result(
+                "read",
+                {
+                    "status": "error",
+                    "error": {
+                        "code": "FileNotFoundError",
+                        "message": "No file: /work/missing.toml",
+                    },
+                },
+            )
+
+        lines = self.render(run).splitlines()
+        self.assertIn("✗ 读取  missing.toml  失败", lines[0])
+        self.assertEqual(lines[1].strip(), "╰ No file: missing.toml")
+        self.assertEqual(console._tool_errors, 1)
+
+    def test_edits_report_changed_lines_and_the_task_lists_changed_files(self):
+        console = Console(workspace=Path("/work"))
+        console.colors = False
+        edit = {
+            "path": "/work/ui.py",
+            "edits": [{"oldText": "a\nb\nc\n", "newText": "a\nB\nc\nd\n"}],
+        }
+
+        def run():
+            console.task_start("修改界面")
+            console.tool("edit", edit)
+            console.tool_result("edit", {"status": "ok", "data": {"path": "/work/ui.py"}})
+            console.tool("write", {"path": "/work/new.py", "content": "x = 1\ny = 2\n"})
+            console.tool_result("write", {"status": "ok", "data": {"path": "/work/new.py"}})
+            console.task_end(True)
+
+        rendered = self.render(run)
+        self.assertIn("✓ 修改  ui.py  +2 -1  #1", rendered)
+        self.assertIn("✓ 写入  new.py  2 行  #2", rendered)
+        self.assertIn("✎ 修改 2 个文件  ui.py +2 -1 · new.py +2 -0", rendered)
+
+    def test_plan_updates_show_progress_and_the_current_step(self):
+        console = Console()
+        plan = {
+            "title": "整理界面",
+            "steps": [
+                {"step": "检查现状", "status": "completed"},
+                {"step": "改进输出", "status": "in_progress"},
+                {"step": "验证", "status": "pending"},
+            ],
+        }
+
+        def run():
+            console.tool("update_plan", plan)
+            console.tool_result("update_plan", {"status": "ok", "data": plan})
+
+        self.assertEqual(self.render(run).splitlines(), ["  ☰ 计划  改进输出  1/3  #1"])
+
+    def test_long_command_output_is_folded_with_a_pointer_to_the_full_result(self):
+        console = Console()
+
+        def run():
+            console.tool("exec", {"command": "make test"})
+            console.tool_result(
+                "exec",
+                {
+                    "status": "ok",
+                    "data": {"output": "\n".join(f"line {n}" for n in range(10)), "exit_code": 0},
+                },
+            )
+
+        lines = self.render(run).splitlines()
+        self.assertIn("✓ 运行  make test  exit 0 · 10 行输出  #1", lines[0])
+        self.assertEqual(
+            [line.strip() for line in lines[1:]],
+            ["│ line 0", "│ … 省略 7 行 · /tool 1 查看全部", "│ line 8", "│ line 9"],
+        )
+
+    def test_task_summary_reports_time_tools_output_speed_context_and_cache(self):
+        console = Console()
+        console.cache_provider = lambda: {"calls": 2, "hit_rate": 0.875}
+
+        def run():
+            console.task_start("问题")
+            console.update_context(
+                {"tokens": 12000, "window_tokens": 1000000, "budget_tokens": 983616}
+            )
+            console.progress(
+                {
+                    "phase": "generation",
+                    "request_id": "one",
+                    "tokens": 200,
+                    "generation_seconds": 4,
+                    "tps": 50,
+                }
+            )
+            console.tool("ls", {"path": "."})
+            console.tool_result("ls", {"status": "error", "error": {"message": "denied"}})
+            console.task_end(True)
+
+        summary = self.render(run).splitlines()[-1]
+        for value in ("✓ 已完成", "工具 1", "异常 1", "输出 200", "TPS 50.0", "1.2%", "缓存 88%"):
+            self.assertIn(value, summary)
+
+    def test_toolbar_shows_model_effort_and_cache_then_drops_hints_when_narrow(self):
+        console = Console("provider/model-x", reasoning_effort="high")
+        console.cache_provider = lambda: {"hit_rate": 0.5}
+        console.update_context({"tokens": 900000, "window_tokens": 1000000, "budget_tokens": 1})
+        with patch.object(Console, "terminal_width", return_value=160):
+            wide = console._toolbar()
+            styles = {style for style, _ in console._toolbar_fragments()}
+        for value in ("model-x", "推理 high", "缓存 50%", "90.0%", "Ctrl-T"):
+            self.assertIn(value, wide)
+        self.assertNotIn("provider/", wide)
+        self.assertIn("class:toolbar.error", styles)
+        with patch.object(Console, "terminal_width", return_value=70):
+            narrow = console._toolbar()
+        self.assertNotIn("Ctrl-T", narrow)
+        self.assertIn("环境", narrow)
+        self.assertIn("TPS", narrow)
+        self.assertLessEqual(_display_width(narrow), 69)
+
+    def test_help_groups_commands_and_keeps_bracketed_arguments(self):
+        console = Console()
+        sections = (
+            ("环境", (("/env 名称 [keep] [--yes]", "切换环境"),)),
+            ("快捷键", (("Ctrl-T", "轨迹"),)),
+        )
+        for width in (100, 40):
+            with self.subTest(width=width):
+                rendered = self.render(lambda: console.help(sections), width=width)
+                self.assertIn("/env 名称 [keep] [--yes]", rendered)
+                self.assertIn("快捷键", rendered)
+                self.assertTrue(
+                    all(_display_width(line) <= width for line in rendered.splitlines())
+                )
+        self.assertEqual(self.render(lambda: console.help("plain help")), "plain help\n")
+
+    def test_status_is_grouped_and_includes_usage_and_cache(self):
+        console = Console("model-x")
+        console.cache_provider = lambda: {"calls": 3, "hit_rate": 0.5, "latest": {"hit_rate": 0.9}}
+        console.update_context({"tokens": 12000, "window_tokens": 1000000, "budget_tokens": 983616})
+        rendered = self.render(lambda: console.status(Path("/tmp/session.json"), 4))
+        for value in ("运行", "能力", "用量", "会话", "12k / 1M tokens · 1.2%", "会话 50.0%"):
+            self.assertIn(value, rendered)
+        self.assertIn("最近一次 90.0%", rendered)
+        self.assertIn("已恢复 · 4 条", rendered)
+
+    def test_git_branch_is_read_from_head_including_worktree_pointers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "repo" / ".git").mkdir(parents=True)
+            (root / "repo" / ".git" / "HEAD").write_text("ref: refs/heads/feature/ui\n")
+            (root / "repo" / "src").mkdir()
+            self.assertEqual(_git_branch(root / "repo" / "src"), "feature/ui")
+            (root / "linked").mkdir()
+            (root / "gitdir").mkdir()
+            (root / "gitdir" / "HEAD").write_text("0123456789abcdef\n")
+            (root / "linked" / ".git").write_text(f"gitdir: {root / 'gitdir'}\n")
+            self.assertEqual(_git_branch(root / "linked"), "01234567")

@@ -143,6 +143,16 @@ class InspectorInteractionTests(unittest.IsolatedAsyncioTestCase):
         inspector = await self.inspect([entry(1), entry(2, status="error")], "e\x1b")
         self.assertEqual([record.number for record in inspector.filtered], [2])
 
+    async def test_rows_mark_status_and_the_heading_counts_failures(self):
+        inspector = await self.inspect([entry(1), entry(2, status="error")], "\x1b")
+        heading = "".join(text for _, text in inspector._heading())
+        rows = "".join(text for _, text in inspector._rows())
+        self.assertIn("2/2 次调用 · 1 次异常", heading)
+        self.assertIn("✓ #1  exec", rows)
+        self.assertIn("✗ #2  exec", rows)
+        self.assertIn("失败 · echo example", rows)
+        self.assertNotIn("主代理", rows)
+
     async def test_search_filter_and_current_task_can_be_cleared(self):
         inspector = await self.inspect(
             [entry(1, command="first", task="old"), entry(2)], "/first\rtc\x1b"

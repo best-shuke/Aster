@@ -104,6 +104,7 @@ class ExecutionEntry:
                 "session_id",
                 "action",
                 "wait_for",
+                "title",
             )
         ]
         return plain(" · ".join(str(value) for value in values if value)).replace("\n", " ↵ ")

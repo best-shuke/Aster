@@ -1,3 +1,4 @@
+import difflib
 import os
 import select
 import shutil
@@ -190,6 +191,7 @@ def _wrap_display(text: str, max_width: int) -> list[str]:
 
 
 def _short_path(path: Path | str, max_width: int) -> str:
+    """Abbreviate the home directory, then elide middle directories, keeping the name."""
     text = str(path)
     try:
         home = str(Path.home())
@@ -199,11 +201,90 @@ def _short_path(path: Path | str, max_width: int) -> str:
         pass
     if _display_width(text) <= max_width:
         return text
-    name = Path(text).name
-    tail = f"…/{name}"
+    parts = text.split(os.sep)
+    head = parts[0] or (os.sep + parts[1] if len(parts) > 2 else "")
+    rest = parts[1:] if parts[0] else parts[2:]
+    for keep in range(len(rest) - 1, 0, -1):
+        candidate = os.sep.join([head, "…", *rest[-keep:]])
+        if _display_width(candidate) <= max_width:
+            return candidate
+    tail = f"…/{Path(text).name}"
     if _display_width(tail) <= max_width:
         return tail
     return _ellipsize(text, max_width)
+
+
+def _workspace_path(path: Path | str, workspace: Path) -> str:
+    """Show paths inside the workspace relative to it."""
+    try:
+        relative = Path(path).resolve().relative_to(workspace.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return str(path)
+    return str(relative) if str(relative) != "." else "."
+
+
+_GIT_CACHE: dict[Path, tuple[float, str | None]] = {}
+
+
+def _git_branch(workspace: Path) -> str | None:
+    """Read the checked-out branch from .git without running git; cached briefly."""
+    now = time.monotonic()
+    cached = _GIT_CACHE.get(workspace)
+    if cached is not None and now - cached[0] < 3:
+        return cached[1]
+    branch = None
+    try:
+        for directory in (workspace, *workspace.parents):
+            marker = directory / ".git"
+            if marker.is_file():
+                pointer = marker.read_text(encoding="utf-8").strip()
+                if not pointer.startswith("gitdir:"):
+                    break
+                marker = (directory / pointer[7:].strip()).resolve()
+            if marker.is_dir():
+                head = (marker / "HEAD").read_text(encoding="utf-8").strip()
+                if head.startswith("ref: refs/heads/"):
+                    branch = head[16:]
+                elif head:
+                    branch = head[:8]
+                break
+    except (OSError, UnicodeDecodeError):
+        branch = None
+    _GIT_CACHE[workspace] = (now, branch)
+    return branch
+
+
+def _usage_style(ratio: float) -> str:
+    return "red" if ratio >= 0.9 else "yellow" if ratio >= 0.7 else "cyan"
+
+
+def _usage_bar(ratio: float, cells: int = 10) -> Text:
+    ratio = min(1.0, max(0.0, ratio))
+    filled = min(cells, round(ratio * cells)) or (1 if ratio > 0 else 0)
+    bar = Text("━" * filled, style=_usage_style(ratio))
+    bar.append("━" * (cells - filled), style="bright_black")
+    return bar
+
+
+def _edit_stats(name: str, arguments: dict[str, Any]) -> tuple[int, int] | None:
+    """Changed line counts for an edit or a full-file write, from the call itself."""
+    if name == "write" and isinstance(arguments.get("content"), str):
+        return len(arguments["content"].splitlines()), 0
+    if name != "edit" or not isinstance(arguments.get("edits"), list):
+        return None
+    added = removed = 0
+    for item in arguments["edits"]:
+        if not isinstance(item, dict):
+            continue
+        old = str(item.get("oldText") or "").splitlines()
+        new = str(item.get("newText") or "").splitlines()
+        matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+            if tag in {"replace", "delete"}:
+                removed += old_end - old_start
+            if tag in {"replace", "insert"}:
+                added += new_end - new_start
+    return added, removed
 
 
 def _duration(seconds: float, *, compact: bool = False) -> str:
@@ -217,6 +298,10 @@ def _duration(seconds: float, *, compact: bool = False) -> str:
         return f"{seconds:.1f} 秒"
     minutes, remaining = divmod(int(seconds), 60)
     return f"{minutes} 分 {remaining:02d} 秒"
+
+
+def _duration_short(seconds: float) -> str:
+    return f"{seconds:.1f}s" if seconds < 60 else _duration(seconds, compact=True)
 
 
 def _token_count(value: int) -> str:
@@ -485,7 +570,11 @@ class Console:
         self.skill_status: dict[str, Any] | None = None
         self._mcp_servers: list[dict[str, Any]] = []
         self.execution_provider: Callable[[], list[ExecutionEntry]] | None = None
+        self.cache_provider: Callable[[], dict[str, Any] | None] | None = None
         self._active_tool_number = 0
+        self._active_tool: tuple[str, dict[str, Any]] | None = None
+        # Files the main agent edited in the current task: path -> [added, removed].
+        self._changed_files: dict[str, list[int]] = {}
 
     def update_context(self, snapshot: dict[str, Any]) -> None:
         self._context = dict(snapshot)
@@ -546,26 +635,97 @@ class Console:
         return f"TPS {tokens / duration:.1f}"
 
     def _toolbar(self) -> str:
+        return "".join(text for _, text in self._toolbar_fragments())
+
+    def _cache_rate(self) -> float | None:
+        try:
+            stats = self.cache_provider() if self.cache_provider is not None else None
+        except Exception:
+            return None
+        return (stats or {}).get("hit_rate")
+
+    def _toolbar_fragments(self) -> list[tuple[str, str]]:
+        """Bottom status line; lower-priority items drop out first on narrow terminals."""
         self._refresh_mcp()
         width = self.terminal_width() - 1
-        context = self._context_label(compact=width < 70)
         environment = f"环境 {self.environment_name}"
         if self.last_environment_name:
             environment += f"（上次 {self.last_environment_name}）"
-        parts = [environment, context, self._tps_label()]
+        # (priority, segments); a lower priority number is kept longer.
+        items: list[tuple[int, list[tuple[str, str]]]] = [(0, [("", environment)])]
         team = self._team_label()
         if team:
-            parts.insert(1, team)
-        if width >= 70 or not context:
-            parts.append(f"MCP {self.mcp_status}")
-        if width >= 110:
-            parts.append("Ctrl-T 执行轨迹")
-        line = " · ".join(part for part in parts if part)
-        if context and _display_width(line) > width and width < 40:
-            return "\n".join(
-                _ellipsize(part, width) for part in (environment, context, self._tps_label())
+            items.append((0, [("class:toolbar.accent", team)]))
+        items.append((3, [("class:toolbar.strong", self.model.rsplit("/", 1)[-1])]))
+        items.append((5, [("", f"推理 {self.reasoning_effort}")]))
+        if self._context:
+            ratio = self._context["tokens"] / max(1, self._context["window_tokens"])
+            level = {"red": "class:toolbar.error", "yellow": "class:toolbar.warn"}.get(
+                _usage_style(ratio), "class:toolbar.accent"
             )
-        return _ellipsize(line, width)
+            if self._context_style() == "yellow" and level == "class:toolbar.accent":
+                level = "class:toolbar.warn"
+            segments = [("", "上下文 " if width >= 70 else "CTX ")]
+            if width >= 100:
+                filled = min(8, round(ratio * 8)) or (1 if ratio > 0 else 0)
+                segments += [(level, "━" * filled), ("class:toolbar.dim", "━" * (8 - filled) + " ")]
+            segments += [
+                (level, f"{ratio:.1%}" if width >= 70 else ""),
+                (
+                    "",
+                    (" " if width >= 70 else "")
+                    + f"{_token_count(self._context['tokens'])}/"
+                    + _token_count(self._context["window_tokens"]),
+                ),
+            ]
+            items.append((1, segments))
+        items.append((2, [("", self._tps_label())]))
+        cache = self._cache_rate()
+        if cache is not None:
+            items.append((6, [("", f"缓存 {cache:.0%}")]))
+        mcp_failed = "失败" in self.mcp_status or "错误" in self.mcp_status
+        mcp_idle = self.mcp_status in {"关闭", "未配置"}
+        items.append(
+            (
+                1 if mcp_failed else 8 if mcp_idle else 4,
+                [("class:toolbar.warn" if mcp_failed else "", f"MCP {self.mcp_status}")],
+            )
+        )
+        branch = _git_branch(self.workspace)
+        if branch:
+            items.append((7, [("", f"⎇ {branch}")]))
+        items.append((9, [("class:toolbar.dim", "Ctrl-T 执行轨迹 · / 命令")]))
+
+        def measure(selected):
+            texts = ["".join(text for _, text in segments) for _, segments in selected]
+            return sum(_display_width(text) for text in texts) + 3 * (len(texts) - 1)
+
+        visible = list(items)
+        while len(visible) > 1 and measure(visible) > width:
+            drop = max(range(len(visible)), key=lambda index: (visible[index][0], index))
+            if visible[drop][0] <= 2:
+                break
+            visible.pop(drop)
+        if measure(visible) > width and width < 40 and self._context:
+            lines = [environment, self._context_label(compact=True), self._tps_label()]
+            return [("", "\n".join(_ellipsize(line, width) for line in lines))]
+        fragments: list[tuple[str, str]] = []
+        for index, (_, segments) in enumerate(visible):
+            if index:
+                fragments.append(("class:toolbar.dim", " · "))
+            fragments.extend(segments)
+        used = 0
+        fitted = []
+        for style, text in fragments:
+            room = width - used
+            if room <= 0:
+                break
+            if _display_width(text) > room:
+                fitted.append((style, _ellipsize(text, room)))
+                break
+            fitted.append((style, text))
+            used += _display_width(text)
+        return fitted
 
     def _team_label(self) -> str:
         team = self._team
@@ -618,7 +778,23 @@ class Console:
         )
 
     def _section(self, label: str, *, style: str) -> None:
-        self._rich().print(Rule(label, align="left", style=style))
+        self._rich().print(
+            Padding(
+                Rule(Text(label, style=f"bold {style}"), align="left", style="bright_black"),
+                (0, 0, 0, 2),
+            )
+        )
+
+    @staticmethod
+    def _reasoning_heading() -> Text:
+        return Text("  ✻ 思考过程", style="dim italic")
+
+    def _answer_heading(self):
+        label = f"◆ {self.model} · 回答" if self.terminal_width() >= 40 else "◆ 回答"
+        return Padding(
+            Rule(Text(label, style="bold cyan"), align="left", style="bright_black"),
+            (0, 0, 0, 2),
+        )
 
     def _markdown(self, content: str, *, dim: bool = False) -> None:
         content = content.strip("\n")
@@ -692,9 +868,12 @@ class Console:
             return Group(*rows)
 
         model = Text.assemble(("模型    ", "bright_black"), (self.model, "bold bright_cyan"))
+        branch = _git_branch(self.workspace)
+        branch_label = Text(f"⎇ {branch}", style="magenta") if branch else None
+        reserved = 8 + (_display_width(branch_label.plain) + 2 if branch_label else 0)
         workspace = Text.assemble(
             ("工作区  ", "bright_black"),
-            (_short_path(self.workspace, max(8, width - 8)), "bold"),
+            (_short_path(self.workspace, max(8, width - reserved)), "bold"),
         )
         capabilities = [
             Text.assemble(("环境    ", "bright_black"), (self.environment_name, "bold")),
@@ -726,7 +905,7 @@ class Console:
             )
         sections = [
             line([model], Text(session, style="bold green")),
-            workspace,
+            line([workspace], branch_label) if branch_label else workspace,
             packed(capabilities),
         ]
         if self._context:
@@ -754,7 +933,12 @@ class Console:
                 title=Text(APP_NAME.upper(), style="bold cyan"),
                 title_align="left",
                 subtitle=Text(
-                    "/help  /resume  /env" if banner_width >= 40 else "/help", style="dim"
+                    "/ 命令 · \\+Enter 换行 · Ctrl-T 执行轨迹 · Esc 暂停"
+                    if banner_width >= 64
+                    else "/help  /resume  /env"
+                    if banner_width >= 40
+                    else "/help",
+                    style="dim",
                 ),
                 subtitle_align="right",
                 border_style="bright_black",
@@ -793,64 +977,165 @@ class Console:
     def status(self, session_file: Path, history_count: int) -> None:
         self._clear_status()
         self._refresh_mcp()
-        session = "已恢复" if history_count else "空"
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="bright_black", width=8, no_wrap=True)
-        table.add_column()
-        table.add_row("模型", self.model)
-        table.add_row("工作区", _short_path(self.workspace, max(16, self.terminal_width() - 14)))
-        table.add_row("推理", self.reasoning_effort)
+        width = self.terminal_width()
+        value_width = max(16, width - 16)
+        rich = self._rich()
+
+        def section(title: str, rows: list[tuple[str, Any]]) -> None:
+            table = Table.grid(padding=(0, 2))
+            table.add_column(style="bright_black", width=8, no_wrap=True)
+            table.add_column(overflow="fold")
+            for label, value in rows:
+                table.add_row(label, value if isinstance(value, Text) else Text(str(value)))
+            rich.print(Text(f"  {title}", style="bold cyan"))
+            rich.print(Padding(table, (0, 0, 0, 4)))
+
         health = self.environment_provider() if self.environment_provider else "ready"
-        state = {"ready": "就绪", "degraded": "部分依赖不可用", "blocked": "必需依赖不可用"}.get(
-            health, health
-        )
-        table.add_row("环境", f"{self.environment_name} · {state}")
-        table.add_row("联网", self.websearch_status)
+        state, state_style = {
+            "ready": ("就绪", "green"),
+            "degraded": ("部分依赖不可用", "yellow"),
+            "blocked": ("必需依赖不可用", "red"),
+        }.get(health, (health, "yellow"))
+        runtime: list[tuple[str, Any]] = [
+            ("模型", Text(self.model, style="bold cyan")),
+            ("推理", self.reasoning_effort),
+            (
+                "环境",
+                Text.assemble(self.environment_name, (" · ", "bright_black"), (state, state_style)),
+            ),
+            ("工作区", _short_path(self.workspace, value_width)),
+        ]
+        branch = _git_branch(self.workspace)
+        if branch:
+            runtime.append(("Git", Text(f"⎇ {branch}", style="magenta")))
+
+        capabilities: list[tuple[str, Any]] = [
+            (
+                "联网",
+                Text(
+                    self.websearch_status,
+                    style="green" if self.websearch_status == "可用" else "",
+                ),
+            )
+        ]
         if self.skill_status is not None:
             skills = self.skill_status
-            table.add_row(
-                "Skills",
-                f"已加载 {skills['loaded']} · 自动 {skills['automatic']} · "
-                f"手动 {skills['manual']} · 警告 {skills['diagnostics']}"
-                if skills["enabled"]
-                else "关闭",
+            capabilities.append(
+                (
+                    "Skills",
+                    f"已加载 {skills['loaded']} · 自动 {skills['automatic']} · "
+                    f"手动 {skills['manual']} · 警告 {skills['diagnostics']}"
+                    if skills["enabled"]
+                    else "关闭",
+                )
             )
-        table.add_row("MCP", self.mcp_status)
+        capabilities.append(("MCP", self.mcp_status))
         for server in self._mcp_servers:
-            state = {
-                "connected": "已连接",
-                "not-connected": "待连接",
-                "connecting": "连接中",
-                "failed": "失败",
-                "closed": "已关闭",
-                "disabled": "已禁用",
-            }.get(server["status"], server["status"])
-            table.add_row(
-                "", Text(f"{server['name']} · {state} · {server.get('tool_count', 0)} 个工具")
+            server_state, server_style = {
+                "connected": ("已连接", "green"),
+                "not-connected": ("待连接", "bright_black"),
+                "connecting": ("连接中", "cyan"),
+                "failed": ("失败", "red"),
+                "closed": ("已关闭", "bright_black"),
+                "disabled": ("已禁用", "bright_black"),
+            }.get(server["status"], (server["status"], "yellow"))
+            capabilities.append(
+                (
+                    "",
+                    Text.assemble(
+                        ("● ", server_style),
+                        server["name"],
+                        (f" · {server_state} · {server.get('tool_count', 0)} 个工具", "dim"),
+                    ),
+                )
             )
             if server.get("error") and server["status"] != "connected":
-                table.add_row("", Text(f"原因：{server['error']}"))
+                capabilities.append(("", Text(f"  原因：{server['error']}", style="yellow")))
+
+        usage: list[tuple[str, Any]] = []
         if self._context:
             snapshot = self._context
-            table.add_row(
-                "上下文",
-                f"{snapshot['tokens']:,} / {snapshot['window_tokens']:,} tokens",
+            ratio = snapshot["tokens"] / max(1, snapshot["window_tokens"])
+            bar = _usage_bar(ratio, 20 if width >= 60 else 10)
+            bar.append(
+                f"  {_token_count(snapshot['tokens'])} / {_token_count(snapshot['window_tokens'])}"
+                f" tokens · {ratio:.1%}"
             )
+            usage.append(("上下文", bar))
             if snapshot.get("max_chars") is not None:
-                table.add_row(
-                    "预算", f"字符模式 {snapshot['chars']:,}/{snapshot['max_chars']:,} 字符"
+                usage.append(
+                    ("预算", f"字符模式 {snapshot['chars']:,}/{snapshot['max_chars']:,} 字符")
                 )
             else:
-                table.add_row("预算", f"压缩阈值 {snapshot['budget_tokens']:,} tokens")
-        table.add_row("速度", self._tps_label())
+                usage.append(("压缩阈值", f"{snapshot['budget_tokens']:,} tokens"))
+        usage.append(("速度", self._tps_label()))
+        output_tokens = sum(item.get("tokens") or 0 for item in tuple(self._performance.values()))
+        if output_tokens:
+            usage.append(("输出", f"{output_tokens:,} tokens（上次任务）"))
         if self._tool_count:
-            table.add_row("工具", f"{self._tool_count} 次调用 · {self._tool_errors} 次异常")
-        table.add_row("会话", f"{session} · {history_count} 条记录")
-        table.add_row("文件", str(session_file), style="dim")
+            usage.append(
+                (
+                    "工具",
+                    Text.assemble(
+                        f"{self._tool_count} 次调用 · ",
+                        (f"{self._tool_errors} 次异常", "yellow" if self._tool_errors else ""),
+                    ),
+                )
+            )
+        try:
+            cache = self.cache_provider() if self.cache_provider is not None else None
+        except Exception:
+            cache = None
+        if cache and cache.get("calls"):
+            rate = cache.get("hit_rate")
+            latest = (cache.get("latest") or {}).get("hit_rate")
+            text = f"会话 {rate:.1%}" if rate is not None else "会话 未知"
+            if latest is not None:
+                text += f" · 最近一次 {latest:.1%}"
+            usage.append(("缓存", text))
+
+        session = [
+            ("记录", f"{'已恢复' if history_count else '空'} · {history_count} 条"),
+            ("文件", Text(_short_path(session_file, value_width), style="dim")),
+        ]
+        rich.print()
+        self._section("当前状态", style="cyan")
+        for title, rows in (
+            ("运行", runtime),
+            ("能力", capabilities),
+            ("用量", usage),
+            ("会话", session),
+        ):
+            section(title, rows)
+        rich.print()
+
+    def help(self, sections) -> None:
+        """Grouped command reference; plain text is printed unchanged."""
+        self._clear_status()
+        if isinstance(sections, str):
+            print(sections)
+            return
+        width = self.terminal_width()
+        rows = [command for _, items in sections for command, _ in items]
+        command_width = min(max(map(_display_width, rows), default=8), max(12, width // 2 - 4))
         rich = self._rich()
         rich.print()
-        rich.print(Rule("当前状态", align="left", style="cyan"))
-        rich.print(Padding(table, (0, 2)))
+        self._section(f"{APP_NAME} 命令", style="cyan")
+        for title, items in sections:
+            rich.print(Text(f"  {title}", style="bold"))
+            table = Table.grid(padding=(0, 2))
+            if width >= 60:
+                table.add_column(width=command_width)
+                table.add_column(overflow="fold")
+                for command, description in items:
+                    table.add_row(Text(command, style="cyan"), Text(description, style="dim"))
+            else:
+                table.add_column(overflow="fold")
+                for command, description in items:
+                    table.add_row(Text(command, style="cyan"))
+                    table.add_row(Text("  " + description, style="dim"))
+            rich.print(Padding(table, (0, 0, 1, 4)))
+        rich.print(Text("  输入 / 查看命令提示；/env help 查看环境子命令。", style="dim"))
         rich.print()
 
     def configuration_notice(self) -> None:
@@ -899,6 +1184,18 @@ class Console:
                 elif event.current_buffer.complete_state is not None:
                     event.current_buffer.cancel_completion()
 
+            # Alt-Enter and Ctrl-J already mean Enter in some terminals, so a trailing
+            # backslash is the unambiguous way to continue on a new line.
+            @bindings.add(
+                "enter",
+                filter=Condition(
+                    lambda: get_app().current_buffer.document.text_before_cursor.endswith("\\")
+                ),
+            )
+            def insert_newline(event) -> None:
+                event.current_buffer.delete_before_cursor(1)
+                event.current_buffer.insert_text("\n")
+
             @bindings.add("tab")
             @bindings.add("s-tab")
             def handle_completion(event) -> None:
@@ -937,11 +1234,22 @@ class Console:
                 ),
                 reserve_space_for_menu=0 if isolated else 6,
                 include_default_pygments_style=False,
-                bottom_toolbar=self._toolbar,
+                bottom_toolbar=self._toolbar_fragments,
                 style=Style.from_dict(
                     {
                         "bottom-toolbar": "fg:ansibrightblack bg:default noreverse",
                         "bottom-toolbar.text": "noreverse",
+                        "toolbar.strong": "fg:ansidefault",
+                        "toolbar.accent": "fg:ansicyan",
+                        "toolbar.warn": "fg:ansiyellow",
+                        "toolbar.error": "fg:ansired bold",
+                        "toolbar.dim": "fg:ansibrightblack",
+                        "prompt.marker": "fg:ansicyan bold",
+                        "completion-menu": "bg:default",
+                        "completion-menu.completion": "bg:default fg:ansidefault",
+                        "completion-menu.completion.current": "bg:ansicyan fg:ansiblack",
+                        "completion-menu.meta.completion": "bg:default fg:ansibrightblack",
+                        "completion-menu.meta.completion.current": "bg:ansicyan fg:ansiblack",
                     }
                     if self.colors
                     else {"bottom-toolbar": "bg:default noreverse"}
@@ -953,7 +1261,7 @@ class Console:
             session = self._prompt_session
         # Team members may report from their threads while the prompt waits for input.
         with patch_stdout(raw=True):
-            return session.prompt(prompt)
+            return session.prompt([("class:prompt.marker", prompt)])
 
     @contextmanager
     def interrupt_on_escape(self):
@@ -1281,6 +1589,9 @@ class Console:
                     metrics.append(f" · 工具 {self._tool_count}", style="dim")
                 if self._tool_errors:
                     metrics.append(f" · 异常 {self._tool_errors}", style="yellow")
+                cache = self._cache_rate()
+                if cache is not None:
+                    metrics.append(f" · 缓存 {cache:.0%}", style="dim")
             metrics.truncate(available, overflow="ellipsis")
             content.append(metrics)
         if compact:
@@ -1477,22 +1788,18 @@ class Console:
             return StreamingDisplay(
                 body, dashboard, key=response_number, height=height, row_lengths=lengths
             )
-        sections = []
+        sections = [Text("")]
         if reasoning:
             sections.extend(
                 [
-                    Text("  思考过程", style="dim"),
+                    self._reasoning_heading(),
                     self._preview_markdown(reasoning, None, dim=True),
                 ]
             )
         if content:
-            label = f"{self.model} · 回答" if self.terminal_width() >= 40 else "回答"
-            sections.extend(
-                [
-                    Rule(label, align="left", style="cyan"),
-                    self._preview_markdown(content, None),
-                ]
-            )
+            if reasoning:
+                sections.append(Text(""))
+            sections.extend([self._answer_heading(), self._preview_markdown(content, None)])
         body = []
         lengths = []
         for section in sections:
@@ -1585,6 +1892,8 @@ class Console:
         self._tool_count = 0
         self._tool_errors = 0
         self._active_tool_number = 0
+        self._active_tool = None
+        self._changed_files.clear()
         if self.interactive:
             sys.stdout.write("\033[2J\033[H" + ("" if self._screen_active else "\033[3J"))
             sys.stdout.flush()
@@ -1601,6 +1910,8 @@ class Console:
         self._performance.clear()
         self._tool_count = 0
         self._tool_errors = 0
+        self._active_tool = None
+        self._changed_files.clear()
         self._clear_preview()
         self._task_started = time.monotonic()
         if self.interactive:
@@ -1640,21 +1951,13 @@ class Console:
         if self._live is not None:
             self._live.stop()
             self._live = None
+        rich = self._rich()
         if self._todos or self._agents:
-            self._rich().print(self._dashboard())
-        if completed and self._task_started is not None and not (self._todos or self._agents):
-            elapsed = _duration(time.monotonic() - self._task_started)
-            metrics = " · ".join(
-                part for part in (self._context_label(), self._tps_label()) if part
-            )
-            print(self.style(f"  ✓ 完成 · {elapsed} · {metrics}", GREEN))
-        elif self._task_started is not None and not (self._todos or self._agents):
-            label, _ = _TASK_STATES.get(self._task_state, (self._task_state, "yellow"))
-            print(
-                self.style(
-                    f"  ◇ {label} · {_duration(time.monotonic() - self._task_started)}", YELLOW
-                )
-            )
+            rich.print(self._dashboard())
+        elif self._task_started is not None:
+            rich.print(self._task_summary())
+        if self._changed_files:
+            rich.print(self._changed_files_line())
         if background:
             team = self._team or {}
             names = list(
@@ -1665,7 +1968,68 @@ class Console:
                 + (f"（{'、'.join(names)}）" if names else "")
                 + "；完成时会在这里提示，/env results 查看结果。"
             )
+        if self.interactive:
+            print()
         self._task_started = None
+
+    def _metric_parts(self) -> list[tuple[str, str]]:
+        """Run statistics as (text, style) pairs, most important first."""
+        parts = []
+        if self._tool_count or self._tool_errors:
+            parts.append((f"工具 {self._tool_count}", "dim"))
+            if self._tool_errors:
+                parts.append((f"异常 {self._tool_errors}", "yellow"))
+        output_tokens = sum(item.get("tokens") or 0 for item in tuple(self._performance.values()))
+        if output_tokens:
+            parts.append((f"输出 {_token_count(output_tokens)}", "dim"))
+        speed = self._tps_label()
+        if speed != "TPS —":
+            parts.append((speed, "dim"))
+        if self._context:
+            tokens, window = self._context["tokens"], self._context["window_tokens"]
+            parts.append(
+                (
+                    f"上下文 {_token_count(tokens)}/{_token_count(window)} · {tokens / window:.1%}",
+                    self._context_style(),
+                )
+            )
+        cache = self._cache_rate()
+        if cache is not None:
+            parts.append((f"缓存 {cache:.0%}", "dim"))
+        return parts
+
+    def _task_summary(self) -> Text:
+        width = self.terminal_width() - 1
+        label, style = _TASK_STATES.get(self._task_state, (self._task_state, "yellow"))
+        icon = {"completed": "✓", "error": "✗", "timeout": "✗"}.get(self._task_state, "◇")
+        line = Text(f"  {icon} {label}", style=f"bold {style}")
+        line.append(f" · {_duration(self._task_elapsed)}", style=style)
+        for text, part_style in self._metric_parts():
+            if line.cell_len + 3 + _display_width(text) > width:
+                continue
+            line.append(" · ", style="bright_black")
+            line.append(text, style=part_style)
+        return line
+
+    def _changed_files_line(self) -> Text:
+        width = self.terminal_width() - 1
+        files = list(self._changed_files.items())
+        line = Text("  ✎ ", style="bold cyan")
+        line.append(f"修改 {len(files)} 个文件", style="bold")
+        for index, (path, (added, removed)) in enumerate(files):
+            entry = Text("  " if index == 0 else " · ", style="bright_black")
+            entry.append(_short_path(path, 48))
+            entry.append(f" +{added}", style="green")
+            entry.append(f" -{removed}", style="red")
+            remaining = len(files) - index
+            more = Text(f" · 另 {remaining} 个", style="dim")
+            reserve = more.cell_len if remaining > 1 else 0
+            if index and line.cell_len + entry.cell_len + reserve > width:
+                line.append_text(more)
+                break
+            line.append_text(entry)
+        line.truncate(width, overflow="ellipsis")
+        return line
 
     def assistant_start(self) -> None:
         self._tool_parameter_progress = False
@@ -1824,17 +2188,14 @@ class Console:
             if reasoning.strip():
                 sections.extend(
                     [
-                        Rule("思考过程", align="left", style="bright_black"),
+                        Text(""),
+                        self._reasoning_heading(),
                         self._markdown_renderable(reasoning, dim=True),
                     ]
                 )
             if content.strip():
-                label = f"{self.model} · 回答" if self.terminal_width() >= 40 else "回答"
                 sections.extend(
-                    [
-                        Rule(label, align="left", style="cyan"),
-                        self._markdown_renderable(content),
-                    ]
+                    [Text(""), self._answer_heading(), self._markdown_renderable(content)]
                 )
             if sections:
                 self._rich().print(Group(*sections))
@@ -1851,16 +2212,12 @@ class Console:
         self._tool_count += 1
         entry = self._current_execution()
         self._active_tool_number = entry.number if entry else self._active_tool_number + 1
+        self._active_tool = (name, dict(arguments))
         detail = self._tool_detail(name, arguments)
-        self._task_activity = f"{_TOOL_LABELS.get(name, name)} · {detail}"
+        label = _TOOL_LABELS.get(name, name)
+        self._task_activity = f"{label} · {detail}" if detail else label
+        # The call is printed once, with its outcome; until then the live task shows it.
         self._refresh_task()
-        available = max(8, self.terminal_width() - 18)
-        detail = _ellipsize(detail, available) if detail else ""
-        line = Text(f"  ├─ #{self._active_tool_number}  ", style="bright_black")
-        line.append(_TOOL_LABELS.get(name, name), style="bold yellow")
-        if detail:
-            line.append(f"  {detail}", style="dim")
-        self._rich().print(line)
 
     def tool_result(self, name: str, result: dict[str, Any]) -> None:
         if name == "ask_user":
@@ -1868,48 +2225,141 @@ class Console:
         status = result.get("status") or "error"
         if status != "ok":
             self._tool_errors += 1
-        labels = {
-            "ok": ("完成", "green"),
-            "partial": ("部分完成", "yellow"),
-            "timeout": ("超时", "red"),
-            "unknown": ("结果未知", "yellow"),
-            "error": ("失败", "red"),
-        }
-        label, style = labels.get(status, (str(status), "yellow"))
+        icon, style, label = {
+            "ok": ("✓", "green", ""),
+            "partial": ("◐", "yellow", "部分完成"),
+            "timeout": ("✗", "red", "超时"),
+            "unknown": ("?", "yellow", "结果未知"),
+            "error": ("✗", "red", "失败"),
+        }.get(status, ("?", "yellow", str(status)))
         data = result.get("data") or {}
         if status == "ok" and name == "monitor" and data.get("event") == "matched":
-            label, style = "条件满足", "green"
+            label = "条件满足"
         elif status == "ok" and data.get("state") in {"running", "waiting"}:
-            label, style = "等待中" if name == "monitor" else "运行中", "cyan"
-        detail = result_summary(result)
+            icon, style = "◷", "cyan"
+            label = "等待中" if name == "monitor" else "运行中"
         entry = self._current_execution()
-        duration = entry.run.get("duration_seconds") if entry else None
-        if isinstance(duration, (int, float)):
-            detail = f"{duration:.1f}s · {detail}".rstrip(" ·")
-        detail = _ellipsize(detail.replace("\n", " "), max(8, self.terminal_width() - 18))
-        line = Text("  └─ ", style="bright_black")
-        line.append(label, style=f"bold {style}")
-        if detail:
-            line.append(f"  {detail}", style="dim")
-        self._rich().print(line)
-        if name in {"exec", "monitor"}:
-            output = (result.get("data") or {}).get("output")
-            if isinstance(output, str) and output:
-                lines = plain(output).splitlines()
-                visible = lines if len(lines) <= 3 else [*lines[:2], lines[-1]]
-                for index, text in enumerate(visible):
-                    if len(lines) > 3 and index == 2:
-                        self._rich().print(Text(f"      … 省略 {len(lines) - 3} 行", style="dim"))
-                    self._rich().print(
-                        Text(
-                            "      " + _ellipsize(text, max(8, self.terminal_width() - 8)),
-                            style="dim",
-                        )
-                    )
+        pending, self._active_tool = self._active_tool, None
+        if entry is not None:
+            arguments = entry.arguments
+        elif pending is not None and pending[0] == name:
+            arguments = pending[1]
+        else:
+            arguments = {}
         number = entry.number if entry else self._active_tool_number
+        duration = entry.run.get("duration_seconds") if entry else None
+        width = self.terminal_width() - 1
+        rich = self._rich()
+
+        if name == "update_plan" and status == "ok" and isinstance(data.get("steps"), list):
+            rich.print(self._plan_line(data, number, width))
+            return
+
+        stats = _edit_stats(name, arguments) if status == "ok" else None
+        if stats is not None and name in {"edit", "write"}:
+            path = _workspace_path(data.get("path") or arguments.get("path") or "", self.workspace)
+            totals = self._changed_files.setdefault(path, [0, 0])
+            totals[0] += stats[0]
+            totals[1] += stats[1]
+
+        meta = Text()
+        if label:
+            meta.append(label, style=f"bold {style}")
+        if name == "write" and stats is not None:
+            facts = f"{stats[0]} 行"
+        elif name == "edit" and stats is not None:
+            facts = ""
+            meta.append(" · " if meta else "", style="dim")
+            meta.append(f"+{stats[0]}", style="green")
+            meta.append(" ", style="dim")
+            meta.append(f"-{stats[1]}", style="red")
+        else:
+            facts = result_summary({**result, "error": None})
+        if data.get("merged"):
+            facts = " · ".join(part for part in (facts, "已合并并行修改") if part)
+        if isinstance(duration, (int, float)) and duration >= 0.1:
+            facts = " · ".join(part for part in (facts, _duration_short(duration)) if part)
+        if facts:
+            meta.append((" · " if meta else "") + facts, style="dim")
         if number:
-            suffix = " · o 打开保留文件" if result.get("artifact_path") else ""
-            self._rich().print(Text(f"      /tool {number} 查看详情{suffix}", style="dim"))
+            meta.append(("  " if meta else "") + f"#{number}", style="bright_black")
+
+        line = Text("  ")
+        line.append(icon, style=f"bold {style}")
+        line.append(" ")
+        line.append(_TOOL_LABELS.get(name, name), style="bold")
+        target = self._tool_target(name, arguments)
+        room = width - line.cell_len - meta.cell_len - 4
+        if target and room >= 8:
+            line.append("  ")
+            line.append(_ellipsize(target, room))
+        elif target:
+            line.append("  ")
+            line.append(_ellipsize(target, max(8, width - line.cell_len - 2)))
+            meta.truncate(max(0, width - line.cell_len - 2), overflow="ellipsis")
+        if meta:
+            line.append("  ")
+            line.append_text(meta)
+        line.truncate(width, overflow="ellipsis")
+        rich.print(line)
+
+        error = result.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            message = plain(error["message"]).replace("\n", " ").strip()
+            message = message.replace(str(self.workspace) + os.sep, "")
+            reason = Text("    ╰ ", style="bright_black")
+            reason.append(_ellipsize(message, max(8, width - 6)), style=style)
+            rich.print(reason)
+        output = data.get("output") if name in {"exec", "monitor"} else None
+        if isinstance(output, str) and output.strip():
+            lines = plain(output).rstrip().splitlines()
+            folded = len(lines) - 3
+            visible = lines if folded <= 1 else [lines[0], None, *lines[-2:]]
+            for text in visible:
+                row = Text("    │ ", style="bright_black")
+                if text is None:
+                    hint = f"… 省略 {folded} 行"
+                    if number:
+                        hint += f" · /tool {number} 查看全部"
+                    row.append(hint, style="dim italic")
+                else:
+                    row.append(_ellipsize(text.expandtabs(4), max(8, width - 6)), style="dim")
+                rich.print(row)
+
+    def _plan_line(self, plan: dict[str, Any], number: int, width: int) -> Text:
+        steps = [item for item in plan.get("steps") or [] if isinstance(item, dict)]
+        completed = sum(item.get("status") == "completed" for item in steps)
+        current = next(
+            (item for item in steps if item.get("status") == "in_progress"),
+            next((item for item in steps if item.get("status") == "pending"), None),
+        )
+        line = Text("  ")
+        line.append("☰", style="bold cyan")
+        line.append(" 计划", style="bold")
+        meta = Text(f"{completed}/{len(steps)}", style="dim")
+        if number:
+            meta.append(f"  #{number}", style="bright_black")
+        focus = str(current["step"]) if current else "全部完成" if steps else plan.get("title", "")
+        room = width - line.cell_len - meta.cell_len - 4
+        if focus and room >= 4:
+            line.append("  ")
+            line.append(
+                _ellipsize(focus, room),
+                style="cyan" if current and current.get("status") == "in_progress" else "",
+            )
+        line.append("  ")
+        line.append_text(meta)
+        line.truncate(width, overflow="ellipsis")
+        return line
+
+    def _tool_target(self, name: str, arguments: dict[str, Any]) -> str:
+        if name in {"read", "edit", "write", "ls"} and arguments.get("path"):
+            detail = _workspace_path(arguments["path"], self.workspace)
+            offset = arguments.get("offset")
+            if name == "read" and isinstance(offset, int) and offset > 1:
+                detail += f":{offset}"
+            return detail
+        return self._tool_detail(name, arguments)
 
     def _current_execution(self) -> ExecutionEntry | None:
         execution_id = current_trace().execution_id
@@ -2048,20 +2498,20 @@ class Console:
             content = history_text(message.get("content"))
             print()
             if is_user:
-                self._section("你", style="bright_black")
+                self._section("› 你", style="green")
                 self._markdown(content)
                 continue
             reasoning = history_text(_reasoning_text(message))
             if reasoning:
-                self._section("思考过程", style="bright_black")
+                self._rich().print(self._reasoning_heading())
                 self._markdown(reasoning, dim=True)
             if content:
-                self._section("回答", style="cyan")
+                self._section("◆ 回答", style="cyan")
                 self._markdown(content)
             tool_calls = message.get("tool_calls") or []
             if tool_calls:
                 names = [call.get("function", {}).get("name") or "未知工具" for call in tool_calls]
-                self._rich().print(Text(f"  工具调用  {' · '.join(names)}", style="dim yellow"))
+                self._rich().print(Text(f"  ⚙ 工具调用  {' · '.join(names)}", style="dim yellow"))
             elif not reasoning and not content:
                 self._rich().print(Text("  [空响应]", style="dim"))
         print()

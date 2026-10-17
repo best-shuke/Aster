@@ -697,6 +697,10 @@ print('RESULT:' + json.dumps({'status': status,
 
         self.assertEqual(self.read_keys(keys), {"value": pasted})
 
+    def test_trailing_backslash_continues_the_prompt_on_a_new_line(self):
+        keys = [b"first \\", (b"first", b"\r"), (b"\\", b"second\r")]
+        self.assertEqual(self.read_keys(keys, width=60), {"value": "first \nsecond"})
+
     def test_chunked_bracketed_paste_is_not_truncated(self):
         pasted = "\n".join(f"第 {index} 行：" + "内容" * 20 for index in range(24))
         payload = pasted.encode()

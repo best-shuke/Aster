@@ -25,6 +25,18 @@ STATUS_LABELS = {
     "error": "失败",
     "not_executed": "未执行",
 }
+HEALTHY = {"ok", "completed", "pending", "running"}
+STATUS_ICONS = {
+    "ok": ("✓", "class:ok"),
+    "completed": ("✓", "class:ok"),
+    "running": ("◷", "class:accent"),
+    "pending": ("○", "class:muted"),
+    "partial": ("◐", "class:warn"),
+    "timeout": ("✗", "class:error"),
+    "unknown": ("?", "class:warn"),
+    "error": ("✗", "class:error"),
+    "not_executed": ("○", "class:warn"),
+}
 
 
 class TraceInspector:
@@ -69,10 +81,7 @@ class TraceInspector:
             entry
             for entry in self.entries
             if all(word in entry.searchable for word in query.split())
-            and (
-                not self.errors_only
-                or entry.status not in {"ok", "completed", "pending", "running"}
-            )
+            and (not self.errors_only or entry.status not in HEALTHY)
             and (not self.latest_task or (entry.run.get("trace") or {}).get("task_id") == task_id)
         ]
         self.filtered.sort(key=lambda entry: entry.run.get("started_at", float("inf")))
@@ -137,34 +146,46 @@ class TraceInspector:
             task = (entry.run.get("trace") or {}).get("task_id")
             if task != previous_task:
                 title = plain(entry.run.get("task_title") or "旧会话记录")
-                fragments.append(("class:muted", f" ── {title[:80]} ──\n"))
+                fragments.append(("class:task", f" ▸ {title[:80]}\n"))
                 previous_task = task
             selected = index == self.selected
             style = "class:selected" if selected else ""
             if selected:
                 fragments.append(("[SetCursorPosition]", ""))
-            marker = "›" if selected else " "
+            icon, icon_style = STATUS_ICONS.get(entry.status, ("?", "class:warn"))
             label = STATUS_LABELS.get(entry.status, entry.status)
             duration = entry.run.get("duration_seconds")
-            timing = f" · {duration:.1f}s" if isinstance(duration, (int, float)) else ""
-            fragments.append(
-                (style, f" {marker} #{entry.number}  {entry.run.get('tool')} · {entry.agent}\n")
+            timing = f"{duration:.1f}s" if isinstance(duration, (int, float)) else ""
+            agent = "" if entry.agent == "主代理" else f" · {entry.agent}"
+            fragments.extend(
+                [
+                    (style, " › " if selected else "   "),
+                    (style or icon_style, icon),
+                    (style, f" #{entry.number}  {entry.run.get('tool')}{agent}\n"),
+                ]
             )
-            fragments.append(
-                (style or "class:muted", f"    {label}{timing} · {entry.target[:256]}\n")
+            facts = " · ".join(
+                part
+                for part in (label if entry.status not in {"ok", "completed"} else "", timing)
+                if part
             )
+            details = " · ".join(part for part in (facts, entry.target[:256]) if part)
+            fragments.append((style or "class:muted", f"     {details or label}\n"))
         return fragments or [("class:muted", "  没有匹配的调用\n")]
 
     def _heading(self):
         scopes = ["当前任务" if self.latest_task else "整个会话"]
         if self.errors_only:
             scopes.append("仅异常")
-        return [
-            (
-                "class:heading",
-                f"  执行轨迹 · {' / '.join(scopes)} · {len(self.filtered)}/{len(self.entries)} 次调用  ",
-            )
+        failures = sum(entry.status not in HEALTHY for entry in self.entries)
+        heading = [
+            ("class:heading", "  执行轨迹"),
+            ("class:muted", f" · {' / '.join(scopes)} · "),
+            ("", f"{len(self.filtered)}/{len(self.entries)} 次调用"),
         ]
+        if failures:
+            heading.append(("class:error", f" · {failures} 次异常"))
+        return heading
 
     def _footer(self):
         summary = self.notice or (result_summary(self.entry.result) if self.entry else "")
@@ -331,6 +352,11 @@ class TraceInspector:
                     "heading": "bold ansicyan",
                     "selected": "bold ansicyan reverse",
                     "muted": "ansibrightblack",
+                    "task": "bold",
+                    "ok": "ansigreen",
+                    "accent": "ansicyan",
+                    "warn": "ansiyellow",
+                    "error": "ansired",
                 }
                 if colors
                 else {}

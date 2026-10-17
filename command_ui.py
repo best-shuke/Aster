@@ -1,6 +1,6 @@
 """Terminal presentation and interactive selection for parsed commands."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import cast
@@ -768,7 +768,7 @@ def present_command(
     conversation: Conversation,
     console: Console,
     *,
-    help_text: str,
+    help_text: str | Sequence[tuple[str, Sequence[tuple[str, str]]]],
     interactions: dict[CommandName, Callable[[Conversation, Console, list[str]], object]],
 ) -> None:
     for effect in execution.effects:
@@ -787,7 +787,7 @@ def present_command(
         elif effect.kind is EffectKind.CACHE:
             console.cache(cast(dict, effect.payload))
         elif effect.kind is EffectKind.HELP:
-            print(help_text)
+            console.help(help_text)
         elif effect.kind is EffectKind.TEXT:
             print(effect.payload)
         elif effect.kind is EffectKind.INTERACTION:
