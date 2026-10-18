@@ -763,7 +763,7 @@ class RecoveryTests(TeamTestCase):
             engineer=engineer_blocks,
         )
         conversation = self.team_conversation(script)
-        self.ask(conversation, "Build the widget with the team")
+        self.ask(conversation, "Build the widget with the team; don't wait for the engineer")
         session_id = conversation.session_id
         engineer = conversation.team.state.data["agents"]["engineer"]
         self.assertEqual(engineer["status"], "idle")
@@ -1572,6 +1572,41 @@ class BackgroundWorkTests(TeamTestCase):
     def background(self, conversation):
         return conversation.team.state.data.get("background") or {}
 
+    def ask(self, conversation, prompt="Do the team task; don't wait for it."):
+        # The user hands the work off, so main may answer while members still work.
+        return super().ask(conversation, prompt)
+
+    def test_main_waits_for_this_turns_work_unless_the_user_hands_it_off(self):
+        release = threading.Event()
+
+        def engineer(messages, tools):
+            release.wait(10)
+            return say("Widget built.")
+
+        def wait(messages, tools):
+            release.set()
+            return team("wait", timeout=30)
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build the widget"),
+                # Held each time, not only once: the user did not ask to leave work running.
+                say("The engineer is building it."),
+                say("The engineer is building it."),
+                wait,
+                lambda messages, tools: say(
+                    "Result: " + last_tool(messages)["data"]["items"][0]["content"]
+                ),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        self.assertEqual(self.ask(conversation, "Build the widget."), "Result: Widget built.")
+        self.assertFalse(conversation.team.in_background)
+        self.assertFalse(conversation.team.went_background)
+        self.assertIn("did not ask you to leave this work running", script.seen("main"))
+        self.assertEqual(conversation.last_outcome["status"], "completed")
+
     def test_unlimited_background_and_activation_have_no_expiry_timer(self):
         release = threading.Event()
         deadlines = []
@@ -1943,6 +1978,70 @@ class BackgroundWorkTests(TeamTestCase):
         self.ask(conversation)
         self.assertFalse(conversation.team.in_background)
         self.assertNotIn("keep working in the background", script.seen("main"))
+
+
+class MemberSelfCheckTests(TeamTestCase):
+    """Members follow the environment's rules and check their own code changes."""
+
+    CHECK = f'"{sys.executable}" -c "import app; assert app.answer == 42"'
+
+    def delegate(self, *engineer):
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Fix app.py"),
+                team("wait", timeout=30),
+                lambda messages, tools: say(last_tool(messages)["data"]["items"][0]["content"]),
+            ),
+            engineer=Steps(*engineer),
+        )
+        conversation = self.team_conversation(script)
+        return script, self.ask(conversation, "Fix app.py with the team")
+
+    def test_members_start_from_the_environments_working_rules(self):
+        script, _ = self.delegate(
+            use("write", path="notes.txt", content="not code\n"), say("Wrote notes.")
+        )
+        member = script.requests["engineer"][0]["messages"][0]["content"]
+        rules = self.store.resolve("program:crew").prompt_text
+        self.assertTrue(member.startswith(rules))
+        self.assertIn('You are "engineer"', member)
+        self.assertIn("run a relevant standalone check", member)
+        # Main's prompt starts the same way up to the tool list, so the prefix is shared.
+        main = script.requests["main"][0]["messages"][0]["content"]
+        self.assertEqual(main.split("Available tools:")[0], member.split("Available tools:")[0])
+        # A document edit needs no check.
+        self.assertEqual(len(script.requests["engineer"]), 2)
+
+    def test_a_member_is_asked_once_to_check_its_code_change(self):
+        script, answer = self.delegate(
+            use("write", path="app.py", content="answer = 42\n"),
+            say("Fixed."),
+            use("exec", command=self.CHECK),
+            say("Fixed app.py; the assertion passed."),
+        )
+        self.assertEqual(answer, "Fixed app.py; the assertion passed.")
+        self.assertIn("the change is not verified yet", script.seen("engineer"))
+        self.assertEqual(len(script.requests["engineer"]), 4)
+
+    def test_a_member_that_checks_its_change_is_not_asked_again(self):
+        script, answer = self.delegate(
+            use("write", path="app.py", content="answer = 42\n"),
+            use("exec", command=self.CHECK),
+            say("Fixed and checked."),
+        )
+        self.assertEqual(answer, "Fixed and checked.")
+        self.assertNotIn("not verified yet", script.seen("engineer"))
+
+    def test_an_unchecked_change_is_reported_as_unchecked(self):
+        script, answer = self.delegate(
+            use("write", path="app.py", content="answer = 42\n"),
+            say("Fixed."),
+            say("Fixed; I did not run anything."),
+        )
+        self.assertTrue(answer.startswith("Fixed; I did not run anything."))
+        self.assertIn("engineer changed source files", answer)
+        self.assertIn("no passing standalone check followed its last edit", answer)
+        self.assertEqual(len(script.requests["engineer"]), 3)
 
 
 class AcceptanceAttributionTests(TeamTestCase):

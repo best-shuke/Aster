@@ -217,7 +217,8 @@ Members (independent agents with their own contexts, tools and permissions):
 Start from the user's goal, requested deliverable and task-specific acceptance criteria. Research, academic work, analysis, writing, planning, organising materials and software work are all valid tasks. Choose the relevant roles and evidence checks; do not turn other tasks into code changes or require programming tests for a non-software deliverable. When this environment allows dynamic agents and an important expertise gap remains, create a focused specialist with a self-contained assignment and the minimum useful tools, within the team limits. Members can request help, disagree and review each other's work directly. For academic work, distinguish proposed experiments from executed ones and verify citations against sources actually obtained.
 
 Decide whether the task benefits from the team. Do simple tasks yourself. Engage only the members whose skills matter, and pick the cheapest collaboration that works: a direct request, tasks with dependencies, or a structured protocol (start_protocol) when independence or a formal discussion helps. Members also talk to each other directly; you do not need to relay or approve their messages.
-After engaging members, call team action=wait to receive replies, task results and protocol outcomes. It returns as soon as something arrives, when the team is idle, or on timeout. Do not give your final answer while work you depend on is still running. Members' reports are evidence, not proof: verify what matters before presenting it. Cancel tasks you no longer need (update_task status=cancelled); an open task wakes its assignee again in a later turn.
+One tightly coupled deliverable, such as a single page, app, game or module, is best written by one implementer (you or one member) who also checks it: give that implementer the whole of it. Split implementation only into parts with separate files and agreed interfaces, and use other members to review or test.
+After engaging members, call team action=wait to receive replies, task results and protocol outcomes. It returns as soon as something arrives, when the team is idle, or on timeout. Do not give your final answer while work you depend on is still running; unless the user asked you not to wait, you are held until this turn's work finishes. Members' reports are evidence, not proof: verify what matters before presenting it. Cancel tasks you no longer need (update_task status=cancelled); an open task wakes its assignee again in a later turn.
 Limits per turn: {limits.max_concurrent_agents} members run at once; messages: {format_limit(limits.max_messages_per_turn)}; activations per member: {format_limit(limits.max_activations_per_agent)}; message chains up to {limits.max_message_hops} hops; task nesting up to {limits.max_task_depth} levels. An unlimited budget never requires you to stop merely because of usage; finish when the goal is met or report a real blocker. Team state persists across turns of this session.{background_text(limits)}"""
 
 
@@ -245,7 +246,8 @@ def background_text(limits) -> str:
         "\nIn interactive sessions, members still working when you answer keep working in the "
         f"background {duration}, within the same "
         "per-turn limits. What they send you waits in your mailbox for the next turn, and the "
-        "user can look at it meanwhile. If you answer while members still work, tell the user "
+        "user can look at it meanwhile. Answer while members still work only when the user "
+        "asked you not to wait or the work was left by an earlier turn, and then tell the user "
         "they continue in the background."
     )
 
@@ -258,6 +260,9 @@ def member_instructions(runtime: "TeamRuntime", spec, skills_section: str) -> st
         "- Teammates may edit the same files. An edit or write based on your earlier read merges "
         'with their non-overlapping changes (the result then says "merged"); on file_changed, '
         "read the file again and reapply your change.\n"
+        "- After changing code, run a relevant standalone check (test, build or assertion, "
+        "each in its own exec call) before you finish, and report the command and result; if "
+        "you cannot run one, say so and ask a teammate who can.\n"
         if {"write", "edit"} & runtime.member_tool_names(spec)
         else ""
     )

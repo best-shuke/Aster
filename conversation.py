@@ -761,7 +761,7 @@ class Conversation:
                     return problem
             background = False
             if self.team is not None:
-                problem = self.team.final_answer_problem()
+                problem = self.team.final_answer_problem(handoff=acceptance.handoff_allowed)
                 if problem:
                     return problem
                 # Members' unfinished edits are verified when their work is done, not now.

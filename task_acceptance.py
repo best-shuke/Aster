@@ -22,6 +22,13 @@ INABILITY = re.compile(
     re.I,
 )
 NEEDS_USER = re.compile(r"需要你.{0,20}(?:提供|确认)|\bneed your clarification\b", re.I)
+# The user lets the agent answer while delegated work goes on ("不要等待它完成", "don't wait").
+HANDOFF = re.compile(
+    r"不(?:要|用|必)等|无需等|别等|后台继续|转入后台"
+    r"|\b(?:don't|do not|no need to) wait\b|\bwithout waiting\b"
+    r"|\b(?:keep working|continue|carry on) in the background\b",
+    re.I,
+)
 UNTRUSTED_CHECK = "Run the check as a standalone command; shell composition may hide failures."
 # Quoted and code text reports what something said or contains, not the agent's own state.
 QUOTED = re.compile(r"```.*?```|`[^`\n]*`|“[^”]*”|「[^」]*」|‘[^’]*’|\"[^\"\n]{0,300}\"", re.S)
@@ -92,6 +99,7 @@ class TaskAcceptance:
                 re.I,
             )
             self.kind = "change" if self.has_tools and action and not discussion else "answer"
+        self.handoff_allowed = bool(HANDOFF.search(self.prompt))
         self.status = "in_progress"
         self.evidence = []
         self.check_results = []
@@ -213,6 +221,9 @@ class TaskAcceptance:
                 and words[1] == "-m"
                 and words[2] in {"unittest", "pytest", "compileall"}
             )
+        if executable == "node":
+            # The built-in test runner and syntax check; plain scripts are not checks.
+            return len(words) > 1 and words[1] in {"--test", "--check", "-c"}
         return executable in {"npm", "pnpm", "yarn", "bun", "cargo", "go", "make", "cmake"} and any(
             word in {"test", "check", "build", "lint", "typecheck", "--build"} for word in words[1:]
         )
@@ -419,27 +430,10 @@ class TaskAcceptance:
                 "Cannot verify the final code revision because file tracking failed: "
                 + self._tracking_error
             )
-        if self.kind == "change" and self.failed_verifications:
-            return "Verification failed and remains unresolved. Rerun the failed check successfully, or explicitly report the concrete validation blocker."
-        if self.kind == "change" and self.pending_verifications:
-            return "Background verification is still running. Use monitor to observe its final result before reporting completion."
-        if (
-            self.kind == "change"
-            and self.code_revision > 0
-            and self.verified_revision != self.code_revision
-            and not self.contract.checks
-        ):
-            if any(
-                record.get("verification_untrusted")
-                for record in self.evidence[max(self.last_code_change, 0) :]
-            ):
-                return (
-                    "Code was changed but no successful verification followed the last edit: "
-                    "the check you ran was not counted because it was combined with other shell "
-                    "commands (&&, ;, |, newlines), which can hide a failure. Run the check alone "
-                    "in its own exec call, with the cwd argument instead of cd."
-                )
-            return "Code was changed but no successful verification followed the last edit. Run a relevant standalone test/build/assertion, or explicitly report why validation is blocked."
+        if self.kind == "change":
+            problem = self.verification_problem()
+            if problem:
+                return problem
         self.check_results = []
         for check in self.contract.checks:
             try:
@@ -456,6 +450,30 @@ class TaskAcceptance:
             if problem:
                 return "Task acceptance failed: " + problem
         self.status = "completed"
+        return None
+
+    def verification_problem(self):
+        """What leaves the latest code revision unverified, or None."""
+        if self.failed_verifications:
+            return "Verification failed and remains unresolved. Rerun the failed check successfully, or explicitly report the concrete validation blocker."
+        if self.pending_verifications:
+            return "Background verification is still running. Use monitor to observe its final result before reporting completion."
+        if (
+            self.code_revision > 0
+            and self.verified_revision != self.code_revision
+            and not self.contract.checks
+        ):
+            if any(
+                record.get("verification_untrusted")
+                for record in self.evidence[max(self.last_code_change, 0) :]
+            ):
+                return (
+                    "Code was changed but no successful verification followed the last edit: "
+                    "the check you ran was not counted because it was combined with other shell "
+                    "commands (&&, ;, |, newlines), which can hide a failure. Run the check alone "
+                    "in its own exec call, with the cwd argument instead of cd."
+                )
+            return "Code was changed but no successful verification followed the last edit. Run a relevant standalone test/build/assertion, or explicitly report why validation is blocked."
         return None
 
     def outcome(self):

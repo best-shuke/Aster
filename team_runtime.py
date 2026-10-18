@@ -127,6 +127,8 @@ class TeamRuntime:
         self.accepting = False
         self.turn_deadline = float("inf")
         self.nudges = 0
+        # Whether this turn started with work left by an earlier turn (background or paused).
+        self.inherited_work = False
         self.notices: list[str] = []
         self.main_origin = MainOrigin()
         self._titles: dict[str, str] = {}
@@ -280,6 +282,8 @@ class TeamRuntime:
                     record["status"] = "idle"
             self._event("turn_started", MAIN, turn=data["turn"]["number"])
             self._drain()
+            summary = self._summary()
+            self.inherited_work = bool(summary["working"] or summary["queued"])
             self._persist()
 
     def end_turn(self, *, interrupted: bool = False) -> int:
@@ -1557,15 +1561,31 @@ class TeamRuntime:
 
     # Main-agent integration --------------------------------------------------------
 
-    def final_answer_problem(self) -> str | None:
+    def final_answer_problem(self, *, handoff: bool = True) -> str | None:
+        """Why main may not give its final answer yet, or None.
+
+        Without ``handoff`` (the user did not ask main to leave work running) main waits
+        for the work it started this turn, so it can check the result it reports. Otherwise,
+        and for work an earlier turn left, it is held once and may then answer anyway.
+        """
         with self.lock:
-            if self.state is None or self.nudges >= 1:
+            if self.state is None:
+                return None
+            hold = not handoff and not self.inherited_work
+            if self.nudges >= 1 and not hold:
                 return None
             summary = self._summary()
             if not summary["working"] and not summary["queued"]:
                 return None
             self.nudges += 1
             working = ", ".join(summary["working"] + summary["queued"])
+            if hold:
+                return (
+                    f"Team members are still working ({working}). Call team action=wait until "
+                    "they finish, check the integrated result, then answer; or team "
+                    "action=cancel to stop work you no longer need. The user did not ask you to "
+                    "leave this work running."
+                )
             if self._may_continue():
                 return (
                     f"Held once, not rejected: team members are still working ({working}). Call "

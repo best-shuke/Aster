@@ -3,8 +3,10 @@
 Each member has its own model client, private context and tool set. Its tools are the
 environment's tools intersected with its own declaration; its MCP scope is the
 environment's scope intersected with its own; its skills are the environment's active
-skills it declares. Activations reuse the main agent's TaskRuntime for generation,
-compaction, recovery, deadlines and cancellation.
+skills it declares. Its system prompt starts with the environment's working rules, the
+same ones main and delegate workers follow. Activations reuse the main agent's
+TaskRuntime for generation, compaction, recovery, deadlines and cancellation, and a
+member that changes source files is asked once to check its change before it finishes.
 """
 
 import json
@@ -13,12 +15,14 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from client_runtime import fork_client
+from config import system_prompt
 from context_budget import LOCAL_METADATA, estimate_tokens
 from deepseek_client import CompletionError
 from environment_spec import MEMBER_DEFAULT_TOOLS, MEMBER_EXCLUDED, TEAM_TOOL, AgentSpec
 from execution_trace import TraceContext, trace_scope
 from mcp_scope import McpScope, ScopedMcp
 from skills import skills_prompt_section
+from task_acceptance import TaskAcceptance, TaskContract
 from task_runtime import TaskRuntime
 from team_state import TeamError
 from team_tools import TeamTool, member_instructions
@@ -31,6 +35,14 @@ if TYPE_CHECKING:
 
 # Tools that are registered on demand rather than inherited from the main registry.
 ATTACHED = frozenset({"mcp", "delegate", TEAM_TOOL})
+UNVERIFIED_NUDGE = (
+    "[runtime] You changed source files in this activation, but the change is not verified "
+    "yet. {problem} Your next final message replaces the one above, so make it complete."
+)
+UNVERIFIED_NOTE = (
+    "\n\n[runtime] {name} changed source files in this activation; no passing standalone "
+    "check followed its last edit."
+)
 
 
 def allowed_tools(runtime: "TeamRuntime", spec: AgentSpec) -> frozenset[str]:
@@ -152,7 +164,14 @@ class MemberAgent:
             "Skills granted to you. Load one with team action=load_skill name=<skill> "
             "before acting on it.",
         )
-        prompt = member_instructions(runtime, spec, section)
+        names = tuple(item["function"]["name"] for item in self.tools.definitions)
+        # The environment's rules come first: a prefix shared with main's prompt.
+        prompt = system_prompt(
+            settings.workspace,
+            settings.prompt_file,
+            names,
+            instructions=runtime.environment.prompt_text,
+        ) + member_instructions(runtime, spec, section)
         if self.tools.definitions:
             prompt += "\n\n" + self.tools.environment_instructions()
         self.system = {"role": "system", "content": prompt}
@@ -228,6 +247,9 @@ class MemberAgent:
             check_active=execution.remaining,
             cancelled=activation.cancelled,
         )
+        # Tracks only this member's own edits and checks, not its teammates' changes.
+        acceptance = TaskAcceptance("", TaskContract(kind="change"))
+        nudged = False
 
         def model_progress(event):
             phase = event.get("phase")
@@ -246,9 +268,21 @@ class MemberAgent:
             runtime.save_context(name, messages)
             calls = response.get("tool_calls") or []
             if not calls:
-                return self.Result("ok", response.get("content") or "")
+                final = response.get("content") or ""
+                problem = acceptance.verification_problem()
+                if problem and not nudged and "exec" in self.tools.registry:
+                    nudged = True
+                    messages.append(
+                        {"role": "user", "content": UNVERIFIED_NUDGE.format(problem=problem)}
+                    )
+                    runtime.save_context(name, messages)
+                    continue
+                if problem:
+                    final += UNVERIFIED_NOTE.format(name=name)
+                return self.Result("ok", final)
             for call in calls:
                 execution.remaining()
+                acceptance.before_tool(call)
                 function = call.get("function", {})
                 try:
                     arguments = json.loads(function.get("arguments") or "{}")
@@ -275,6 +309,7 @@ class MemberAgent:
                 )
                 runtime.save_context(name, messages)
                 decoded = json.loads(output)
+                acceptance.observe(call, decoded)
                 with trace_scope(execution.trace):
                     task_runtime.progress.observe(call, decoded)
                 runtime.progress(

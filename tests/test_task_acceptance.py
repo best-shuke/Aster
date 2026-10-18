@@ -138,6 +138,19 @@ class TaskAcceptanceTests(unittest.TestCase):
         self.assertFalse(self.acceptance.verification_command("pytest --collect-only"))
         self.assertFalse(self.acceptance.verification_command("ruff --version"))
 
+    def test_node_test_runner_and_syntax_check_are_verification(self):
+        for command in (
+            "node --test",
+            "node --test tests/",
+            "node --check game.js",
+            "node -c a.js",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(self.acceptance.verification_command(command))
+        for command in ("node game.js", "node -e \"console.log('ok')\"", "node --version"):
+            with self.subTest(command=command):
+                self.assertFalse(self.acceptance.verification_command(command))
+
     def test_user_edit_after_verification_requires_reverification(self):
         self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
         self.execute("exec", self.command("assert True"))
@@ -260,6 +273,26 @@ class TaskAcceptanceTests(unittest.TestCase):
         for command in ("pytest 2>&1", "pytest >&2", "pytest &>log", "pytest > out 2>&1"):
             with self.subTest(command=command):
                 self.assertEqual(len(TaskAcceptance.shell_segments(command)), 1)
+
+
+class HandoffTests(unittest.TestCase):
+    def test_only_an_explicit_request_lets_delegated_work_run_on(self):
+        for prompt in (
+            "修复 app.py：交给 engineer，不要等待它完成",
+            "让团队去做，不用等结果",
+            "Build it with the team, don't wait for them",
+            "Let the members continue in the background",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertTrue(TaskAcceptance(prompt).handoff_allowed)
+        for prompt in (
+            "做一个五子棋网页",
+            "生成一个后台管理系统",
+            "Build a gomoku web page",
+            "Start the dev server in the background and test the page",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(TaskAcceptance(prompt).handoff_allowed)
 
 
 class BlockerAttributionTests(unittest.TestCase):
