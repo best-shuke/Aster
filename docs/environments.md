@@ -15,7 +15,7 @@
 /env mcp                                            查看已选 MCP 服务与可添加服务
 /env mcp add github --tools 'get_*,search_*'        引用已配置的服务，并限制工具
 /env agents                                         查看成员
-/env agents add analyst --description '数据分析' --tools read,grep,exec
+/env agents add statistician --description '统计分析' --tools read,grep,exec
 /env limits max_meeting_rounds=2                    查看或修改资源限制
 /env status                                         当前环境、成员、任务、协议
 /env log 50                                         团队事件

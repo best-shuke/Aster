@@ -1034,41 +1034,50 @@ class CodingTools:
             column = next_cursor.get("column", 0)
         file_path = self.path(path)
         changes = self.worker_changes
-        if changes is not None:
-            content = changes.read(file_path, _context.remaining)
-            version = text_digest(content)
-            source = io.StringIO(content, newline="")
-        else:
-            if not file_path.is_file():
-                raise FileNotFoundError(f"Not a regular file: {file_path}")
-            whole = self._mergeable_text(file_path, _context.remaining)
-            if whole is not None:
-                # One read serves the page, its version and the team's merge base.
-                version = self.edit_ledger.remember(whole)
-                source = io.StringIO(whole, newline="")
+        try:
+            if changes is not None:
+                content = changes.read(file_path, _context.remaining)
+                version = text_digest(content)
+                source = io.StringIO(content, newline="")
             else:
-                version = file_digest(file_path, _context.remaining)
-                source = file_path.open(encoding="utf-8", newline="")
-        with source as stream:
-            current_line = 1
-            while current_line < offset:
-                _context.remaining()
-                chunk = stream.readline(PAGE_CHARS)
-                if not chunk:
-                    break
-                if chunk.endswith("\n"):
-                    current_line += 1
-            if current_line < offset:
-                raise ValueError("offset is beyond the end of the file")
-            left = column
-            while left:
-                _context.remaining()
-                chunk = stream.readline(min(left, PAGE_CHARS))
-                if not chunk or chunk.endswith("\n"):
-                    raise ValueError("column is beyond the end of the line")
-                left -= len(chunk)
-            content, next_line, next_column, eof = self._read_page(
-                stream, offset, column, limit, _context
+                if not file_path.is_file():
+                    raise FileNotFoundError(f"Not a regular file: {file_path}")
+                whole = self._mergeable_text(file_path, _context.remaining)
+                if whole is not None:
+                    # One read serves the page, its version and the team's merge base.
+                    version = self.edit_ledger.remember(whole)
+                    source = io.StringIO(whole, newline="")
+                else:
+                    version = file_digest(file_path, _context.remaining)
+                    source = file_path.open(encoding="utf-8", newline="")
+            with source as stream:
+                current_line = 1
+                while current_line < offset:
+                    _context.remaining()
+                    chunk = stream.readline(PAGE_CHARS)
+                    if not chunk:
+                        break
+                    if chunk.endswith("\n"):
+                        current_line += 1
+                if current_line < offset:
+                    raise ValueError("offset is beyond the end of the file")
+                left = column
+                while left:
+                    _context.remaining()
+                    chunk = stream.readline(min(left, PAGE_CHARS))
+                    if not chunk or chunk.endswith("\n"):
+                        raise ValueError("column is beyond the end of the line")
+                    left -= len(chunk)
+                content, next_line, next_column, eof = self._read_page(
+                    stream, offset, column, limit, _context
+                )
+        except UnicodeDecodeError:
+            # PDFs, Word files and images are common research inputs; say what to do.
+            return ToolResult.failure(
+                "not_text",
+                f"{file_path} is not UTF-8 text (for example a PDF, Word or image file). "
+                "Extract its text first with a command such as `pdftotext FILE OUT.txt`, "
+                "or ask a teammate who can run commands to do it, then read the text file.",
             )
         if changes is None and file_digest(file_path, _context.remaining) != version:
             raise FileChangedError(f"File changed while reading: {file_path}. Read it again.")

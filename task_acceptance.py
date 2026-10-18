@@ -99,11 +99,31 @@ class TaskAcceptance:
                 re.I,
             )
             discussion = re.search(
-                r"分析|解释|怎么|如何|计划|不要修改|翻译|复述|引用|\b(?:explain|analy[sz]e|how to|review|plan|translate|quote)\b",
+                r"分析|解释|怎么|如何|计划|不要修改|翻译|复述|引用"
+                r"|\b(?:explain|analy[sz]e|how to|review|plan|translate|quote)\b",
                 self.prompt,
                 re.I,
             )
-            self.kind = "change" if self.has_tools and action and not discussion else "answer"
+            # Research and writing deliverables are no code change even when their topic
+            # mentions one ("调研 RAG 的实现方案并写一份报告"), unless the prompt also names
+            # code work ("修复论文管理系统的登录 bug").
+            writing = re.search(
+                r"调研|综述|文献|论文|撰写|研究报告|写.{0,8}(?:报告|文章|综述)"
+                r"|\b(?:research|survey|literature|essay|write (?:a|an|the) report)\b",
+                self.prompt,
+                re.I,
+            ) and not re.search(
+                r"修复|修一下|重构|bug|测试|代码|接口|函数|模块|页面|网页|脚本"
+                r"|\b(?:fix|refactor|tests?|code|api|page|module|function|class|endpoint|script)\b"
+                r"|\.(?:py|js|ts|tsx|jsx|go|rs|java|html|css)\b",
+                self.prompt,
+                re.I,
+            )
+            self.kind = (
+                "change"
+                if self.has_tools and action and not discussion and not writing
+                else "answer"
+            )
         self.handoff_allowed = bool(HANDOFF.search(self.prompt))
         self.status = "in_progress"
         self.evidence = []

@@ -294,6 +294,33 @@ class TaskAcceptanceTests(unittest.TestCase):
                 self.assertEqual(len(TaskAcceptance.shell_segments(command)), 1)
 
 
+class TaskKindTests(unittest.TestCase):
+    def test_research_and_writing_that_mention_implementations_are_no_code_change(self):
+        for prompt in (
+            "调研 RAG 的主流实现方案并写一份报告",
+            "比较三篇论文提出的方法在实现上的差异，整理成文献综述",
+            "帮我调研一下新增的欧盟 AI 法案条款对初创公司的影响",
+            "Research how vector databases implement HNSW and write a report",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(TaskAcceptance(prompt).kind, "answer")
+
+    def test_code_requests_still_need_verification(self):
+        for prompt in (
+            "修复 stats.py 的测试失败",
+            "实现一个 LRU 缓存并加测试",
+            "fix the bug in report.py",
+            "implement the researcher_tool module",
+            "fix the survey form validation bug",
+            "修复论文管理系统的登录 bug",
+            "实现一个文献检索的 API 并加测试",
+            "撰写单元测试并修复 utils.py 的 bug",
+            "implement the research dashboard page",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(TaskAcceptance(prompt).kind, "change")
+
+
 class HandoffTests(unittest.TestCase):
     def test_only_an_explicit_request_lets_delegated_work_run_on(self):
         for prompt in (
