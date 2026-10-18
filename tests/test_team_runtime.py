@@ -1590,9 +1590,10 @@ class BackgroundWorkTests(TeamTestCase):
         script = TeamScript(
             main=Steps(
                 team("send_message", to=["engineer"], kind="request", content="Build the widget"),
-                # Held each time, not only once: the user did not ask to leave work running.
                 say("The engineer is building it."),
-                say("The engineer is building it."),
+                # A tool call in between, so the next early answer is held again.
+                team("wait", timeout=0),
+                say("Still building."),
                 wait,
                 lambda messages, tools: say(
                     "Result: " + last_tool(messages)["data"]["items"][0]["content"]
@@ -1602,10 +1603,76 @@ class BackgroundWorkTests(TeamTestCase):
         )
         conversation = self.background_conversation(script)
         self.assertEqual(self.ask(conversation, "Build the widget."), "Result: Widget built.")
-        self.assertFalse(conversation.team.in_background)
+        self.assertEqual(len(script.requests["main"]), 6)
         self.assertFalse(conversation.team.went_background)
-        self.assertIn("did not ask you to leave this work running", script.seen("main"))
+        self.assertIn("did not ask you to leave it running", script.seen("main"))
         self.assertEqual(conversation.last_outcome["status"], "completed")
+
+    def test_answering_twice_in_a_row_hands_the_work_off_instead_of_failing(self):
+        # The model fails a turn after a few rejected answers in a row: hold only once.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build the widget"),
+                say("Building."),
+                say("Building."),
+            ),
+            engineer=lambda messages, tools: (release.wait(10), say("Built."))[1],
+        )
+        conversation = self.background_conversation(script)
+        self.assertEqual(self.ask(conversation, "Build the widget."), "Building.")
+        self.assertTrue(conversation.team.in_background)
+
+    def test_main_is_not_held_in_the_turns_final_reserve(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def answer_near_the_deadline(messages, tools):
+            conversation.team.turn_deadline = time.monotonic() + 1
+            return say("Partial result.")
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build the widget"),
+                answer_near_the_deadline,
+                say("Partial result."),
+            ),
+            engineer=lambda messages, tools: (release.wait(10), say("Built."))[1],
+        )
+        conversation = self.background_conversation(script)
+        self.assertEqual(self.ask(conversation, "Build the widget."), "Partial result.")
+        self.assertNotIn("did not ask you to leave it running", script.seen("main"))
+
+    def test_new_work_is_held_even_when_an_earlier_turn_left_work_running(self):
+        left, fresh = threading.Event(), threading.Event()
+        self.addCleanup(left.set)
+
+        def wait_for_fresh(messages, tools):
+            fresh.set()
+            return team("wait", timeout=30)
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build"),
+                say("Building in the background."),
+                say("Building in the background."),
+                # Next turn: new work for the researcher while the engineer still works.
+                team("send_message", to=["researcher"], kind="request", content="Find facts"),
+                say("The researcher is on it."),
+                wait_for_fresh,
+                lambda messages, tools: say(
+                    "Facts: " + last_tool(messages)["data"]["items"][0]["content"]
+                ),
+            ),
+            engineer=lambda messages, tools: (left.wait(10), say("Built."))[1],
+            researcher=lambda messages, tools: (fresh.wait(10), say("A and B."))[1],
+        )
+        conversation = self.background_conversation(script)
+        self.ask(conversation)
+        self.assertTrue(conversation.team.in_background)
+        self.assertEqual(self.ask(conversation, "Find the facts."), "Facts: A and B.")
+        self.assertIn("did not ask you to leave it running", script.seen("main"))
 
     def test_unlimited_background_and_activation_have_no_expiry_timer(self):
         release = threading.Event()
@@ -2004,6 +2071,7 @@ class MemberSelfCheckTests(TeamTestCase):
         member = script.requests["engineer"][0]["messages"][0]["content"]
         rules = self.store.resolve("program:crew").prompt_text
         self.assertTrue(member.startswith(rules))
+        self.assertIn("You are a member, not main", member)
         self.assertIn('You are "engineer"', member)
         self.assertIn("run a relevant standalone check", member)
         # Main's prompt starts the same way up to the tool list, so the prefix is shared.
@@ -2039,9 +2107,90 @@ class MemberSelfCheckTests(TeamTestCase):
             say("Fixed; I did not run anything."),
         )
         self.assertTrue(answer.startswith("Fixed; I did not run anything."))
-        self.assertIn("engineer changed source files", answer)
+        self.assertIn("engineer changed code", answer)
         self.assertIn("no passing standalone check followed its last edit", answer)
         self.assertEqual(len(script.requests["engineer"]), 3)
+
+    def test_a_failing_check_without_an_edit_is_no_unchecked_change(self):
+        # A tester whose check finds the bug changed nothing.
+        script, answer = self.delegate(
+            use("exec", command=f'"{sys.executable}" -c "assert 1 == 2"'),
+            say("Found it: the assertion fails."),
+        )
+        self.assertEqual(answer, "Found it: the assertion fails.")
+        self.assertEqual(len(script.requests["engineer"]), 2)
+
+    def test_an_earlier_failing_check_is_named_as_the_reason(self):
+        _, answer = self.delegate(
+            use("exec", command=f'"{sys.executable}" -c "import app; assert app.answer == 42"'),
+            use("write", path="app.py", content="answer = 42\n"),
+            use("exec", command=f'"{sys.executable}" -c "import app; assert app.answer"'),
+            say("Fixed."),
+            say("Fixed; the second check passed."),
+        )
+        self.assertIn("a check it ran failed and was not rerun successfully", answer)
+        self.assertNotIn("no passing standalone check", answer)
+
+    def test_a_finished_answer_survives_a_failed_follow_up_request(self):
+        self.define("tight", limits={"token_budget_per_agent": 1000})
+        small = {"prompt_tokens": 100, "completion_tokens": 10}
+        usage = {"prompt_tokens": 2000, "completion_tokens": 10}
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Fix app.py"),
+                team("wait", timeout=30),
+                lambda messages, tools: say(last_tool(messages)["data"]["items"][0]["content"]),
+            ),
+            engineer=Steps(
+                {
+                    **use("write", path="app.py", content="answer = 42\n"),
+                    LOCAL_METADATA: {"usage": small},
+                },
+                # The nudge's follow-up request finds the budget spent.
+                {**say("Fixed app.py."), LOCAL_METADATA: {"usage": usage}},
+            ),
+        )
+        answer = self.ask(self.team_conversation(script, "tight"), "Fix app.py with the team")
+        self.assertTrue(answer.startswith("Fixed app.py."), answer)
+        self.assertIn("no passing standalone check followed its last edit", answer)
+        self.assertEqual(len(script.requests["engineer"]), 2)
+
+    def test_members_without_exec_and_data_files_need_no_check(self):
+        self.define(
+            "writers",
+            agents={
+                **self.members,
+                "writer": {
+                    "description": "Writes pages.",
+                    "instructions": "You write.",
+                    "tools": ["read", "write", "edit"],
+                },
+            },
+        )
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["writer", "engineer"], kind="request", content="Go"),
+                team("wait", timeout=30),
+                lambda messages, tools: (
+                    say("done")
+                    if sum(item["type"] == "reply" for item in arrived(messages)) >= 2
+                    else team("wait", timeout=30)
+                ),
+                say("done"),
+            ),
+            writer=Steps(
+                use("write", path="report.html", content="<p>report</p>\n"), say("Wrote it.")
+            ),
+            engineer=Steps(
+                use("write", path="results.json", content="{}\n"), say("Saved results.")
+            ),
+        )
+        self.ask(self.team_conversation(script, "writers"))
+        self.assertNotIn("[runtime]", script.seen("main"))
+        self.assertEqual(len(script.requests["writer"]), 2)
+        self.assertEqual(len(script.requests["engineer"]), 2)
+        writer = script.requests["writer"][0]["messages"][0]["content"]
+        self.assertNotIn("run a relevant standalone check", writer)
 
 
 class AcceptanceAttributionTests(TeamTestCase):

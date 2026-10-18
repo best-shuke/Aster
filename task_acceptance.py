@@ -23,9 +23,12 @@ INABILITY = re.compile(
 )
 NEEDS_USER = re.compile(r"需要你.{0,20}(?:提供|确认)|\bneed your clarification\b", re.I)
 # The user lets the agent answer while delegated work goes on ("不要等待它完成", "don't wait").
+# 等 must be about waiting for someone or end the clause: not 等宽, 不要等太久 or 区别等.
 HANDOFF = re.compile(
-    r"不(?:要|用|必)等|无需等|别等|后台继续|转入后台"
-    r"|\b(?:don't|do not|no need to) wait\b|\bwithout waiting\b"
+    r"(?:不要|不用|不必|无需|不需要|(?<![区识级类派告辨鉴性组差特分])别)再?等(?:待)?"
+    r"(?:它|他|她|他们|她们|它们|其|成员|团队|队友|大家|结果|了|(?=[，。！？、；,.!?;\s]|$))"
+    r"|后台继续|转入后台"
+    r"|\b(?:don['’]?t|do not|no need to) wait\b|\bwithout waiting\b"
     r"|\b(?:keep working|continue|carry on) in the background\b",
     re.I,
 )
@@ -82,6 +85,8 @@ class TaskAcceptance:
     deadline: float | None = None
     # Other agents (team members) whose limitations the answer may report.
     others: tuple[str, ...] = ()
+    # Suffixes of files whose own edits need a check.
+    suffixes: frozenset[str] = SOURCE_SUFFIXES
 
     def __post_init__(self):
         self.kind = self.contract.kind
@@ -196,6 +201,8 @@ class TaskAcceptance:
 
     @staticmethod
     def verification_command(command):
+        if not isinstance(command, str):
+            return False
         try:
             words = shlex.split(command)
         except ValueError:
@@ -222,8 +229,9 @@ class TaskAcceptance:
                 and words[2] in {"unittest", "pytest", "compileall"}
             )
         if executable == "node":
-            # The built-in test runner and syntax check; plain scripts are not checks.
-            return len(words) > 1 and words[1] in {"--test", "--check", "-c"}
+            # The test runner or syntax check of named files: bare forms pass with nothing
+            # to check (no test files, empty stdin). Plain scripts are not checks.
+            return len(words) > 2 and words[1] in {"--test", "--check", "-c"}
         return executable in {"npm", "pnpm", "yarn", "bun", "cargo", "go", "make", "cmake"} and any(
             word in {"test", "check", "build", "lint", "typecheck", "--build"} for word in words[1:]
         )
@@ -237,6 +245,12 @@ class TaskAcceptance:
             arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}
+        # A malformed call (e.g. a command given as a list) is no edit and no check.
+        arguments = {
+            key: value
+            for key, value in arguments.items()
+            if key not in {"command", "path", "cwd"} or isinstance(value, str)
+        }
         record = {
             "tool_call_id": call.get("id"),
             "tool": function.get("name"),
@@ -249,7 +263,7 @@ class TaskAcceptance:
             result.get("status") == "ok"
             and function.get("name") in {"write", "edit"}
             and (
-                Path(arguments.get("path", "")).suffix.lower() in SOURCE_SUFFIXES
+                Path(arguments.get("path", "")).suffix.lower() in self.suffixes
                 or Path(arguments.get("path", "")).name in SOURCE_NAMES
             )
         )
@@ -326,6 +340,8 @@ class TaskAcceptance:
         None when the command cannot be lexed (e.g. a quote inside a shell comment), so
         its composition is unknown.
         """
+        if not isinstance(command, str):
+            return None
         lexer = shlex.shlex(command.strip(), posix=True, punctuation_chars=";&|<>\n")
         lexer.whitespace = " \t\r"
         lexer.commenters = ""
@@ -452,11 +468,15 @@ class TaskAcceptance:
         self.status = "completed"
         return None
 
-    def verification_problem(self):
-        """What leaves the latest code revision unverified, or None."""
+    def verification_problem(self, *, monitored=True):
+        """What leaves the latest code revision unverified, or None.
+
+        Without ``monitored`` (no monitor tool) a background check can never report its
+        result, so it counts as no check at all.
+        """
         if self.failed_verifications:
             return "Verification failed and remains unresolved. Rerun the failed check successfully, or explicitly report the concrete validation blocker."
-        if self.pending_verifications:
+        if self.pending_verifications and monitored:
             return "Background verification is still running. Use monitor to observe its final result before reporting completion."
         if (
             self.code_revision > 0

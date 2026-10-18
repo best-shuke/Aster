@@ -761,7 +761,11 @@ class Conversation:
                     return problem
             background = False
             if self.team is not None:
-                problem = self.team.final_answer_problem(handoff=acceptance.handoff_allowed)
+                # Hold at most once per run of rejected answers: TaskRuntime fails the turn
+                # after a few in a row. A tool call in between ends the run.
+                problem = self.team.final_answer_problem(
+                    handoff=acceptance.handoff_allowed or runtime.protocol_repairs > 0
+                )
                 if problem:
                     return problem
                 # Members' unfinished edits are verified when their work is done, not now.

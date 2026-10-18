@@ -256,16 +256,19 @@ def member_instructions(runtime: "TeamRuntime", spec, skills_section: str) -> st
     environment = runtime.environment
     limits = runtime.limits
     persona = spec.instructions or spec.description
+    tools = runtime.member_tool_names(spec)
     editing = (
         "- Teammates may edit the same files. An edit or write based on your earlier read merges "
         'with their non-overlapping changes (the result then says "merged"); on file_changed, '
         "read the file again and reapply your change.\n"
-        "- After changing code, run a relevant standalone check (test, build or assertion, "
-        "each in its own exec call) before you finish, and report the command and result; if "
-        "you cannot run one, say so and ask a teammate who can.\n"
-        if {"write", "edit"} & runtime.member_tool_names(spec)
+        if {"write", "edit"} & tools
         else ""
     )
+    if editing and "exec" in tools:
+        editing += (
+            "- After changing code, run a relevant standalone check (test, build or assertion, "
+            "each in its own exec call) before you finish, and report the command and result.\n"
+        )
     return f"""{persona}
 
 You are "{spec.name}", an independent agent in the "{environment.entry.name}" team environment. Your role: {spec.description or spec.name}.

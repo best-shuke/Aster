@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from environment_spec import AgentSpec, format_limit, limit_reached, parse_agent
 from skills import SkillCatalog, skill_block
+from task_runtime import finalization_reserve
 from team_protocols import ProtocolEngine
 from team_state import (
     MAIN,
@@ -126,9 +127,12 @@ class TeamRuntime:
         self.activations: dict[str, Activation] = {}
         self.accepting = False
         self.turn_deadline = float("inf")
+        # The end of the turn in which main must answer rather than wait.
+        self.turn_reserve = 0.0
         self.nudges = 0
-        # Whether this turn started with work left by an earlier turn (background or paused).
-        self.inherited_work = False
+        # Work an earlier turn left (background or paused): activation ids and queued members.
+        self.inherited_activations: set[str] = set()
+        self.inherited_queue: set[str] = set()
         self.notices: list[str] = []
         self.main_origin = MainOrigin()
         self._titles: dict[str, str] = {}
@@ -265,6 +269,7 @@ class TeamRuntime:
             self._end_background("resumed")
             self.accepting = True
             self.turn_deadline = deadline
+            self.turn_reserve = finalization_reserve(self.settings, deadline)
             self.turn_background = background
             self.went_background = False
             self.nudges = 0
@@ -282,8 +287,8 @@ class TeamRuntime:
                     record["status"] = "idle"
             self._event("turn_started", MAIN, turn=data["turn"]["number"])
             self._drain()
-            summary = self._summary()
-            self.inherited_work = bool(summary["working"] or summary["queued"])
+            self.inherited_activations = {item.id for item in self.activations.values()}
+            self.inherited_queue = set(self._summary()["queued"])
             self._persist()
 
     def end_turn(self, *, interrupted: bool = False) -> int:
@@ -1565,26 +1570,32 @@ class TeamRuntime:
         """Why main may not give its final answer yet, or None.
 
         Without ``handoff`` (the user did not ask main to leave work running) main waits
-        for the work it started this turn, so it can check the result it reports. Otherwise,
-        and for work an earlier turn left, it is held once and may then answer anyway.
+        for work started this turn, so it can check the result it reports, except in the
+        turn's final reserve, where it must answer. Otherwise, and for work an earlier turn
+        left, it is held once and may then answer anyway.
         """
         with self.lock:
             if self.state is None:
                 return None
-            hold = not handoff and not self.inherited_work
-            if self.nudges >= 1 and not hold:
-                return None
             summary = self._summary()
             if not summary["working"] and not summary["queued"]:
+                return None
+            hold = (
+                not handoff
+                and self.turn_deadline - time.monotonic() > self.turn_reserve
+                and self._fresh_work(summary)
+            )
+            if self.nudges >= 1 and not hold:
                 return None
             self.nudges += 1
             working = ", ".join(summary["working"] + summary["queued"])
             if hold:
                 return (
-                    f"Team members are still working ({working}). Call team action=wait until "
-                    "they finish, check the integrated result, then answer; or team "
-                    "action=cancel to stop work you no longer need. The user did not ask you to "
-                    "leave this work running."
+                    f"Team members are still working ({working}) on work started this turn, "
+                    "and the user did not ask you to leave it running. Call team action=wait "
+                    "until they finish, check the integrated result, then answer. "
+                    "update_task status=cancelled drops a task you no longer need; team "
+                    "action=cancel stops all team work."
                 )
             if self._may_continue():
                 return (
@@ -1599,6 +1610,12 @@ class TeamRuntime:
                 "their results, or team action=cancel to stop them, before giving your final "
                 "answer."
             )
+
+    def _fresh_work(self, summary: dict) -> bool:
+        """Whether work started this turn is still running or queued (lock held)."""
+        return any(
+            item.id not in self.inherited_activations for item in self.activations.values()
+        ) or any(name not in self.inherited_queue for name in summary["queued"])
 
     def _may_continue(self) -> bool:
         """Whether work left when this turn ends may continue in the background."""

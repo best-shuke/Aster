@@ -139,17 +139,36 @@ class TaskAcceptanceTests(unittest.TestCase):
         self.assertFalse(self.acceptance.verification_command("ruff --version"))
 
     def test_node_test_runner_and_syntax_check_are_verification(self):
-        for command in (
-            "node --test",
-            "node --test tests/",
-            "node --check game.js",
-            "node -c a.js",
-        ):
+        for command in ("node --test tests/", "node --check game.js", "node -c a.js"):
             with self.subTest(command=command):
                 self.assertTrue(self.acceptance.verification_command(command))
-        for command in ("node game.js", "node -e \"console.log('ok')\"", "node --version"):
+        # Bare forms pass with nothing to check: no test files, or empty stdin.
+        for command in (
+            "node --test",
+            "node --check",
+            "node game.js",
+            "node -e \"console.log('ok')\"",
+            "node --version",
+        ):
             with self.subTest(command=command):
                 self.assertFalse(self.acceptance.verification_command(command))
+
+    def test_a_malformed_command_is_no_check_and_does_not_fail(self):
+        command = [sys.executable, "-m", "unittest"]
+        self.acceptance.observe(call("exec", {"command": command}), {"status": "error"})
+        self.acceptance.observe(call("write", {"path": ["app.py"]}), {"status": "ok"})
+        self.assertFalse(self.acceptance.verification_command(command))
+        self.assertIsNone(TaskAcceptance.shell_segments(command))
+        self.assertEqual(self.acceptance.last_own_edit, -1)
+
+    def test_a_background_check_without_monitor_is_no_check(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.execute("exec", {**self.command("assert True"), "background": True, "timeout": 30})
+        self.assertIn("monitor", self.acceptance.verification_problem())
+        self.assertIn(
+            "no successful verification",
+            self.acceptance.verification_problem(monitored=False),
+        )
 
     def test_user_edit_after_verification_requires_reverification(self):
         self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
@@ -282,6 +301,10 @@ class HandoffTests(unittest.TestCase):
             "让团队去做，不用等结果",
             "Build it with the team, don't wait for them",
             "Let the members continue in the background",
+            "不需要等待他们完成，先回复我",
+            "先回复我，不用等",
+            "Don’t wait for the team",
+            "dont wait for them",
         ):
             with self.subTest(prompt=prompt):
                 self.assertTrue(TaskAcceptance(prompt).handoff_allowed)
@@ -290,6 +313,10 @@ class HandoffTests(unittest.TestCase):
             "生成一个后台管理系统",
             "Build a gomoku web page",
             "Start the dev server in the background and test the page",
+            "做一个支持人脸识别等功能的网页",
+            "解释 TCP 和 UDP 的区别等。",
+            "代码块不用等宽字体",
+            "实现一个游戏，玩家不要等太久才能出牌",
         ):
             with self.subTest(prompt=prompt):
                 self.assertFalse(TaskAcceptance(prompt).handoff_allowed)
