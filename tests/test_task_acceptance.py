@@ -138,6 +138,38 @@ class TaskAcceptanceTests(unittest.TestCase):
         self.assertFalse(self.acceptance.verification_command("pytest --collect-only"))
         self.assertFalse(self.acceptance.verification_command("ruff --version"))
 
+    def test_node_test_runner_and_syntax_check_are_verification(self):
+        for command in ("node --test tests/", "node --check game.js", "node -c a.js"):
+            with self.subTest(command=command):
+                self.assertTrue(self.acceptance.verification_command(command))
+        # Bare forms pass with nothing to check: no test files, or empty stdin.
+        for command in (
+            "node --test",
+            "node --check",
+            "node game.js",
+            "node -e \"console.log('ok')\"",
+            "node --version",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(self.acceptance.verification_command(command))
+
+    def test_a_malformed_command_is_no_check_and_does_not_fail(self):
+        command = [sys.executable, "-m", "unittest"]
+        self.acceptance.observe(call("exec", {"command": command}), {"status": "error"})
+        self.acceptance.observe(call("write", {"path": ["app.py"]}), {"status": "ok"})
+        self.assertFalse(self.acceptance.verification_command(command))
+        self.assertIsNone(TaskAcceptance.shell_segments(command))
+        self.assertEqual(self.acceptance.last_own_edit, -1)
+
+    def test_a_background_check_without_monitor_is_no_check(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.execute("exec", {**self.command("assert True"), "background": True, "timeout": 30})
+        self.assertIn("monitor", self.acceptance.verification_problem())
+        self.assertIn(
+            "no successful verification",
+            self.acceptance.verification_problem(monitored=False),
+        )
+
     def test_user_edit_after_verification_requires_reverification(self):
         self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
         self.execute("exec", self.command("assert True"))
@@ -260,6 +292,61 @@ class TaskAcceptanceTests(unittest.TestCase):
         for command in ("pytest 2>&1", "pytest >&2", "pytest &>log", "pytest > out 2>&1"):
             with self.subTest(command=command):
                 self.assertEqual(len(TaskAcceptance.shell_segments(command)), 1)
+
+
+class TaskKindTests(unittest.TestCase):
+    def test_research_and_writing_that_mention_implementations_are_no_code_change(self):
+        for prompt in (
+            "调研 RAG 的主流实现方案并写一份报告",
+            "比较三篇论文提出的方法在实现上的差异，整理成文献综述",
+            "帮我调研一下新增的欧盟 AI 法案条款对初创公司的影响",
+            "Research how vector databases implement HNSW and write a report",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(TaskAcceptance(prompt).kind, "answer")
+
+    def test_code_requests_still_need_verification(self):
+        for prompt in (
+            "修复 stats.py 的测试失败",
+            "实现一个 LRU 缓存并加测试",
+            "fix the bug in report.py",
+            "implement the researcher_tool module",
+            "fix the survey form validation bug",
+            "修复论文管理系统的登录 bug",
+            "实现一个文献检索的 API 并加测试",
+            "撰写单元测试并修复 utils.py 的 bug",
+            "implement the research dashboard page",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(TaskAcceptance(prompt).kind, "change")
+
+
+class HandoffTests(unittest.TestCase):
+    def test_only_an_explicit_request_lets_delegated_work_run_on(self):
+        for prompt in (
+            "修复 app.py：交给 engineer，不要等待它完成",
+            "让团队去做，不用等结果",
+            "Build it with the team, don't wait for them",
+            "Let the members continue in the background",
+            "不需要等待他们完成，先回复我",
+            "先回复我，不用等",
+            "Don’t wait for the team",
+            "dont wait for them",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertTrue(TaskAcceptance(prompt).handoff_allowed)
+        for prompt in (
+            "做一个五子棋网页",
+            "生成一个后台管理系统",
+            "Build a gomoku web page",
+            "Start the dev server in the background and test the page",
+            "做一个支持人脸识别等功能的网页",
+            "解释 TCP 和 UDP 的区别等。",
+            "代码块不用等宽字体",
+            "实现一个游戏，玩家不要等太久才能出牌",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(TaskAcceptance(prompt).handoff_allowed)
 
 
 class BlockerAttributionTests(unittest.TestCase):

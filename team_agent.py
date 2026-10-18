@@ -3,8 +3,11 @@
 Each member has its own model client, private context and tool set. Its tools are the
 environment's tools intersected with its own declaration; its MCP scope is the
 environment's scope intersected with its own; its skills are the environment's active
-skills it declares. Activations reuse the main agent's TaskRuntime for generation,
-compaction, recovery, deadlines and cancellation.
+skills it declares. Its system prompt starts with the environment's working rules, the
+same ones main and delegate workers follow. Activations reuse the main agent's
+TaskRuntime for generation, compaction, recovery, deadlines and cancellation, and a
+member that can run commands and changes code is asked once to check its change before
+it finishes.
 """
 
 import json
@@ -13,12 +16,15 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from client_runtime import fork_client
+from config import system_prompt
 from context_budget import LOCAL_METADATA, estimate_tokens
 from deepseek_client import CompletionError
 from environment_spec import MEMBER_DEFAULT_TOOLS, MEMBER_EXCLUDED, TEAM_TOOL, AgentSpec
 from execution_trace import TraceContext, trace_scope
+from file_state import CODE_SUFFIXES
 from mcp_scope import McpScope, ScopedMcp
 from skills import skills_prompt_section
+from task_acceptance import TaskAcceptance, TaskContract
 from task_runtime import TaskRuntime
 from team_state import TeamError
 from team_tools import TeamTool, member_instructions
@@ -31,6 +37,17 @@ if TYPE_CHECKING:
 
 # Tools that are registered on demand rather than inherited from the main registry.
 ATTACHED = frozenset({"mcp", "delegate", TEAM_TOOL})
+# Shared rules first, then the member's own: the shared ones were written for main.
+MEMBER_RULES = (
+    "The rules above are shared by the whole team. You are a member, not main: report to "
+    "the teammate or main who asked, ask main for user decisions, and skip guidance about "
+    "tools you do not have.\n\n"
+)
+UNVERIFIED_NUDGE = (
+    "[runtime] You changed code in this activation, but the change is not verified yet. "
+    "{problem} Your next final message replaces the one above, so make it complete."
+)
+UNVERIFIED_NOTE = "\n\n[runtime] {name} changed code in this activation; {reason}."
 
 
 def allowed_tools(runtime: "TeamRuntime", spec: AgentSpec) -> frozenset[str]:
@@ -152,7 +169,15 @@ class MemberAgent:
             "Skills granted to you. Load one with team action=load_skill name=<skill> "
             "before acting on it.",
         )
-        prompt = member_instructions(runtime, spec, section)
+        names = tuple(item["function"]["name"] for item in self.tools.definitions)
+        # The environment's rules come first: a prefix shared with main's prompt.
+        prompt = system_prompt(
+            settings.workspace,
+            settings.prompt_file,
+            names,
+            instructions=runtime.environment.prompt_text,
+        )
+        prompt += MEMBER_RULES + member_instructions(runtime, spec, section)
         if self.tools.definitions:
             prompt += "\n\n" + self.tools.environment_instructions()
         self.system = {"role": "system", "content": prompt}
@@ -193,6 +218,8 @@ class MemberAgent:
             else nullcontext()
         )
         self.team_tool.activation = activation
+        # The complete answer a self-check nudge set aside, delivered if the rest fails.
+        self.set_aside = None
         messages = runtime.context_messages(name)
         repair_incomplete(messages)
         messages.append({"role": "user", "content": runtime.render_activation(activation)})
@@ -204,6 +231,8 @@ class MemberAgent:
         except (TimeoutError, CompletionError) as exc:
             if activation.cancelled.is_set():
                 return self.Result("cancelled")
+            if self.set_aside is not None:
+                return self.Result("ok", self.set_aside)
             code = getattr(exc, "code", "deadline_exceeded")
             status = {"budget_exhausted": "budget", "task_deadline": "timeout"}.get(code, "error")
             if isinstance(exc, TimeoutError):
@@ -212,6 +241,8 @@ class MemberAgent:
         except Exception as exc:
             if activation.cancelled.is_set():
                 return self.Result("cancelled")
+            if self.set_aside is not None:
+                return self.Result("ok", self.set_aside)
             return self.Result("error", error=f"{type(exc).__name__}: {exc}")
         finally:
             self.team_tool.activation = None
@@ -228,6 +259,10 @@ class MemberAgent:
             check_active=execution.remaining,
             cancelled=activation.cancelled,
         )
+        # Tracks only this member's own code edits and checks, not its teammates' changes.
+        # Without exec it cannot run a check, so nothing is asked or noted.
+        acceptance = TaskAcceptance("", TaskContract(kind="change"), suffixes=CODE_SUFFIXES)
+        checks = "exec" in self.tools.registry
 
         def model_progress(event):
             phase = event.get("phase")
@@ -246,9 +281,31 @@ class MemberAgent:
             runtime.save_context(name, messages)
             calls = response.get("tool_calls") or []
             if not calls:
-                return self.Result("ok", response.get("content") or "")
+                final = response.get("content") or ""
+                problem = (
+                    acceptance.verification_problem(monitored=False)
+                    if checks and acceptance.code_revision
+                    else None
+                )
+                if not problem:
+                    return self.Result("ok", final)
+                reason = (
+                    "a check it ran failed and was not rerun successfully"
+                    if acceptance.failed_verifications
+                    else "no passing standalone check followed its last edit"
+                )
+                final += UNVERIFIED_NOTE.format(name=name, reason=reason)
+                if self.set_aside is not None:
+                    return self.Result("ok", final)
+                self.set_aside = final
+                messages.append(
+                    {"role": "user", "content": UNVERIFIED_NUDGE.format(problem=problem)}
+                )
+                runtime.save_context(name, messages)
+                continue
             for call in calls:
                 execution.remaining()
+                acceptance.before_tool(call)
                 function = call.get("function", {})
                 try:
                     arguments = json.loads(function.get("arguments") or "{}")
@@ -275,6 +332,7 @@ class MemberAgent:
                 )
                 runtime.save_context(name, messages)
                 decoded = json.loads(output)
+                acceptance.observe(call, decoded)
                 with trace_scope(execution.trace):
                     task_runtime.progress.observe(call, decoded)
                 runtime.progress(

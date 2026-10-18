@@ -236,9 +236,21 @@ class LimitEditingTests(EditorTestCase):
         self.editor.create("crew", template="multi-agent")
         before = (self.user / "crew.json").read_text()
         for assignment in ("max_concurrent_agents=unlimited", "max_agents=unlimited"):
-            with self.subTest(assignment=assignment), self.assertRaises(ValueError):
+            with (
+                self.subTest(assignment=assignment),
+                self.assertRaisesRegex(ValueError, "不能设为 unlimited"),
+            ):
                 self.editor.set_limits("crew", [assignment])
         self.assertEqual((self.user / "crew.json").read_text(), before)
+
+    def test_keywords_are_case_insensitive(self):
+        self.editor.create("crew", template="multi-agent")
+        result = self.editor.set_limits("crew", ["token_budget_per_agent=Unlimited"])
+        limits = json.loads(result.entry.path.read_text())["limits"]
+        self.assertIsNone(limits["token_budget_per_agent"])
+        result = self.editor.set_limits("crew", ["token_budget_per_agent=DEFAULT"])
+        limits = json.loads(result.entry.path.read_text()).get("limits", {})
+        self.assertNotIn("token_budget_per_agent", limits)
 
 
 class TrustCarryOverTests(EditorTestCase):

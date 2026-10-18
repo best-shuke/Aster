@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from config import BUILTIN_TEMPLATES_DIR
-from environment_spec import LIMIT_RANGES, MEMBER_DEFAULT_TOOLS, parse_kind
+from environment_spec import LIMIT_RANGES, MEMBER_DEFAULT_TOOLS, UNLIMITED_LIMITS, parse_kind
 from environments import (
     NAME,
     RESERVED,
@@ -324,11 +324,19 @@ class EnvironmentEditor:
         for item in assignments:
             key, separator, raw = item.partition("=")
             if not separator or key not in LIMIT_RANGES:
-                raise ValueError(f"用法：/env limits 键=整数|unlimited|default；可设置：{', '.join(LIMIT_RANGES)}")
-            if raw == "default":
+                raise ValueError(
+                    f"用法：/env limits 键=整数|unlimited|default；可设置：{', '.join(LIMIT_RANGES)}"
+                )
+            word = raw.strip().lower()
+            if word == "default":
                 values[key] = reset
                 continue
-            if raw.lower() in {"unlimited", "none", "null"}:
+            if word in {"unlimited", "none", "null"}:
+                if key not in UNLIMITED_LIMITS:
+                    raise ValueError(
+                        f"limits.{key} 不能设为 unlimited，需要整数；"
+                        f"可设为 unlimited 的项：{', '.join(sorted(UNLIMITED_LIMITS))}"
+                    )
                 values[key] = None
                 continue
             try:

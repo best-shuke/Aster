@@ -267,6 +267,14 @@ class TaskProgress:
         )
 
 
+def finalization_reserve(settings, deadline: float) -> float:
+    """Seconds before ``deadline`` in which a task stops working and gives its answer."""
+    return min(
+        getattr(settings, "finalization_reserve_seconds", 120),
+        max(0, deadline - time.monotonic()) * 0.15,
+    )
+
+
 class TaskRuntime:
     def __init__(
         self,
@@ -291,10 +299,7 @@ class TaskRuntime:
         self.requests = 0
         self.summary_requests = 0
         self.protocol_repairs = 0
-        self.reserve = min(
-            getattr(settings, "finalization_reserve_seconds", 120),
-            max(0, deadline - time.monotonic()) * 0.15,
-        )
+        self.reserve = finalization_reserve(settings, deadline)
         self.finalizing = False
         self._last_progress = ""
         self._rate_limit_streak = 0

@@ -22,6 +22,16 @@ INABILITY = re.compile(
     re.I,
 )
 NEEDS_USER = re.compile(r"需要你.{0,20}(?:提供|确认)|\bneed your clarification\b", re.I)
+# The user lets the agent answer while delegated work goes on ("不要等待它完成", "don't wait").
+# 等 must be about waiting for someone or end the clause: not 等宽, 不要等太久 or 区别等.
+HANDOFF = re.compile(
+    r"(?:不要|不用|不必|无需|不需要|(?<![区识级类派告辨鉴性组差特分])别)再?等(?:待)?"
+    r"(?:它|他|她|他们|她们|它们|其|成员|团队|队友|大家|结果|了|(?=[，。！？、；,.!?;\s]|$))"
+    r"|后台继续|转入后台"
+    r"|\b(?:don['’]?t|do not|no need to) wait\b|\bwithout waiting\b"
+    r"|\b(?:keep working|continue|carry on) in the background\b",
+    re.I,
+)
 UNTRUSTED_CHECK = "Run the check as a standalone command; shell composition may hide failures."
 # Quoted and code text reports what something said or contains, not the agent's own state.
 QUOTED = re.compile(r"```.*?```|`[^`\n]*`|“[^”]*”|「[^」]*」|‘[^’]*’|\"[^\"\n]{0,300}\"", re.S)
@@ -75,6 +85,8 @@ class TaskAcceptance:
     deadline: float | None = None
     # Other agents (team members) whose limitations the answer may report.
     others: tuple[str, ...] = ()
+    # Suffixes of files whose own edits need a check.
+    suffixes: frozenset[str] = SOURCE_SUFFIXES
 
     def __post_init__(self):
         self.kind = self.contract.kind
@@ -87,11 +99,32 @@ class TaskAcceptance:
                 re.I,
             )
             discussion = re.search(
-                r"分析|解释|怎么|如何|计划|不要修改|翻译|复述|引用|\b(?:explain|analy[sz]e|how to|review|plan|translate|quote)\b",
+                r"分析|解释|怎么|如何|计划|不要修改|翻译|复述|引用"
+                r"|\b(?:explain|analy[sz]e|how to|review|plan|translate|quote)\b",
                 self.prompt,
                 re.I,
             )
-            self.kind = "change" if self.has_tools and action and not discussion else "answer"
+            # Research and writing deliverables are no code change even when their topic
+            # mentions one ("调研 RAG 的实现方案并写一份报告"), unless the prompt also names
+            # code work ("修复论文管理系统的登录 bug").
+            writing = re.search(
+                r"调研|综述|文献|论文|撰写|研究报告|写.{0,8}(?:报告|文章|综述)"
+                r"|\b(?:research|survey|literature|essay|write (?:a|an|the) report)\b",
+                self.prompt,
+                re.I,
+            ) and not re.search(
+                r"修复|修一下|重构|bug|测试|代码|接口|函数|模块|页面|网页|脚本"
+                r"|\b(?:fix|refactor|tests?|code|api|page|module|function|class|endpoint|script)\b"
+                r"|\.(?:py|js|ts|tsx|jsx|go|rs|java|html|css)\b",
+                self.prompt,
+                re.I,
+            )
+            self.kind = (
+                "change"
+                if self.has_tools and action and not discussion and not writing
+                else "answer"
+            )
+        self.handoff_allowed = bool(HANDOFF.search(self.prompt))
         self.status = "in_progress"
         self.evidence = []
         self.check_results = []
@@ -188,6 +221,8 @@ class TaskAcceptance:
 
     @staticmethod
     def verification_command(command):
+        if not isinstance(command, str):
+            return False
         try:
             words = shlex.split(command)
         except ValueError:
@@ -213,6 +248,10 @@ class TaskAcceptance:
                 and words[1] == "-m"
                 and words[2] in {"unittest", "pytest", "compileall"}
             )
+        if executable == "node":
+            # The test runner or syntax check of named files: bare forms pass with nothing
+            # to check (no test files, empty stdin). Plain scripts are not checks.
+            return len(words) > 2 and words[1] in {"--test", "--check", "-c"}
         return executable in {"npm", "pnpm", "yarn", "bun", "cargo", "go", "make", "cmake"} and any(
             word in {"test", "check", "build", "lint", "typecheck", "--build"} for word in words[1:]
         )
@@ -226,6 +265,12 @@ class TaskAcceptance:
             arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}
+        # A malformed call (e.g. a command given as a list) is no edit and no check.
+        arguments = {
+            key: value
+            for key, value in arguments.items()
+            if key not in {"command", "path", "cwd"} or isinstance(value, str)
+        }
         record = {
             "tool_call_id": call.get("id"),
             "tool": function.get("name"),
@@ -238,7 +283,7 @@ class TaskAcceptance:
             result.get("status") == "ok"
             and function.get("name") in {"write", "edit"}
             and (
-                Path(arguments.get("path", "")).suffix.lower() in SOURCE_SUFFIXES
+                Path(arguments.get("path", "")).suffix.lower() in self.suffixes
                 or Path(arguments.get("path", "")).name in SOURCE_NAMES
             )
         )
@@ -315,6 +360,8 @@ class TaskAcceptance:
         None when the command cannot be lexed (e.g. a quote inside a shell comment), so
         its composition is unknown.
         """
+        if not isinstance(command, str):
+            return None
         lexer = shlex.shlex(command.strip(), posix=True, punctuation_chars=";&|<>\n")
         lexer.whitespace = " \t\r"
         lexer.commenters = ""
@@ -419,27 +466,10 @@ class TaskAcceptance:
                 "Cannot verify the final code revision because file tracking failed: "
                 + self._tracking_error
             )
-        if self.kind == "change" and self.failed_verifications:
-            return "Verification failed and remains unresolved. Rerun the failed check successfully, or explicitly report the concrete validation blocker."
-        if self.kind == "change" and self.pending_verifications:
-            return "Background verification is still running. Use monitor to observe its final result before reporting completion."
-        if (
-            self.kind == "change"
-            and self.code_revision > 0
-            and self.verified_revision != self.code_revision
-            and not self.contract.checks
-        ):
-            if any(
-                record.get("verification_untrusted")
-                for record in self.evidence[max(self.last_code_change, 0) :]
-            ):
-                return (
-                    "Code was changed but no successful verification followed the last edit: "
-                    "the check you ran was not counted because it was combined with other shell "
-                    "commands (&&, ;, |, newlines), which can hide a failure. Run the check alone "
-                    "in its own exec call, with the cwd argument instead of cd."
-                )
-            return "Code was changed but no successful verification followed the last edit. Run a relevant standalone test/build/assertion, or explicitly report why validation is blocked."
+        if self.kind == "change":
+            problem = self.verification_problem()
+            if problem:
+                return problem
         self.check_results = []
         for check in self.contract.checks:
             try:
@@ -456,6 +486,34 @@ class TaskAcceptance:
             if problem:
                 return "Task acceptance failed: " + problem
         self.status = "completed"
+        return None
+
+    def verification_problem(self, *, monitored=True):
+        """What leaves the latest code revision unverified, or None.
+
+        Without ``monitored`` (no monitor tool) a background check can never report its
+        result, so it counts as no check at all.
+        """
+        if self.failed_verifications:
+            return "Verification failed and remains unresolved. Rerun the failed check successfully, or explicitly report the concrete validation blocker."
+        if self.pending_verifications and monitored:
+            return "Background verification is still running. Use monitor to observe its final result before reporting completion."
+        if (
+            self.code_revision > 0
+            and self.verified_revision != self.code_revision
+            and not self.contract.checks
+        ):
+            if any(
+                record.get("verification_untrusted")
+                for record in self.evidence[max(self.last_code_change, 0) :]
+            ):
+                return (
+                    "Code was changed but no successful verification followed the last edit: "
+                    "the check you ran was not counted because it was combined with other shell "
+                    "commands (&&, ;, |, newlines), which can hide a failure. Run the check alone "
+                    "in its own exec call, with the cwd argument instead of cd."
+                )
+            return "Code was changed but no successful verification followed the last edit. Run a relevant standalone test/build/assertion, or explicitly report why validation is blocked."
         return None
 
     def outcome(self):

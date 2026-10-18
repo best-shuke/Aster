@@ -94,6 +94,12 @@ class ToolReliabilityTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "invalid_arguments")
         self.assertIn("URL", result["error"]["message"])
 
+    def test_binary_read_says_how_to_extract_text(self):
+        (self.root / "paper.pdf").write_bytes(b"%PDF-1.4\n\xe2\x28\xa1\x00\xff")
+        result = self.execute("read", {"path": "paper.pdf"})
+        self.assertEqual(result["error"]["code"], "not_text")
+        self.assertIn("pdftotext", result["error"]["message"])
+
     def test_oversized_regex_reports_a_recovery_method(self):
         (self.root / "sample.txt").write_text("needle\n")
         result = self.execute("grep", {"pattern": "^.{0,1000000}needle"})
