@@ -1,10 +1,12 @@
 """Shared tool contracts, validation, deadlines, and durable output storage."""
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,8 +15,30 @@ from uuid import uuid4
 from contracts import ErrorDetails, ProgressCallback, ToolDefinition, ToolResultPayload
 from execution_trace import EventSink, TraceContext, current_sink, current_trace
 
-MAX_RESULT_CHARS = 12_000
+MAX_RESULT_CHARS = 24_000
+# Worker reports are the product of many model requests: give them more room.
+DELEGATE_RESULT_CHARS = 48_000
 PAGE_CHARS = 6_000
+# A read page is bounded so that even with JSON escaping it fits one result.
+READ_PAGE_CHARS = 16_000
+# Shrinking an oversized result never cuts a value below this many serialized characters.
+MIN_EXCERPT_CHARS = 400
+OMISSION = "\n[... {count} characters omitted; the full result is saved at artifact_path ...]\n"
+
+
+def command_environment() -> dict[str, str]:
+    """The environment of commands the agent runs.
+
+    Output is unbuffered so progress shows while it runs. Python writes no bytecode
+    caches into the workspace unless the user asks for them: they litter the files the
+    agent is asked to leave unchanged, and a same-size edit within the second of a run
+    could be served from a stale cache.
+    """
+    return {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": os.environ.get("PYTHONDONTWRITEBYTECODE", "1"),
+    }
 
 
 @dataclass
@@ -96,13 +120,22 @@ class ArtifactStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         return self.directory / f"{uuid4().hex}{suffix}"
 
-    def render(self, result: ToolResult) -> str:
+    def render(self, result: ToolResult, limit: int = MAX_RESULT_CHARS) -> str:
         serialized = json.dumps(result.as_dict(), ensure_ascii=False)
-        if len(serialized) <= MAX_RESULT_CHARS:
+        if len(serialized) <= limit:
             return serialized
         # Preserve the entire result before shrinking the envelope. Never cut JSON.
+        # Indented, so that read pages through it by line.
         path = self.new_path(".json")
-        path.write_text(serialized, encoding="utf-8")
+        path.write_text(
+            json.dumps(result.as_dict(), ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        # Keep the structure and as much of every value as fits: only the longest
+        # strings lose their middles, each marked, so the model rarely needs the file.
+        payload = {**result.as_dict(), "truncated": True, "artifact_path": str(path)}
+        shrunk = shrink_to_fit(payload, limit)
+        if shrunk is not None:
+            return shrunk
         summary = ToolResult(
             status=result.status,
             data={"message": "Full result saved to artifact_path. Use read to inspect it."},
@@ -120,6 +153,76 @@ class ArtifactStore:
         return json.dumps(summary.as_dict(), ensure_ascii=False)
 
 
+def excerpt_middle(text: str, limit: int) -> str:
+    """At most ``limit`` characters of text: its head and tail around a marked omission."""
+    if len(text) <= limit:
+        return text
+    kept = max(0, limit - len(OMISSION.format(count=len(text))))
+    marker = OMISSION.format(count=len(text) - kept)
+    head = kept * 2 // 3
+    return text[:head] + marker + text[len(text) - (kept - head) :]
+
+
+def _string_slots(value: Any, slots: list) -> list:
+    """Every string leaf of a JSON value, as (container, key) pairs."""
+    if isinstance(value, dict):
+        items = value.items()
+    elif isinstance(value, list):
+        items = enumerate(value)
+    else:
+        return slots
+    for key, item in items:
+        if isinstance(item, str):
+            slots.append((value, key))
+        else:
+            _string_slots(item, slots)
+    return slots
+
+
+def _water_level(lengths: list[int], needed: int) -> int:
+    """The largest cap whose cutting of longer strings removes ``needed`` characters."""
+    lengths = sorted(lengths, reverse=True)
+    total = 0
+    for count, length in enumerate(lengths, 1):
+        total += length
+        cap = (total - needed) // count
+        following = lengths[count] if count < len(lengths) else 0
+        if cap >= following:
+            return cap
+    return -1
+
+
+def shrink_to_fit(payload: dict[str, Any], limit: int) -> str | None:
+    """The result serialized within ``limit`` by shortening its longest strings, or None.
+
+    Only string values in data and the error message lose their middles; keys, numbers,
+    lists and the envelope stay intact, so the result keeps its meaning. None when that
+    would leave a string shorter than MIN_EXCERPT_CHARS.
+    """
+    payload = deepcopy(payload)
+    slots = _string_slots(payload["data"], [])
+    if isinstance(payload.get("error"), dict) and isinstance(payload["error"].get("message"), str):
+        slots.append((payload["error"], "message"))
+    originals = [container[key] for container, key in slots]
+    # Sizes as serialized: JSON escapes can make a value much longer than its text.
+    sizes = [len(json.dumps(text, ensure_ascii=False)) - 2 for text in originals]
+    serialized = json.dumps(payload, ensure_ascii=False)
+    needed = 0
+    for _attempt in range(8):
+        if len(serialized) <= limit:
+            return serialized
+        # Escapes are not spread evenly; ask for a little more each time.
+        needed += len(serialized) - limit + 64
+        cap = _water_level(sizes, needed)
+        if cap < MIN_EXCERPT_CHARS:
+            return None
+        # Always excerpt the original, so each marker counts what is really omitted.
+        for (container, key), text, size in zip(slots, originals, sizes, strict=True):
+            container[key] = excerpt_middle(text, cap * len(text) // size) if size > cap else text
+        serialized = json.dumps(payload, ensure_ascii=False)
+    return serialized if len(serialized) <= limit else None
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -128,6 +231,8 @@ class ToolSpec:
     required: tuple[str, ...]
     handler: Callable[..., ToolResult]
     read_only: bool = False
+    # Longer results are shrunk to this size; the whole result is saved as an artifact.
+    result_chars: int = MAX_RESULT_CHARS
 
     @property
     def schema(self) -> dict[str, Any]:

@@ -14,7 +14,7 @@ from conversation import Conversation
 from mcp_client import McpManager
 from task_runtime import TaskProgress
 from tests.support import make_settings
-from tool_runtime import ArtifactStore, ExecutionContext, ToolResult
+from tool_runtime import MAX_RESULT_CHARS, ArtifactStore, ExecutionContext, ToolResult
 from tools import CodingTools
 from ui import Console
 
@@ -184,7 +184,7 @@ class ToolReliabilityTests(unittest.TestCase):
     def test_large_result_keeps_cursor_and_error_retryability(self):
         result = ToolResult(
             status="error",
-            data={"large": "x" * 20000},
+            data={"large": "x" * (MAX_RESULT_CHARS + 1000)},
             error={"code": "IO_ERROR", "message": "Cannot save file", "retryable": False},
             next_cursor={"offset": 2},
         )

@@ -51,6 +51,10 @@ from tools import CodingTools, ToolPolicy
 from usage import CacheStats
 from workflows import WorkflowStore
 
+# A standalone rerun of an uncounted check needs this much of the task's time.
+RERUN_MIN_SECONDS = 5
+RERUN_OUTPUT_CHARS = 2_000
+
 
 class Conversation:
     def __init__(
@@ -101,6 +105,7 @@ class Conversation:
         self.tool_runs: list[ToolRun] = []
         self._tool_runs_lock = threading.RLock()
         self._wire_cache = WireCache()
+        self._digest_cache: dict = {}
         self._execution_title = ""
         self._execution_closed = False
         self.recovery_notice = None
@@ -790,6 +795,12 @@ class Conversation:
             ignored_paths=(self.settings.session_file, self.sessions.directory),
             deadline=deadline,
             others=self.team.member_names() if self.team is not None else (),
+            passive_tools=frozenset(
+                name for name, spec in self.tools.registry.items() if spec.read_only
+            )
+            if self.tools is not None
+            else frozenset(),
+            digest_cache=self._digest_cache,
         )
         note = acceptance.instructions()
         self.last_outcome = acceptance.outcome()
@@ -810,7 +821,12 @@ class Conversation:
                     return problem
                 # Members' unfinished edits are verified when their work is done, not now.
                 background = self.team.continues_in_background()
-            return acceptance.validate(content, background=background)
+            problem = acceptance.validate(content, background=background)
+            if problem and not background:
+                problem = self._rerun_checks(
+                    acceptance, runtime, content, problem, on_tool_result
+                )
+            return problem
 
         # Members work during the turn; afterwards they pause or, interactively, continue
         # in the background. Pending work resumes next turn. The team's turn starts before
@@ -863,6 +879,60 @@ class Conversation:
             self._save_outcome(acceptance)
         return answer
 
+    def _rerun_checks(self, acceptance, runtime, content, problem, on_tool_result=None):
+        """Rerun uncounted checks standalone before rejecting an answer for want of one.
+
+        A check the model ran after its last change counts only alone: "pytest | tail" or
+        "pytest; echo $?" report another command's exit status. Running it alone settles
+        the answer without another model request; a failure is reported with its output.
+        """
+        candidates = acceptance.rerun_candidates()
+        if not candidates or self.tools is None or not self.tools.tool_available("exec"):
+            return problem
+        results = []
+        for command, cwd in candidates:
+            if runtime.tool_deadline() - time.monotonic() < RERUN_MIN_SECONDS:
+                break
+            call = {
+                "id": f"call_recheck_{uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": "exec",
+                    "arguments": json.dumps({"command": command, "cwd": cwd}, ensure_ascii=False),
+                },
+            }
+            acceptance.before_tool(call)
+            with trace_scope(runtime.last_request_trace.tool(call["id"])):
+                try:
+                    result = self.tools.execute(call, deadline=runtime.tool_deadline())
+                except Exception as exc:
+                    result = self._tool_error(type(exc).__name__, str(exc))
+                parsed = json.loads(result)
+                if on_tool_result:
+                    on_tool_result("exec", parsed)
+            acceptance.observe(call, parsed)
+            data = parsed.get("data") or {}
+            if parsed.get("status") == "ok":
+                results.append(f"- `{command}` (cwd {cwd}): passed")
+            else:
+                output = data.get("output") if isinstance(data.get("output"), str) else ""
+                results.append(
+                    f"- `{command}` (cwd {cwd}): {parsed.get('status')}, exit "
+                    f"{data.get('exit_code')}; full output: {parsed.get('artifact_path')}\n"
+                    + output[-RERUN_OUTPUT_CHARS:]
+                )
+        if not results:
+            return problem
+        self.messages.append(
+            {
+                "role": "system",
+                "content": "Runtime reran the checks you ran after your last change, each alone, "
+                "since their composed form did not report their own exit status:\n"
+                + "\n".join(results),
+            }
+        )
+        return acceptance.validate(content)
+
     def _run_turn(
         self,
         runtime,
@@ -889,9 +959,10 @@ class Conversation:
                 )
             except BaseException:
                 acceptance.status = "incomplete"
-                raise
-            finally:
                 self._save_outcome(acceptance)
+                raise
+            # Saved together with the accepted response just below.
+            self.last_outcome = acceptance.outcome()
             self.messages.append(message)
             tool_calls = message.get("tool_calls") or []
             runs = self._record_tool_calls(tool_calls, runtime)

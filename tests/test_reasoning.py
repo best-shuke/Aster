@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from deepseek_client import CompletionError
 from reasoning import RolePromptCache
-from tool_runtime import MAX_RESULT_CHARS
+from tool_runtime import DELEGATE_RESULT_CHARS
 from tools import CodingTools
 
 
@@ -454,8 +454,80 @@ class ReasoningToolsTests(unittest.TestCase):
         self.assertTrue(returned.wait(timeout=1))
         self.assertFalse(executed.wait(timeout=0.1))
 
+    def test_several_long_reports_all_stay_visible_to_the_parent(self):
+        class LongClient:
+            def complete(self, messages, *args, **kwargs):
+                number = messages[1]["content"].split("Assignment:\n", 1)[1].split()[1]
+                return {
+                    "role": "assistant",
+                    "content": f"start{number} " + "发现 " * 8000 + f"end{number}",
+                }
+
+        self.tools.attach_reasoning(LongClient())
+        tasks = [task(f"inspect {n} " + "context " * 200) for n in range(3)]
+        raw = self.tools.execute(call("delegate", {"tasks": tasks}))
+        self.assertLessEqual(len(raw), DELEGATE_RESULT_CHARS)
+        result = json.loads(raw)
+        self.assertTrue(result["truncated"])
+        reports = result["data"]["reports"]
+        for number, entry in enumerate(reports):
+            self.assertTrue(entry["task"].startswith(f"inspect {number} "))
+            self.assertLessEqual(len(entry["task"]), 300)
+            self.assertTrue(entry["data"]["report"].startswith(f"start{number} "))
+            self.assertTrue(entry["data"]["report"].endswith(f"end{number}"))
+
+    def test_worker_checks_echo_only_a_brief_form_of_written_content(self):
+        content = "line of generated content\n" * 2000
+
+        class WritingClient:
+            def complete(self, messages, *args, **kwargs):
+                if any(message["role"] == "tool" for message in messages):
+                    return {"role": "assistant", "content": "Wrote out.txt"}
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [call("write", {"path": "out.txt", "content": content})],
+                }
+
+        self.tools.worker_allow = frozenset({"write"})
+        self.tools.attach_reasoning(WritingClient())
+        result = self.delegate([task("write out.txt", mode="inspect")])
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual((self.workspace / "out.txt").read_text(), content)
+        check = result["data"]["reports"][0]["data"]["checks"][0]
+        self.assertEqual(check["tool"], "write")
+        self.assertLessEqual(len(check["arguments"]), 300)
+        self.assertTrue(check["arguments"].startswith('{"path": "out.txt"'))
+        self.assertFalse(result["truncated"])
+
+    def test_many_worker_calls_are_digested_with_failures_kept(self):
+        (self.workspace / "result.txt").write_text("expected value")
+
+        class BusyClient:
+            def complete(self, messages, *args, **kwargs):
+                done = sum(message["role"] == "tool" for message in messages)
+                if done == 20:
+                    return {"role": "assistant", "content": "Checked everything"}
+                path = "missing.txt" if done == 3 else "result.txt"
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [call("read", {"path": path, "offset": 1})],
+                }
+
+        self.tools.attach_reasoning(BusyClient())
+        data = self.delegate()["data"]["reports"][0]["data"]
+        self.assertEqual(data["tool_calls"], 20)
+        self.assertEqual(len(data["checks"]), 6)
+        self.assertEqual(data["checks_omitted"], 14)
+        self.assertEqual(data["check_counts"], {"read:ok": 19, "read:error": 1})
+        # The failure is kept; the rest are the latest calls, in call order.
+        self.assertEqual(data["checks"][0]["status"], "error")
+        self.assertIn("missing.txt", data["checks"][0]["arguments"])
+        self.assertTrue(all(check["status"] == "ok" for check in data["checks"][1:]))
+
     def test_long_reports_are_saved_without_cutting_json_or_dropping_evidence(self):
-        report = "evidence " * 4000
+        report = "evidence " * (DELEGATE_RESULT_CHARS // 4)
 
         class LongClient:
             def complete(self, *args, **kwargs):
@@ -463,7 +535,7 @@ class ReasoningToolsTests(unittest.TestCase):
 
         self.tools.attach_reasoning(LongClient())
         raw = self.tools.execute(call("delegate", {"tasks": [task()]}))
-        self.assertLessEqual(len(raw), MAX_RESULT_CHARS)
+        self.assertLessEqual(len(raw), DELEGATE_RESULT_CHARS)
         result = json.loads(raw)
         self.assertTrue(result["truncated"])
         full = json.loads(Path(result["artifact_path"]).read_text())

@@ -12,7 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import suppress
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 from client_runtime import client_event
 from config import Settings
@@ -39,6 +39,8 @@ RUNTIME_INSTRUCTIONS = (
     "Before repeating a failed or unchanged check, identify what changed or why polling is needed. "
     "After a timeout, reduce the problem or change approach. Verify actual results, not only exit codes or prior reports."
 )
+# Tools whose success on a path resolves earlier failures of these tools on it.
+FILE_TOOLS = {"edit": {"edit", "write"}, "write": {"edit", "write"}, "read": {"read"}}
 SYNTHESIS_INSTRUCTIONS = (
     "Synthesis phase: answer now from the accumulated evidence in the requested format. "
     "State uncertainty; do not restart completed work. Use tools only for a necessary final check."
@@ -47,6 +49,7 @@ SYNTHESIS_INSTRUCTIONS = (
 
 class TaskProgress:
     def __init__(self, workspace):
+        self.workspace = Path(workspace)
         self.artifacts = ArtifactStore(workspace)
         self.path = None
         self.log_error = None
@@ -123,6 +126,13 @@ class TaskProgress:
         self.failures.pop(signature, None)
         if failed:
             self.failures[signature] = record
+        elif record.get("path") and record["tool"] in FILE_TOOLS:
+            # A later successful edit of the file settles its failed edits, and a read
+            # its failed reads: they are no longer unresolved.
+            family = FILE_TOOLS[record["tool"]]
+            for key, failure in list(self.failures.items()):
+                if failure.get("path") == record["path"] and failure["tool"] in family:
+                    del self.failures[key]
         for mapping, limit in ((self.observations, 128), (self.failures, 32)):
             while len(mapping) > limit:
                 mapping.popitem(last=False)
@@ -203,6 +213,9 @@ class TaskProgress:
             "same_result_count": same,
             "artifact_path": result.get("artifact_path"),
         }
+        if isinstance(arguments, dict) and isinstance(arguments.get("path"), str):
+            with suppress(OSError, ValueError):
+                record["path"] = str((self.workspace / arguments["path"]).resolve())
         name = function.get("name")
         error = result.get("error") or {}
         if result.get("status") == "error" and error.get("code"):

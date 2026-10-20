@@ -359,6 +359,23 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.summary_requests, 3)
         self.assertEqual(json.loads(runtime.progress.path.read_text())["status"], "error")
 
+    def test_a_later_successful_edit_settles_failed_edits_of_the_same_file(self):
+        progress = TaskProgress(self.workspace)
+        failure = {"status": "error", "error": {"code": "ValueError"}}
+        progress.observe(tool("edit", {"path": "app.py", "edits": [1]}), failure)
+        progress.observe(tool("edit", {"path": "other.py", "edits": [1]}), failure)
+        self.assertEqual(len(progress.failures), 2)
+        progress.observe(
+            tool("edit", {"path": str(self.workspace / "app.py"), "edits": [2]}),
+            {"status": "ok", "data": {}},
+        )
+        self.assertEqual(
+            [record["arguments"] for record in progress.failures.values()],
+            [json.dumps({"path": "other.py", "edits": [1]})],
+        )
+        progress.observe(tool("read", {"path": "other.py"}), {"status": "ok", "data": {}})
+        self.assertEqual(len(progress.failures), 1)
+
     def test_repetition_ignores_duration_but_changed_output_counts_as_new(self):
         progress = TaskProgress(self.workspace)
         for duration, output in [(1, "same"), (2, "same"), (3, "new")]:

@@ -25,7 +25,18 @@ from file_state import FileChangedError, atomic_write_text, file_digest, file_lo
 from mcp_client import McpManager
 from process_monitor import ProcessMonitor
 from reasoning import ReasoningTools
-from tool_runtime import PAGE_CHARS, ArtifactStore, ExecutionContext, ToolResult, ToolSpec, validate
+from tool_runtime import (
+    DELEGATE_RESULT_CHARS,
+    MAX_RESULT_CHARS,
+    PAGE_CHARS,
+    READ_PAGE_CHARS,
+    ArtifactStore,
+    ExecutionContext,
+    ToolResult,
+    ToolSpec,
+    command_environment,
+    validate,
+)
 from websearch import WebSearchClient
 
 TEXT = {"type": "string"}
@@ -133,7 +144,7 @@ def run_process(
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=command_environment(),
             )
         except BaseException:
             path.unlink(missing_ok=True)
@@ -205,6 +216,74 @@ def _null_records(path: Path, context: ExecutionContext) -> Iterator[str]:
                 yield os.fsdecode(part)
     if pending:
         raise ValueError("Incomplete filename record from ripgrep")
+
+
+def _numbered(content: str, first_line: int) -> str:
+    # Lines end at "\n" only, as read's offsets count them.
+    if not content:
+        return content
+    lines = content.split("\n")
+    end = "\n" if lines[-1] == "" else ""
+    if end:
+        lines.pop()
+    return "\n".join(f"{number:>6}\t{line}" for number, line in enumerate(lines, first_line)) + end
+
+
+def _line_of(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
+def _edit_mismatch(original: str, old_text: str, number: int) -> str:
+    """Why edits[number].oldText does not match exactly once, and where to look instead."""
+    message = f"Each oldText must match exactly once; edits[{number}].oldText "
+    count = original.count(old_text)
+    if count > 1:
+        starts, index = [], original.find(old_text)
+        while index != -1 and len(starts) < 5:
+            starts.append(_line_of(original, index))
+            index = original.find(old_text, index + 1)
+        return (
+            message + f"matches {count} places (lines {', '.join(map(str, starts))}"
+            f"{', ...' if count > len(starts) else ''}). Include nearby unique lines."
+        )
+    message += "matches nothing in the current file."
+    wanted = [line.strip() for line in old_text.split("\n") if line.strip()]
+    if not wanted:
+        return message + " Read the file and copy the exact text."
+    lines = original.split("\n")
+    stripped = [line.strip() for line in lines]
+    # A block equal apart from indentation or trailing spaces is the usual cause.
+    for start in range(len(lines)):
+        if stripped[start] != wanted[0]:
+            continue
+        found, position = 0, start
+        while position < len(lines) and found < len(wanted):
+            if stripped[position] == wanted[found]:
+                found += 1
+            elif stripped[position]:
+                break
+            position += 1
+        if found == len(wanted):
+            return (
+                message + f" Ignoring whitespace it matches lines {start + 1}-{position}: copy "
+                "their exact indentation, blank lines and trailing spaces (read with "
+                "line_numbers to see them; the prefixes are not file content)."
+            )
+    partial = next(
+        (
+            (index, line)
+            for index, line in enumerate(wanted)
+            if stripped.count(line) == 1 and len(line) > 3
+        ),
+        None,
+    )
+    if partial is not None:
+        index, line = partial
+        return (
+            message + f" Its line {index + 1} ({line[:80]!r}) is at line "
+            f"{stripped.index(line) + 1}, but the lines around it differ; read that range again."
+        )
+    return message + " None of its lines is unique in the file; read the current text first."
 
 
 def _rg_text(value: dict[str, str]) -> str:
@@ -333,16 +412,21 @@ class CodingTools:
         specs = [
             ToolSpec(
                 "read",
-                "Read a local UTF-8 text file with exact line/column ranges; URLs are not file paths. Pass the returned next_cursor object with the same path, or merge its offset/column fields, to continue without gaps.",
+                "Read a local UTF-8 text file with exact line/column ranges; URLs are not file paths. Pass the returned next_cursor object with the same path, or merge its offset/column fields, to continue without gaps. Set line_numbers=true when you need to cite line numbers.",
                 {
                     "path": PATH,
                     "offset": OFFSET,
-                    "limit": {**LIMIT, "default": 200},
+                    "limit": {**LIMIT, "default": 400},
                     "column": {
                         "type": "integer",
                         "minimum": 0,
                         "default": 0,
                         "description": "0-based character position within the starting line; used for very long lines.",
+                    },
+                    "line_numbers": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Prefix each line with its number and a tab, like cat -n. The prefixes are not file content: never copy them into edit oldText.",
                     },
                     "next_cursor": READ_CURSOR,
                 },
@@ -384,7 +468,7 @@ class CodingTools:
             ),
             ToolSpec(
                 "grep",
-                "Search text with ripgrep. Returns complete match/context records with paths and line numbers. Repeat the same query with the returned next_cursor object to continue; results are ordered by path. Use literal=true for fixed strings. For minified files, avoid enormous regex repetition bounds; search a short literal, then read the matching range. An explicit positive glob can override ignore files.",
+                "Search text with ripgrep. Returns complete match/context records with line numbers and paths (relative to the workspace when inside it). Repeat the same query with the returned next_cursor object to continue; results are ordered by path. Use literal=true for fixed strings. For minified files, avoid enormous regex repetition bounds; search a short literal, then read the matching range. An explicit positive glob can override ignore files.",
                 {
                     "pattern": TEXT,
                     "path": PATH,
@@ -830,6 +914,7 @@ class CodingTools:
             },
             ("tasks",),
             reasoning.delegate,
+            result_chars=DELEGATE_RESULT_CHARS,
         )
 
     def path(self, value: str = ".") -> Path:
@@ -858,6 +943,15 @@ class CodingTools:
         ):
             allowed = ", ".join(str(root) for root in self.write_roots) or "none"
             raise PermissionError(f"Writing {path} is outside this agent's write scope ({allowed})")
+
+    def _workspace_relative(self, value: str) -> str:
+        # Repeated absolute paths would take much of a search page.
+        path = Path(value)
+        return (
+            path.relative_to(self.workspace).as_posix()
+            if path.is_relative_to(self.workspace)
+            else value
+        )
 
     def _protected_globs(self, root: Path) -> list[str]:
         globs = []
@@ -944,6 +1038,7 @@ class CodingTools:
     def _execute_registered(
         self, tool_call: ToolCall, context: ExecutionContext, worker: bool
     ) -> str:
+        spec = None
         try:
             context.remaining()
             function = tool_call["function"]
@@ -1017,14 +1112,17 @@ class CodingTools:
             result = ToolResult.failure("deadline_exceeded", str(exc), status="timeout")
         except Exception as exc:
             result = ToolResult.failure(type(exc).__name__, str(exc))
-        return self.artifacts.render(result)
+        return self.artifacts.render(
+            result, spec.result_chars if spec is not None else MAX_RESULT_CHARS
+        )
 
     def read(
         self,
         path: str,
         offset: int = 1,
-        limit: int = 200,
+        limit: int = 400,
         column: int = 0,
+        line_numbers: bool = False,
         next_cursor: dict[str, int] | None = None,
         *,
         _context: ExecutionContext,
@@ -1085,7 +1183,7 @@ class CodingTools:
         return ToolResult(
             data={
                 "path": str(file_path),
-                "content": content,
+                "content": _numbered(content, offset) if line_numbers else content,
                 "start_line": offset,
                 "start_column": column,
                 "end_line": next_line,
@@ -1104,9 +1202,9 @@ class CodingTools:
         chunks = []
         size = 0
         completed = 0
-        while size < PAGE_CHARS and completed < limit:
+        while size < READ_PAGE_CHARS and completed < limit:
             context.remaining()
-            chunk = stream.readline(PAGE_CHARS - size)
+            chunk = stream.readline(READ_PAGE_CHARS - size)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -1217,13 +1315,11 @@ class CodingTools:
     @staticmethod
     def _apply_edits(original: str, edits: list[dict[str, str]], check) -> str:
         replacements = []
-        for item in edits:
+        for number, item in enumerate(edits):
             check()
             old_text, new_text = item["oldText"], item["newText"]
             if original.count(old_text) != 1:
-                raise ValueError(
-                    "Each oldText must match exactly once; read a larger unique context"
-                )
+                raise ValueError(_edit_mismatch(original, old_text, number))
             start = original.index(old_text)
             replacements.append((start, start + len(old_text), new_text))
         replacements.sort()
@@ -1485,7 +1581,7 @@ class CodingTools:
                     if event["type"] in ("match", "context"):
                         data = event["data"]
                         yield {
-                            "path": _rg_text(data["path"]),
+                            "path": self._workspace_relative(_rg_text(data["path"])),
                             "line": data["line_number"],
                             "text": _rg_text(data["lines"]),
                             "kind": event["type"],

@@ -5,8 +5,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from task_acceptance import TaskAcceptance, TaskContract
+import file_state
+from task_acceptance import TaskAcceptance, TaskContract, parse_shell, standalone_checks
 from tools import CodingTools
 
 
@@ -52,6 +54,28 @@ class TaskAcceptanceTests(unittest.TestCase):
         self.execute("exec", self.command("assert True"))
         self.assertIn("unresolved", self.acceptance.validate("已完成并验证。"))
         self.execute("exec", arguments)
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+
+    def test_read_only_tools_skip_the_walk_but_changes_made_meanwhile_still_count(self):
+        (self.workspace / "app.py").write_text("answer = 41\n")
+        self.acceptance = TaskAcceptance(
+            "修复代码",
+            TaskContract("change"),
+            workspace=self.workspace,
+            passive_tools=frozenset({"read", "grep"}),
+        )
+        walks = []
+        refresh = self.acceptance._refresh_files
+        self.acceptance._refresh_files = lambda: walks.append(1) or refresh()
+        self.execute("read", {"path": "app.py"})
+        self.execute("grep", {"pattern": "answer"})
+        self.assertEqual(walks, [])
+        # Something else changes the code while only read-only tools run.
+        (self.workspace / "app.py").write_text("answer = 42\n")
+        self.execute("read", {"path": "app.py"})
+        self.assertIn("no successful verification", self.acceptance.validate("已完成。"))
+        # The walk before a check finds the change, so the check covers it.
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
         self.assertIsNone(self.acceptance.validate("已完成并验证。"))
 
     def test_background_verification_requires_observing_the_final_result(self):
@@ -139,6 +163,7 @@ class TaskAcceptanceTests(unittest.TestCase):
         self.assertFalse(self.acceptance.verification_command("ruff --version"))
 
     def test_node_test_runner_and_syntax_check_are_verification(self):
+        self.assertTrue(self.acceptance.verification_command("python manage.py test shop"))
         for command in ("node --test tests/", "node --check game.js", "node -c a.js"):
             with self.subTest(command=command):
                 self.assertTrue(self.acceptance.verification_command(command))
@@ -152,6 +177,116 @@ class TaskAcceptanceTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertFalse(self.acceptance.verification_command(command))
+
+    def test_a_shared_digest_cache_spares_later_tasks_hashing_unchanged_files(self):
+        for index in range(5):
+            (self.workspace / f"module_{index}.py").write_text(f"value = {index}\n")
+        cache = {}
+        # Digests are cached once a file's timestamps are older than the skew.
+        skew = patch.object(file_state, "_DIGEST_CACHE_SKEW_NS", -(10**12))
+        skew.start()
+        self.addCleanup(skew.stop)
+        TaskAcceptance(
+            "修复代码", TaskContract("change"), workspace=self.workspace, digest_cache=cache
+        )
+        with patch("file_state.file_digest", wraps=file_state.file_digest) as digest:
+            TaskAcceptance(
+                "修复代码", TaskContract("change"), workspace=self.workspace, digest_cache=cache
+            )
+        self.assertEqual(digest.call_count, 0)
+
+    def test_only_unquoted_operators_split_a_command_line(self):
+        command = "python -c \"print('a | b; c && d')\" && python -c 'assert 1 << 2 == 4'"
+        self.assertEqual(
+            [(item.operator, item.words[-1]) for item in parse_shell(command)],
+            [(None, "print('a | b; c && d')"), ("&&", "assert 1 << 2 == 4")],
+        )
+        self.assertEqual(
+            [item.words for item in parse_shell("pytest -n 4 >log 2>&1 && echo '&&'")],
+            [("pytest", "-n", "4"), ("echo", "&&")],
+        )
+        heredoc = "python3 - <<'PY'\nassert 1\nPY\necho a\necho b"
+        self.assertEqual(
+            [(item.operator, item.words, item.stdin) for item in parse_shell(heredoc)],
+            [
+                (None, ("python3", "-"), "assert 1\n"),
+                (";", ("echo", "a"), None),
+                (";", ("echo", "b"), None),
+            ],
+        )
+        # A command substitution runs a command the line does not show: no check.
+        self.assertFalse(TaskAcceptance.shell_checks("x=$(diff a b) && true", self.workspace)[0])
+
+    def test_a_rerun_keeps_the_check_as_written_with_its_setup(self):
+        self.assertEqual(
+            standalone_checks(
+                'cd ~ && FOO="a b" pytest tests/test_*.py 2>&1 | tail -3; echo "$?"',
+                self.workspace,
+            ),
+            ['cd ~ && FOO="a b" pytest tests/test_*.py 2>&1'],
+        )
+        heredoc = "python3 - <<'PY' | tail -2\nassert 1\nPY"
+        self.assertEqual(
+            standalone_checks(heredoc, self.workspace), ["python3 - <<'PY'\nassert 1\nPY"]
+        )
+        # Writing a file through a here-document is not setup to rerun.
+        self.assertEqual(
+            standalone_checks(
+                "cat > t.py <<EOF && python -m pytest t.py | tail\ndef test(): pass\nEOF",
+                self.workspace,
+            ),
+            ["python -m pytest t.py"],
+        )
+
+    def test_node_programs_using_node_assert_are_verification(self):
+        program = "import assert from 'node:assert/strict'; assert.equal(1, 1)"
+        for command in (
+            f"node --input-type=module -e {shlex.quote(program)}",
+            f"node --input-type=module - <<'EOF'\n{program}\nEOF",
+            "node -e \"const { strictEqual } = require('assert'); strictEqual(2, 2)\"",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(len(TaskAcceptance.shell_checks(command, self.workspace)[0]), 1)
+        # console.assert only logs, and a program without node:assert checks nothing.
+        for command in ('node -e "console.assert(false)"', 'node -e "console.log(1)"'):
+            with self.subTest(command=command):
+                self.assertFalse(TaskAcceptance.shell_checks(command, self.workspace)[0])
+
+    def test_deleting_an_unused_scratch_check_keeps_the_verification(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.execute("write", {"path": "verify_tmp.py", "content": "assert True\n"})
+        quoted = shlex.quote(sys.executable)
+        self.execute("exec", {"command": f"{quoted} verify_tmp.py"})
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+        self.execute("exec", {"command": "rm verify_tmp.py"})
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+        # A file the remaining code uses is no scratch file.
+        self.execute("write", {"path": "helper.py", "content": "value = 42\n"})
+        self.execute("write", {"path": "app.py", "content": "from helper import value\n"})
+        self.execute("exec", self.command("from app import value; assert value == 42"))
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+        self.execute("exec", {"command": "rm helper.py"})
+        self.assertIn("helper.py", self.acceptance.validate("已完成。"))
+
+    def test_deleting_a_file_that_existed_before_the_task_needs_a_new_check(self):
+        (self.workspace / "legacy.py").write_text("old = True\n")
+        self.acceptance = TaskAcceptance(
+            "修复代码", TaskContract("change"), workspace=self.workspace
+        )
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        self.execute("exec", {"command": "rm legacy.py"})
+        self.assertIn("legacy.py", self.acceptance.validate("已完成。"))
+
+    def test_an_unverified_change_names_the_files_changed_since_the_last_check(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        self.execute("write", {"path": "scratch_check.py", "content": "assert True\n"})
+        self.execute("exec", {"command": "rm scratch_check.py"})
+        problem = self.acceptance.validate("已完成。")
+        self.assertIn("Changed since the last counted check", problem)
+        self.assertIn("scratch_check.py", problem)
+        self.assertNotIn("app.py", problem)
 
     def test_a_malformed_command_is_no_check_and_does_not_fail(self):
         command = [sys.executable, "-m", "unittest"]
@@ -226,11 +361,125 @@ class TaskAcceptanceTests(unittest.TestCase):
     def test_an_uncounted_composed_check_is_explained(self):
         self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
         arguments = self.command("from app import answer; assert answer == 42")
-        arguments["command"] = "cd . && " + arguments["command"]
+        arguments["command"] += " | cat"
         self.execute("exec", arguments)
         problem = self.acceptance.validate("已完成并验证。")
         self.assertIn("was not counted", problem)
         self.assertIn("cwd argument", problem)
+
+    def test_a_check_in_an_and_list_is_proven_by_its_status(self):
+        # "&&" runs each command only after the previous one succeeded: status 0 proves all.
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        check = self.command("from app import answer; assert answer == 42")["command"]
+        for command in (f"cd . && {check}", f"{check} && git --version | cat"):
+            with self.subTest(command=command):
+                self.acceptance.verified_revision = -1
+                self.execute("exec", {"command": command})
+                self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+        failing = self.command("assert False")["command"]
+        self.execute("exec", {"command": f"true && {failing}"})
+        self.assertIn("no successful verification", self.acceptance.validate("已完成。"))
+
+    def test_a_failed_composed_check_leaves_no_failure_that_cannot_be_cleared(self):
+        # "pytest || unittest" can never pass as a trusted check, so its failure must not
+        # be what a later standalone check has to clear.
+        self.execute("write", {"path": "app.py", "content": "answer = 41\n"})
+        quoted = shlex.quote(sys.executable)
+        failing = self.command("from app import answer; assert answer == 42")["command"]
+        self.execute("exec", {"command": f"{quoted} -m no_such_runner || {failing}"})
+        self.assertFalse(self.acceptance.failed_verifications)
+        # Another size than before, so Python cannot reuse the stale bytecode.
+        self.execute("write", {"path": "app.py", "content": "answer = 42  # fixed\n"})
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+
+    def test_a_missing_test_runner_is_no_failed_check(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        missing = (
+            ("python -m pytest -q", {"exit_code": 1, "output": "python: No module named pytest\n"}),
+            ("pytest -q", {"exit_code": 127, "output": "sh: pytest: command not found\n"}),
+            ("npm test", {"exit_code": 1, "output": 'npm error Missing script: "test"\n'}),
+        )
+        for command, data in missing:
+            with self.subTest(command=command):
+                invocation = call("exec", {"command": command})
+                self.acceptance.before_tool(invocation)
+                self.acceptance.observe(invocation, {"status": "error", "data": data})
+                self.assertFalse(self.acceptance.failed_verifications)
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+        # A runner that is there and fails is a failed check.
+        invocation = call("exec", {"command": "pytest -q"})
+        self.acceptance.observe(
+            invocation, {"status": "error", "data": {"exit_code": 1, "output": "1 failed"}}
+        )
+        self.assertIn("unresolved", self.acceptance.validate("已完成。"))
+
+    def test_a_failed_check_is_named_and_cleared_by_rerunning_it_however_verbose(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 41\n"})
+        (self.workspace / "tests").mkdir()
+        (self.workspace / "tests" / "test_app.py").write_text(
+            "import unittest\nfrom app import answer\n\n\nclass T(unittest.TestCase):\n"
+            "    def test(self):\n        self.assertEqual(answer, 42)\n"
+        )
+        quoted = shlex.quote(sys.executable)
+        self.execute("exec", {"command": f"{quoted} -m unittest discover -s tests"})
+        problem = self.acceptance.validate("已完成。")
+        self.assertIn("unittest discover -s tests`", problem)
+        self.execute("write", {"path": "app.py", "content": "answer = 42  # fixed\n"})
+        self.execute("exec", {"command": f"{quoted} -m unittest discover -s tests -v 2>&1"})
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+
+    def test_a_corrected_inline_script_settles_the_failure_of_its_first_version(self):
+        self.execute("write", {"path": "app.py", "content": "def double(x):\n    return 2 * x\n"})
+        quoted = shlex.quote(sys.executable)
+        script = (
+            "from app import double\n"
+            "assert double(0) == 0\n"
+            "assert double(2) == 4\n"
+            "assert double(-3) == {expected}\n"
+            "print('all checks passed')\n"
+        )
+        # The script's own expectation was wrong, not the code.
+        self.execute("exec", {"command": f"{quoted} - <<'PY'\n{script.format(expected=6)}PY"})
+        problem = self.acceptance.validate("已完成。")
+        self.assertIn("unresolved", problem)
+        self.assertIn("corrected version", problem)
+        # An unrelated passing script does not settle it.
+        self.execute("exec", self.command("import json; assert json.loads('1') == 1"))
+        self.assertIn("unresolved", self.acceptance.validate("已完成。"))
+        self.execute("exec", {"command": f"{quoted} - <<'PY'\n{script.format(expected=-6)}PY"})
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+
+    def test_after_a_code_change_only_the_failed_script_itself_settles_its_failure(self):
+        # A weaker script after a fix is no rerun of the check that failed before it.
+        self.execute("write", {"path": "app.py", "content": "answer = 41\n"})
+        failing = self.command("from app import answer; assert answer == 42")
+        self.execute("exec", failing)
+        self.execute("write", {"path": "app.py", "content": "answer = 42  # fixed\n"})
+        self.execute("exec", self.command("from app import answer; assert answer"))
+        self.assertIn("unresolved", self.acceptance.validate("已完成。"))
+        self.execute("exec", failing)
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+
+    def test_assertions_from_a_heredoc_or_a_test_script_are_verification(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        quoted = shlex.quote(sys.executable)
+        program = "from app import answer\nassert answer == 42\n"
+        self.execute("exec", {"command": f"FLAG=1 {quoted} - <<'PY'\n{program}PY"})
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+        self.execute("write", {"path": "app.py", "content": "answer = 43\n"})
+        self.execute("exec", {"command": f"{quoted} - <<'PY'\nprint('answer')\nPY"})
+        self.assertIn("no successful verification", self.acceptance.validate("已完成。"))
+        (self.workspace / "check_app.py").write_text(
+            "import unittest\n\n\nclass T(unittest.TestCase):\n    def test(self):\n"
+            "        pass\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+        )
+        self.execute("exec", {"command": f"{quoted} check_app.py"})
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+        self.execute("write", {"path": "app.py", "content": "answer = 44\n"})
+        self.execute("exec", {"command": f"{quoted} app.py"})
+        self.assertIn("no successful verification", self.acceptance.validate("已完成。"))
 
     def test_work_continuing_in_the_background_is_not_verified_yet(self):
         # A teammate's unfinished edit (not this agent's tool call) changed the code.

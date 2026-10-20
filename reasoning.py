@@ -2,6 +2,7 @@ import json
 import re
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import nullcontext, suppress
@@ -29,6 +30,33 @@ from worker_checkpoint import WorkerCheckpoint
 
 WorkspaceExecutor = Callable[[ToolCall, ExecutionContext], str]
 RoleLoader = Callable[[str, ExecutionContext], str]
+# Reports echo assignments and worker calls only to identify them: the parent wrote the
+# assignment, and a write's whole file content would crowd out the findings.
+ECHO_CHARS = 300
+# A worker may make dozens of calls; the parent needs their outcome, not each call.
+CHECKS_SHOWN = 6
+
+
+def _brief(text: str, limit: int = ECHO_CHARS) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _check_digest(checks: list[dict]) -> dict:
+    """Failed, changing and command calls first, then the latest; counts for the rest."""
+    if len(checks) <= CHECKS_SHOWN:
+        return {"checks": checks}
+
+    def rank(index):
+        check = checks[index]
+        notable = check["status"] != "ok" or check["tool"] in {"write", "edit", "exec"}
+        return (not notable, -index)
+
+    shown = sorted(sorted(range(len(checks)), key=rank)[:CHECKS_SHOWN])
+    return {
+        "checks": [checks[index] for index in shown],
+        "checks_omitted": len(checks) - len(shown),
+        "check_counts": dict(Counter(f"{check['tool']}:{check['status']}" for check in checks)),
+    }
 
 
 class RolePromptCache:
@@ -276,7 +304,7 @@ class SubagentRunner:
                     **role_metadata,
                     **({"model_recovery": model_recovery} if model_recovery else {}),
                     "report": report,
-                    "checks": checks,
+                    **_check_digest(checks),
                     "mode": mode,
                     "model_requests": runtime.requests
                     + runtime.summary_requests
@@ -355,7 +383,7 @@ class SubagentRunner:
                     checks.append(
                         {
                             "tool": function.get("name"),
-                            "arguments": function.get("arguments"),
+                            "arguments": _brief(str(function.get("arguments") or ""), 160),
                             "status": decoded["status"],
                             "error": decoded["error"],
                             "truncated": decoded["truncated"],
@@ -545,7 +573,7 @@ class ReasoningTools:
         tasks: list[dict[str, str]], reports: list[ToolResult | None]
     ) -> ToolResult:
         entries = [
-            {"task": item["task"], **report.as_dict()}
+            {"task": _brief(item["task"]), **report.as_dict()}
             for item, report in zip(tasks, reports, strict=True)
             if report is not None
         ]

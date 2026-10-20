@@ -269,6 +269,46 @@ except SessionConflictError:
             conversation.last_outcome["verified_revision"],
         )
 
+    def test_an_uncounted_check_is_rerun_alone_instead_of_rejecting_the_answer(self):
+        verification = "from app import answer; assert answer == 42"
+        check = f"{shlex.quote(sys.executable)} -c {shlex.quote(verification)}"
+        client = FakeClient(
+            {"role": "assistant", "tool_calls": [call("write", {"path": "app.py", "content": "answer = 42\n"})]},
+            {"role": "assistant", "tool_calls": [call("exec", {"command": f"{check} 2>&1 | tail -5"}, "piped")]},
+            {"role": "assistant", "content": "已修改并验证。"},
+        )
+        conversation = Conversation(self.settings, client, self.tools)
+        answer = conversation.ask("修复代码")
+        self.assertEqual(answer, "已修改并验证。")
+        self.assertEqual(len(client.requests), 3)
+        self.assertEqual(conversation.last_outcome["status"], "completed")
+        reruns = [m for m in conversation.messages if "Runtime reran" in (m.get("content") or "")]
+        self.assertEqual(len(reruns), 1)
+        self.assertIn(f"`{check} 2>&1` (cwd .): passed", reruns[0]["content"])
+
+    def test_a_rerun_that_fails_rejects_the_answer_with_its_output(self):
+        verification = "from app import answer; assert answer == 42, answer"
+        check = f"{shlex.quote(sys.executable)} -c {shlex.quote(verification)}"
+        client = FakeClient(
+            {"role": "assistant", "tool_calls": [call("write", {"path": "app.py", "content": "answer = 41\n"})]},
+            {"role": "assistant", "tool_calls": [call("exec", {"command": f"{check}; echo done"}, "hidden")]},
+            {"role": "assistant", "content": "已修改并验证。"},
+            {"role": "assistant", "tool_calls": [call("write", {"path": "app.py", "content": "answer = 42  # fixed\n"}, "fix")]},
+            {"role": "assistant", "tool_calls": [call("exec", {"command": check}, "rerun")]},
+            {"role": "assistant", "content": "已修复，检查通过。"},
+        )
+        conversation = Conversation(self.settings, client, self.tools)
+        answer = conversation.ask("修复代码")
+        self.assertEqual(answer, "已修复，检查通过。")
+        self.assertEqual(len(client.requests), 6)
+        notes = "\n".join(
+            m.get("content") or "" for m in conversation.messages if m["role"] == "system"
+        )
+        self.assertIn("error, exit 1", notes)
+        self.assertIn("AssertionError: 41", notes)
+        self.assertIn("Verification failed and remains unresolved. Rerun the failed check", notes)
+        self.assertEqual(conversation.last_outcome["status"], "completed")
+
     def test_ui_can_restore_and_finish_incomplete_or_blocked_tasks(self):
         for status in ("blocked", "incomplete"):
             with self.subTest(status=status), patch("sys.stdout", io.StringIO()):

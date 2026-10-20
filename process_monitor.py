@@ -17,7 +17,13 @@ from pathlib import Path
 from stat import S_ISREG
 from uuid import uuid4
 
-from tool_runtime import PAGE_CHARS, ArtifactStore, ExecutionContext, ToolResult
+from tool_runtime import (
+    PAGE_CHARS,
+    ArtifactStore,
+    ExecutionContext,
+    ToolResult,
+    command_environment,
+)
 
 
 @dataclass
@@ -110,7 +116,7 @@ class ProcessMonitor:
                         stdout=output,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
-                        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                        env=command_environment(),
                     )
             except BaseException:
                 if process is not None:

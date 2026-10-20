@@ -133,20 +133,21 @@ class SessionStore:
 
     def save(self, data: dict) -> None:
         snapshot = self.snapshot_path(data["session_id"])
-        content = json.dumps(data, ensure_ascii=False, indent=2)
+        # Saved after every tool step: unindented JSON uses the C encoder, ~2x faster.
+        content = json.dumps(data, ensure_ascii=False)
         with self._locked():
             if data["messages"] or data.get("goal") is not None:
                 self._write(snapshot, content)
             self._write(self.active_file, content)
-            self._revision = file_digest(self.active_file)
+            self._revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def transition(self, previous: dict, data: dict) -> None:
-        content = json.dumps(data, ensure_ascii=False, indent=2)
+        content = json.dumps(data, ensure_ascii=False)
         snapshots = {}
         for item in (previous, data):
             if item["messages"] or item.get("goal") is not None:
                 snapshots[self.snapshot_path(item["session_id"])] = json.dumps(
-                    item, ensure_ascii=False, indent=2
+                    item, ensure_ascii=False
                 )
         with self._locked():
             originals = {

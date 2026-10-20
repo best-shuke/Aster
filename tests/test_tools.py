@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tool_runtime import MAX_RESULT_CHARS, ExecutionContext, ToolResult
+from tool_runtime import MAX_RESULT_CHARS, READ_PAGE_CHARS, ExecutionContext, ToolResult
 from tools import CodingTools, ProcessResult, ToolPolicy
 
 
@@ -41,6 +41,41 @@ class CodingToolsTests(unittest.TestCase):
             set(result), {"status", "data", "error", "truncated", "next_cursor", "artifact_path"}
         )
         return result
+
+    def test_an_edit_that_does_not_match_says_which_and_where(self):
+        (self.workspace / "app.py").write_text("def f():\n    x = 1\n    return x\n\nreturn_ = 2\nreturn_ = 2\n")
+        result = self.execute(
+            "edit",
+            {
+                "path": "app.py",
+                "edits": [
+                    {"oldText": "def f():\n  x = 1", "newText": "def f():\n  x = 2"},
+                ],
+            },
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("edits[0].oldText matches nothing", result["error"]["message"])
+        self.assertIn("Ignoring whitespace it matches lines 1-2", result["error"]["message"])
+        result = self.execute(
+            "edit",
+            {
+                "path": "app.py",
+                "edits": [
+                    {"oldText": "x = 1", "newText": "x = 3"},
+                    {"oldText": "return_ = 2", "newText": "return_ = 3"},
+                ],
+            },
+        )
+        self.assertIn("edits[1].oldText matches 2 places (lines 5, 6)", result["error"]["message"])
+        self.assertIn("return_ = 2\nreturn_ = 2", (self.workspace / "app.py").read_text())
+
+    def test_commands_write_no_python_bytecode_into_the_workspace(self):
+        (self.workspace / "helper.py").write_text("value = 1\n")
+        result = self.execute(
+            "exec", {"command": f"{shlex.quote(sys.executable)} -c 'import helper'"}
+        )
+        self.assertEqual(result["status"], "ok", result)
+        self.assertFalse((self.workspace / "__pycache__").exists())
 
     def test_malformed_arguments_return_a_structured_error(self):
         result = json.loads(self.tools.execute({"function": {"name": "read", "arguments": "{bad"}}))
@@ -206,7 +241,7 @@ class CodingToolsTests(unittest.TestCase):
     def test_oversized_structured_result_is_preserved_in_an_artifact(self):
         original = ToolResult(
             status="partial",
-            data={"reports": ["中" * 20000]},
+            data={"reports": ["中" * (MAX_RESULT_CHARS + 1000)]},
             error={"code": "incomplete", "message": "missing checks"},
         )
         result = json.loads(self.tools.artifacts.render(original))
@@ -215,6 +250,74 @@ class CodingToolsTests(unittest.TestCase):
         restored = json.loads(Path(result["artifact_path"]).read_text())
         self.assertEqual(restored, original.as_dict())
         self.assertEqual(json.loads(self.read_all(result["artifact_path"])), original.as_dict())
+
+    def test_oversized_result_keeps_its_structure_and_most_of_each_value(self):
+        reports = [
+            {"task": f"task {n}", "report": f"head{n} " + "证据" * 9000 + f" tail{n}"}
+            for n in range(3)
+        ]
+        original = ToolResult(data={"reports": reports, "count": 3})
+        raw = self.tools.artifacts.render(original)
+        self.assertLessEqual(len(raw), MAX_RESULT_CHARS)
+        result = json.loads(raw)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(json.loads(Path(result["artifact_path"]).read_text()), original.as_dict())
+        self.assertEqual(result["data"]["count"], 3)
+        shown = result["data"]["reports"]
+        self.assertEqual([item["task"] for item in shown], ["task 0", "task 1", "task 2"])
+        for number, item in enumerate(shown):
+            # Each report keeps its head and tail and an even share of the budget.
+            self.assertTrue(item["report"].startswith(f"head{number} "))
+            self.assertTrue(item["report"].endswith(f" tail{number}"))
+            self.assertIn("characters omitted", item["report"])
+            self.assertGreater(len(item["report"]), MAX_RESULT_CHARS // 5)
+
+    def test_result_of_many_small_values_falls_back_to_the_artifact(self):
+        original = ToolResult(data={"items": ["x" * 50] * 1000})
+        result = json.loads(self.tools.artifacts.render(original))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(set(result["data"]), {"message"})
+        self.assertEqual(json.loads(Path(result["artifact_path"]).read_text()), original.as_dict())
+
+    def test_read_default_page_spans_many_lines_within_the_page_budget(self):
+        (self.workspace / "lines.txt").write_text("".join(f"line {i}\n" for i in range(1, 1001)))
+        result = self.execute("read", {"path": "lines.txt"})
+        self.assertEqual(result["data"]["end_line"], 401)
+        self.assertEqual(result["next_cursor"], {"offset": 401, "column": 0})
+        (self.workspace / "wide.txt").write_text(("y" * 99 + "\n") * 1000)
+        result = self.execute("read", {"path": "wide.txt"})
+        self.assertLessEqual(len(result["data"]["content"]), READ_PAGE_CHARS)
+        self.assertGreater(len(result["data"]["content"]), READ_PAGE_CHARS - 100)
+
+    def test_read_can_number_lines_for_citations_without_changing_paging(self):
+        (self.workspace / "code.py").write_text("one\ntwo\nthree")
+        result = self.execute("read", {"path": "code.py", "offset": 2, "line_numbers": True})
+        self.assertEqual(result["data"]["content"], "     2\ttwo\n     3\tthree")
+        self.assertEqual(result["data"]["end_line"], 3)
+        plain = self.execute("read", {"path": "code.py", "limit": 1})
+        self.assertEqual(plain["data"]["content"], "one\n")
+        numbered = self.execute("read", {"path": "code.py", "limit": 1, "line_numbers": True})
+        self.assertEqual(numbered["data"]["content"], "     1\tone\n")
+        self.assertEqual(numbered["next_cursor"], plain["next_cursor"])
+        # Numbering is display only: edits still match the file's own text.
+        edited = self.execute(
+            "edit", {"path": "code.py", "edits": [{"oldText": "two", "newText": "2"}]}
+        )
+        self.assertEqual(edited["status"], "ok", edited)
+
+    def test_grep_paths_are_workspace_relative_inside_and_absolute_outside(self):
+        (self.workspace / "src").mkdir()
+        (self.workspace / "src" / "app.py").write_text("needle\n")
+        result = self.execute("grep", {"pattern": "needle", "path": "src"})
+        self.assertEqual([item["path"] for item in result["data"]["matches"]], ["src/app.py"])
+        self.assertEqual(
+            self.execute("read", {"path": "src/app.py"})["data"]["content"], "needle\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory).resolve() / "other.txt"
+            outside.write_text("needle\n")
+            result = self.execute("grep", {"pattern": "needle", "path": str(outside)})
+            self.assertEqual([item["path"] for item in result["data"]["matches"]], [str(outside)])
 
     def test_exec_keeps_complete_output_and_exit_status(self):
         program = "print('HEAD'); print('x' * 60000); print('TAIL'); raise SystemExit(7)"
