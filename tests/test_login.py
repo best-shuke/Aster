@@ -58,14 +58,14 @@ class TempDirTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.store = AuthStore(self.root / "aster" / "auth.json")
         self.addCleanup(auth.forget_account, self.store.path)
-        environment = patch.dict(
-            os.environ, {"DEEPSEEK_AUTH_FILE": str(self.store.path)}, clear=True
-        )
+        # A missing env file keeps every load_env() caller away from the repo's real .env.
+        isolated = {
+            "DEEPSEEK_AUTH_FILE": str(self.store.path),
+            "DEEPSEEK_ENV_FILE": str(self.root / "none.env"),
+        }
+        environment = patch.dict(os.environ, isolated, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
-        loader = patch("config.load_env")
-        loader.start()
-        self.addCleanup(loader.stop)
 
     def save_chatgpt(self, **overrides):
         tokens = auth.account_tokens(token_response(**overrides))
@@ -584,8 +584,7 @@ class LoginFlowTests(TempDirTest):
         self.assertEqual(login, Login("env"))
         self.assertEqual(self.store.read()["provider"], "env")
         cancelled = ScriptedConsole([None])
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(login_ui.run_login(cancelled, self.store))
+        self.assertIsNone(login_ui.run_login(cancelled, self.store))
         self.assertEqual(len(cancelled.questions[0][1]), 2)  # No variables, no third option.
         self.assertEqual(self.store.read()["provider"], "env")
 
