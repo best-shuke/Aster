@@ -38,6 +38,7 @@ from execution_trace import (
     trace_scope,
     traced_progress,
 )
+from goals import GoalState
 from mcp_client import McpManager
 from sessions import SessionStore
 from skills import SkillCatalog
@@ -104,6 +105,7 @@ class Conversation:
         self._execution_closed = False
         self.recovery_notice = None
         self.last_outcome = None
+        self.goal: GoalState | None = None
         self.sessions = SessionStore(settings.session_file)
         self.templates = TemplateStore(
             self.sessions, settings.workspace, directory=settings.templates_dir
@@ -184,6 +186,10 @@ class Conversation:
         self.last_environment_ref = data.get("environment_ref")
         self.tool_runs = data.get("tool_runs", [])
         self.last_outcome = data.get("last_outcome")
+        self.goal = (
+            GoalState.from_dict(data["goal"], restoring=True)
+            if data.get("goal") is not None else None
+        )
         self.recovery_notice = None
         if self.tools is not None:
             self.tools.reset_task()
@@ -225,7 +231,9 @@ class Conversation:
         if messages_only:
             data = deepcopy(data)
             data["session_id"] = uuid4().hex
-            for field in ("cache_stats", "template_id", "tool_runs", "task_state", "last_outcome"):
+            for field in (
+                "cache_stats", "template_id", "tool_runs", "task_state", "last_outcome", "goal"
+            ):
                 data.pop(field, None)
             self._apply_environment(
                 self.active_environment, keep=False, restore=data, on_connect=None
@@ -339,6 +347,8 @@ class Conversation:
         }
         if self.template_id is not None:
             data["template_id"] = self.template_id
+        if self.goal is not None:
+            data["goal"] = self.goal.to_dict()
         environment_id = self.environment_id or self.last_environment_id
         reference = self.environment_ref or self.last_environment_ref
         if environment_id is not None:
@@ -382,7 +392,7 @@ class Conversation:
 
     def _start_new(self, data: dict | None, template_id: str | None) -> None:
         messages = deepcopy(data["messages"]) if data is not None else []
-        if self.messages:
+        if self.messages or self.goal is not None:
             self.save()
         if not messages:
             self.sessions.remove_active()
@@ -392,6 +402,7 @@ class Conversation:
         self.template_id = template_id
         self.recovery_notice = None
         self.last_outcome = None
+        self.goal = None
         self.last_environment_id = self.environment_id
         self.last_environment_ref = self.environment_ref
         if self.tools is not None:
@@ -572,6 +583,7 @@ class Conversation:
         task_contract: TaskContract | None = None,
         on_reasoning: ContentCallback | None = None,
         on_tool_result: Callable[[str, ToolResultPayload], None] | None = None,
+        deadline: float | None = None,
     ) -> str:
         with self._exclusive_operation("任务或环境切换正在运行"):
             self._execution_title = " ".join(prompt.split())[:240]
@@ -595,6 +607,7 @@ class Conversation:
                         task_contract=task_contract,
                         on_reasoning=on_reasoning,
                         on_tool_result=display_callback(on_tool_result, name="tool_result"),
+                        deadline=deadline,
                     )
                 except BaseException as exc:
                     emit_event("task_failed", error_type=type(exc).__name__)
@@ -754,12 +767,13 @@ class Conversation:
         task_contract: TaskContract | None = None,
         on_reasoning: ContentCallback | None = None,
         on_tool_result: Callable[[str, ToolResultPayload], None] | None = None,
+        deadline: float | None = None,
     ) -> str:
-        deadline = (
+        configured_deadline = (
             time.monotonic() + self.settings.max_task_seconds
-            if self.settings.max_task_seconds is not None
-            else float("inf")
+            if self.settings.max_task_seconds is not None else float("inf")
         )
+        deadline = min(deadline if deadline is not None else float("inf"), configured_deadline)
         self.reload_prompt()
         self.last_environment_id = self.environment_id
         self.last_environment_ref = self.environment_ref

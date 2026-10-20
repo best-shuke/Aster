@@ -13,6 +13,7 @@ from config import Settings, system_prompt
 from contracts import Message, ToolRun
 from environments import ResolvedEnvironment
 from file_changes import EditLedger
+from goals import GoalState
 from mcp_client import McpManager
 from mcp_scope import ScopedMcp
 from reasoning import RolePromptCache
@@ -46,6 +47,7 @@ class ConversationState:
     session_id: str
     tool_runs: list[ToolRun]
     last_outcome: dict | None
+    goal: GoalState | None
     recovery_notice: str | None
     team: TeamRuntime | None
 
@@ -384,6 +386,7 @@ class EnvironmentTransition:
             conversation.session_id = uuid4().hex
             conversation.tool_runs = []
             conversation.last_outcome = None
+            conversation.goal = None
             conversation.recovery_notice = None
             if prepared.tools is not None:
                 prepared.tools.reset_task()

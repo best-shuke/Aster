@@ -43,6 +43,7 @@ class CommandName(Enum):
     MULTIAGENTS = "multiagents"
     LOGIN = "login"
     LOGOUT = "logout"
+    GOAL = "goal"
 
 
 class EffectKind(Enum):
@@ -78,7 +79,9 @@ NO_ARGUMENTS = frozenset(
         CommandName.LOGOUT,
     }
 )
-QUOTED_ARGUMENTS = frozenset({CommandName.TEMPLATE, CommandName.ENVIRONMENT, CommandName.WORKFLOW})
+QUOTED_ARGUMENTS = frozenset(
+    {CommandName.TEMPLATE, CommandName.ENVIRONMENT, CommandName.WORKFLOW, CommandName.GOAL}
+)
 
 
 @dataclass(frozen=True)

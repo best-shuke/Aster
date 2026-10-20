@@ -1,7 +1,7 @@
 """Terminal presentation and interactive selection for parsed commands."""
 
 from collections.abc import Callable, Sequence
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import cast
 
@@ -12,8 +12,38 @@ from conversation import Conversation
 from environment_commands import enter_multiagents, environment_subcommand
 from environment_definitions import SUBCOMMANDS
 from execution_history import execution_entries
+from goal_runtime import GoalRuntime, prepare_goal
+from goals import parse_goal
 from login_ui import describe, logout, model_client, run_login
 from ui import Console
+
+
+def use_goal(conversation: Conversation, console: Console, arguments: list[str], *, ask_task) -> bool:
+    command = parse_goal(arguments)
+    if command.action == "status":
+        if conversation.goal is None:
+            console.info("当前会话没有目标；用 /goal 目标描述 创建。")
+        else:
+            for line in conversation.goal.status_lines():
+                console.info(line)
+        return True
+    goal = prepare_goal(conversation, command)
+    if command.action in {"start", "resume"}:
+        interrupt = console.interrupt_on_escape() if console.interactive is True else nullcontext()
+        with interrupt:
+            GoalRuntime(
+                conversation,
+                ask_turn=lambda prompt, **options: ask_task(conversation, console, prompt, **options),
+                on_progress=console.progress,
+                on_round=lambda state: console.info(
+                    f"目标第 {state.rounds}/{state.max_rounds} 轮：{state.objective}"
+                ),
+                on_review=lambda state: console.info("正在核对目标、验收条件与执行证据…"),
+            ).run()
+        console.update_context(conversation.context_status())
+    for line in goal.status_lines():
+        console.info(line)
+    return command.action in {"pause", "cancel"} or goal.status == "completed"
 
 
 def conversation_count(conversation: Conversation) -> int:

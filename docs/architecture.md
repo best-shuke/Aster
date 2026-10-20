@@ -10,6 +10,7 @@
 | 模型、传输、限流与用量 | `deepseek_client.py`（OpenAI 兼容接口）、`chatgpt_client.py`（ChatGPT 账户，Responses 协议转换）、`client_runtime.py`、`http_transport.py`、`model_rate_limit.py`、`usage.py`、`generation_metrics.py` |
 | 会话与上下文 | `conversation.py`、`sessions.py`、`context_budget.py`、`context_management.py` |
 | 任务编排与验收 | `reasoning.py`、`task_runtime.py`、`task_acceptance.py`、`worker_checkpoint.py` |
+| 持续目标 | `goals.py`（目标状态与命令参数）、`goal_runtime.py`（多轮调度、证据核对与预算） |
 | 工具与文件状态 | `tools.py`、`tool_runtime.py`、`file_state.py`、`file_changes.py` |
 | 进程与执行记录 | `process_monitor.py`、`execution_history.py`、`execution_trace.py` |
 | 终端展示 | `ui.py`、`terminal_rendering.py`、`trace_ui.py` |

@@ -39,12 +39,13 @@ uv sync --locked
 - 流式响应、重试、限流协调、用量与提示缓存统计。
 - 文件读取、搜索、编辑、命令执行及后台进程观察。
 - 任务计划、子代理调度、文件修改冲突检测与检查点恢复。
+- `/goal` 持续目标：按验收条件自动推进多轮工作，支持总轮次/时间预算、暂停恢复及会话持久化。
 - 上下文预算、压缩、会话保存、历史恢复及执行轨迹。
 - MCP 客户端、skills 发现、环境切换、模板与 workflow 扩展接口。
 - 环境：按环境独立选择技能、MCP 服务与工具权限；`multi-agent` 环境运行多个独立成员代理，支持直接通信、任务依赖、共享产物与会议/辩论/独立调查等可选协议；交互会话中成员可在两次提问之间继续后台工作，并发编辑同一文件时自动三方合并。
 - 交互式终端、命令补全和 Markdown 输出。
 
-常用命令：`/help`、`/status`、`/login`、`/new`、`/history`、`/resume`、`/trace`、`/tasks`、`/skills`、`/environment`（`/env`）、`/multiagents`。完整说明可在运行后用 `/help` 与 `/env help` 查看。
+常用命令：`/help`、`/status`、`/login`、`/new`、`/history`、`/resume`、`/trace`、`/tasks`、`/goal`、`/skills`、`/environment`（`/env`）、`/multiagents`。完整说明可在运行后用 `/help` 与 `/env help` 查看。
 
 快捷键：行尾输入 `\` 再回车换行，`Tab` 补全命令，`Ctrl-T` 打开执行轨迹，任务运行中按 `Esc` 或 `Ctrl-C` 暂停。
 
@@ -72,6 +73,7 @@ TERM=xterm-256color uv run --locked python -m unittest discover -s tests
 
 - [架构](docs/architecture.md)：模块划分与执行链路。
 - [环境](docs/environments.md)：环境定义、能力继承、多代理运行时与协作协议。
+- [持续目标](docs/goals.md)：自动续跑、验收、预算及暂停恢复。
 - [多代理演示](docs/multi-agent-demo.md)：一次真实运行的分工、直接求助与会议记录。
 - [配置入口](docs/configuration.md)：模型、目录与扩展设置。
 - [Git 与私密数据](docs/git-policy.md)：提交边界。

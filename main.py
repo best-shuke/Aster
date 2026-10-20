@@ -29,6 +29,7 @@ from command_ui import (
 from command_ui import (
     use_environment as use_environment,
 )
+from command_ui import use_goal as present_goal
 from command_ui import (
     use_multiagents as use_multiagents,
 )
@@ -64,6 +65,15 @@ HELP = (
             ("/history [数量|all]", "查看对话记录；不带参数时选择范围"),
             ("/session", "查看会话文件位置"),
             ("/exit, /quit", "退出（也可按 Ctrl-D）"),
+        ),
+    ),
+    (
+        "持续目标",
+        (
+            ('/goal [start] "目标"', "创建持续目标，自动执行、核对验收并继续下一轮"),
+            ("/goal status|pause|cancel", "查看、暂停或取消当前会话的目标"),
+            ("/goal resume [补充说明]", "恢复目标；--max-rounds / --max-seconds 调整总预算"),
+            ('--criterion "条件"', "创建目标时添加验收条件，可重复；默认 20 轮、3600 秒"),
         ),
     ),
     (
@@ -132,6 +142,10 @@ def use_workflow(conversation: Conversation, console: Console, arguments: list[s
     present_workflow(conversation, console, arguments, ask_task=ask)
 
 
+def use_goal(conversation: Conversation, console: Console, arguments: list[str]) -> bool:
+    return present_goal(conversation, console, arguments, ask_task=ask)
+
+
 def handle_command(conversation: Conversation, console: Console, prompt: str) -> CommandResult:
     execution = execute_command(parse_command(prompt), conversation)
     present_command(
@@ -152,6 +166,7 @@ def handle_command(conversation: Conversation, console: Console, prompt: str) ->
             CommandName.EFFORT: update_effort,
             CommandName.LOGIN: use_login,
             CommandName.LOGOUT: use_logout,
+            CommandName.GOAL: use_goal,
         },
     )
     return execution.result
@@ -175,6 +190,8 @@ def run_interactive(conversation: Conversation, console: Console) -> None:
     show_skill_diagnostics(conversation, console)
     if conversation.recovery_notice:
         console.info(conversation.recovery_notice)
+    if getattr(conversation, "goal", None) is not None:
+        console.info("当前会话有已保存的目标；/goal status 查看，/goal resume 继续。")
     if conversation.tools is not None:
         console.restore_task(
             conversation.tools.task_title,
@@ -223,7 +240,7 @@ def cache_totals(conversation: Conversation) -> dict | None:
     return stats.totals() if isinstance(stats, CacheStats) else None
 
 
-def ask(conversation: Conversation, console: Console, prompt: str) -> str:
+def ask(conversation: Conversation, console: Console, prompt: str, **task_options) -> str:
     console.execution_provider = lambda: execution_entries(
         conversation.execution_snapshot(), conversation.messages
     )
@@ -247,6 +264,7 @@ def ask(conversation: Conversation, console: Console, prompt: str) -> str:
                 on_progress=console.progress,
                 on_reasoning=console.reasoning,
                 on_tool_result=console.tool_result,
+                **task_options,
             )
         status = (conversation.last_outcome or {}).get("status", "incomplete")
         completed = status == "completed"
@@ -396,6 +414,20 @@ def main() -> int:
                         f"MCP {failure['server']} 连接失败：{failure['error']}；使用时会自动重试。"
                     )
             if prompt:
+                if command is not None and command.name is CommandName.GOAL:
+                    try:
+                        if command.error is not None:
+                            raise command.error
+                        return 0 if use_goal(conversation, console, list(command.arguments)) else 1
+                    except KeyboardInterrupt:
+                        console.info("目标已暂停，已保存可恢复的进展。")
+                        return 130
+                    except ValueError as exc:
+                        console.error(exc)
+                        return 2
+                    except Exception as exc:
+                        console.error(exc)
+                        return 1
                 if environment_command:
                     if command.error is not None:
                         console.error(command.error)

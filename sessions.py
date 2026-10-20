@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from file_state import atomic_write_text, file_digest
+from goals import GoalState
 from tool_runtime import validate_tool_calls
 
 
@@ -83,6 +84,8 @@ class SessionStore:
         if session_id is not None:
             self.snapshot_path(session_id)
         self._validate_environment(data)
+        if data.get("goal") is not None:
+            GoalState.from_dict(data["goal"])
 
     def read(self, path: Path | None = None) -> dict:
         path = self.active_file if path is None else path
@@ -132,7 +135,7 @@ class SessionStore:
         snapshot = self.snapshot_path(data["session_id"])
         content = json.dumps(data, ensure_ascii=False, indent=2)
         with self._locked():
-            if data["messages"]:
+            if data["messages"] or data.get("goal") is not None:
                 self._write(snapshot, content)
             self._write(self.active_file, content)
             self._revision = file_digest(self.active_file)
@@ -141,7 +144,7 @@ class SessionStore:
         content = json.dumps(data, ensure_ascii=False, indent=2)
         snapshots = {}
         for item in (previous, data):
-            if item["messages"]:
+            if item["messages"] or item.get("goal") is not None:
                 snapshots[self.snapshot_path(item["session_id"])] = json.dumps(
                     item, ensure_ascii=False, indent=2
                 )
@@ -174,7 +177,7 @@ class SessionStore:
                     raise ValueError("session ID does not match file name")
                 messages = data["messages"]
                 count = sum(message["role"] in {"user", "assistant"} for message in messages)
-                if not count:
+                if not count and data.get("goal") is None:
                     continue
                 title = next(
                     (
@@ -184,7 +187,7 @@ class SessionStore:
                         and isinstance(message.get("content"), str)
                         and message["content"].strip()
                     ),
-                    "未命名会话",
+                    (data.get("goal") or {}).get("objective", "未命名会话"),
                 )
                 sessions.append(
                     SavedSession(

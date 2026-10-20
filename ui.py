@@ -111,6 +111,7 @@ _SLASH_COMMANDS = {
     "/environment": "选择、确认或切换能力环境",
     "/exit": "退出",
     "/help": "查看帮助",
+    "/goal": "创建、查看、暂停或恢复持续目标",
     "/history": "查看对话历史",
     "/login": "选择登录方式：ChatGPT 账户或第三方 API",
     "/logout": "退出登录并删除保存的凭据",
