@@ -285,9 +285,7 @@ except SessionConflictError:
             conversation.last_outcome = {"status": status}
             with (
                 self.subTest(status=status),
-                patch(
-                    "main.Settings.from_env", return_value=replace(self.settings, mcp_enabled=False)
-                ),
+                patch("main.load_settings", return_value=replace(self.settings, mcp_enabled=False)),
                 patch("main.Conversation", return_value=conversation),
                 patch("main.Console"),
                 patch("main.ask"),

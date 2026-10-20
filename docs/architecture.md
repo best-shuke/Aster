@@ -1,12 +1,13 @@
 # 框架架构
 
-主链路由 `main.py` 启动，读取 `config.py` 配置，构建模型客户端、会话、工具和终端界面。配置使用既有的 `DEEPSEEK_*` 名称，项目名称为 Aster。
+主链路由 `main.py` 启动，读取保存的登录选择（首次启动时询问）与 `config.py` 配置，按登录方式构建模型客户端，再构建会话、工具和终端界面。配置使用既有的 `DEEPSEEK_*` 名称，项目名称为 Aster。
 
 | 职责 | 模块 |
 | --- | --- |
 | CLI 与交互命令 | `main.py`、`commands.py`、`command_ui.py` |
 | 配置、协议与系统提示 | `config.py`、`contracts.py`、`system_prompt.md` |
-| 模型、传输、限流与用量 | `deepseek_client.py`、`client_runtime.py`、`http_transport.py`、`model_rate_limit.py`、`usage.py`、`generation_metrics.py` |
+| 登录 | `auth.py`（登录选择存储、ChatGPT OAuth 与令牌刷新）、`login_ui.py`（登录菜单） |
+| 模型、传输、限流与用量 | `deepseek_client.py`（OpenAI 兼容接口）、`chatgpt_client.py`（ChatGPT 账户，Responses 协议转换）、`client_runtime.py`、`http_transport.py`、`model_rate_limit.py`、`usage.py`、`generation_metrics.py` |
 | 会话与上下文 | `conversation.py`、`sessions.py`、`context_budget.py`、`context_management.py` |
 | 任务编排与验收 | `reasoning.py`、`task_runtime.py`、`task_acceptance.py`、`worker_checkpoint.py` |
 | 工具与文件状态 | `tools.py`、`tool_runtime.py`、`file_state.py`、`file_changes.py` |

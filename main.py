@@ -1,8 +1,12 @@
 import argparse
+import os
 import shlex
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+from auth import AuthError, AuthStore
+from chatgpt_client import ChatGPTClient
 from command_ui import (
     conversation_count,
     present_command,
@@ -12,6 +16,8 @@ from command_ui import (
     show_skills,
     show_tool,
     show_trace,
+    use_login,
+    use_logout,
     use_template,
 )
 from command_ui import (
@@ -37,10 +43,11 @@ from commands import (
     execute_command,
     parse_command,
 )
-from config import APP_NAME, CLI_NAME, Settings
+from config import APP_NAME, CLI_NAME, LoginRequired, Settings, auth_file, load_env
 from conversation import Conversation
 from deepseek_client import DeepSeekClient
 from execution_history import execution_entries
+from login_ui import describe, run_login
 from mcp_client import McpManager
 from skills import SkillCatalog
 from tools import CodingTools
@@ -101,7 +108,11 @@ HELP = (
     ),
     (
         "设置",
-        (("/effort [档位]", "推理强度：default / off / low / high / max"),),
+        (
+            ("/login", "登录方式：ChatGPT 账户（Plus / Pro）或第三方 API，并选择模型"),
+            ("/logout", "退出登录并删除保存的凭据"),
+            ("/effort [档位]", "推理强度：default / off / low / high / max"),
+        ),
     ),
     (
         "快捷键",
@@ -139,6 +150,8 @@ def handle_command(conversation: Conversation, console: Console, prompt: str) ->
             CommandName.WORKFLOW: use_workflow,
             CommandName.SKILLS: show_skills,
             CommandName.EFFORT: update_effort,
+            CommandName.LOGIN: use_login,
+            CommandName.LOGOUT: use_logout,
         },
     )
     return execution.result
@@ -253,6 +266,33 @@ def ask(conversation: Conversation, console: Console, prompt: str) -> str:
         console.task_end(completed, failed=failed, status=status)
 
 
+def load_settings(*, choose: bool, one_shot: bool) -> Settings | None:
+    """Settings from the saved login; an interactive first start asks how to sign in."""
+    store = AuthStore(auth_file())
+    try:
+        login = store.login()
+    except AuthError as exc:
+        print(f"警告：{exc}", file=sys.stderr)
+        login = None
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        load_env()
+        # A one-shot prompt with model variables already configured runs without a menu.
+        configured = one_shot and bool(os.environ.get("DEEPSEEK_API_KEY"))
+        if choose or (login is None and not configured):
+            console = Console()
+            console.toolbar = False
+            login = run_login(console, store, first_run=not choose) or login
+    try:
+        return Settings.from_env(login)
+    except LoginRequired:
+        print(
+            f"尚未登录：在终端运行 {CLI_NAME} 选择 ChatGPT 账户或第三方 API，"
+            "或设置 DEEPSEEK_API_KEY。",
+            file=sys.stderr,
+        )
+        return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog=CLI_NAME, description=f"{APP_NAME} — 终端任务助手")
     parser.add_argument("--environment", metavar="NAME", help="显式选择能力环境")
@@ -263,6 +303,9 @@ def main() -> int:
     parser.add_argument(
         "--no-skills", action="store_true", help="关闭默认技能发现；仍加载 --skill 指定的路径"
     )
+    parser.add_argument(
+        "--login", action="store_true", help="启动前重新选择登录方式（ChatGPT 账户或第三方 API）"
+    )
     parser.add_argument("prompt", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
     prompt = " ".join(arguments.prompt).strip()
@@ -270,7 +313,9 @@ def main() -> int:
         prompt = shlex.join(arguments.prompt)
     command = parse_command(prompt)
     environment_command = command is not None and command.name is CommandName.ENVIRONMENT
-    settings = Settings.from_env()
+    settings = load_settings(choose=arguments.login, one_shot=bool(prompt))
+    if settings is None:
+        return 2
     skills = SkillCatalog(
         settings.workspace,
         settings.skills_dir,
@@ -307,6 +352,7 @@ def main() -> int:
         websearch_status=websearch_status,
         mcp_status=mcp_status,
     )
+    console.account = describe(settings)
     tools = CodingTools(
         settings.workspace, on_tool=console.tool, on_task_update=console.task_update
     )
@@ -318,13 +364,17 @@ def main() -> int:
         tools.attach_mcp(mcp_manager)
     conversation = Conversation(
         settings,
-        DeepSeekClient(settings),
+        ChatGPTClient(settings) if settings.provider == "chatgpt" else DeepSeekClient(settings),
         tools,
         skills=skills,
         mcp_manager=mcp_manager,
     )
     # The status bar, /status and task summaries show prompt cache hit rates.
     console.cache_provider = lambda: cache_totals(conversation)
+    # A ChatGPT account reports its plan usage windows with each response.
+    console.quota_provider = lambda: getattr(
+        getattr(conversation.client, "account", None), "quota", None
+    )
 
     screen = (
         console.session_screen() if console.interactive is True and not prompt else nullcontext()

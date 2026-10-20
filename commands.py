@@ -41,6 +41,8 @@ class CommandName(Enum):
     EFFORT = "effort"
     PROMPT = "prompt"
     MULTIAGENTS = "multiagents"
+    LOGIN = "login"
+    LOGOUT = "logout"
 
 
 class EffectKind(Enum):
@@ -72,6 +74,8 @@ NO_ARGUMENTS = frozenset(
         CommandName.CACHE,
         CommandName.HELP,
         CommandName.PROMPT,
+        CommandName.LOGIN,
+        CommandName.LOGOUT,
     }
 )
 QUOTED_ARGUMENTS = frozenset({CommandName.TEMPLATE, CommandName.ENVIRONMENT, CommandName.WORKFLOW})

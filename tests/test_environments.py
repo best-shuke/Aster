@@ -661,7 +661,7 @@ class EnvironmentTests(EnvironmentTestCase):
 
                 console = Mock(interactive=False)
                 with (
-                    patch("main.Settings.from_env", return_value=settings),
+                    patch("main.load_settings", return_value=settings),
                     patch("main.McpManager", return_value=manager),
                     patch.object(manager, "connect_all") as connect,
                     patch("main.DeepSeekClient", return_value=client),

@@ -2,9 +2,22 @@
 
 所有默认值与解析规则以 `config.py` 为准。仓库不包含 `.env`、MCP 配置、个人技能或环境定义；请按自己的服务和工作区创建。
 
+## 登录方式
+
+模型来源有三种，首次在终端启动时选择，之后用 `/login`、`/logout` 或 `agent --login` 管理：
+
+| 方式 | 说明 |
+| --- | --- |
+| ChatGPT 账户（Plus / Pro） | OAuth 登录（浏览器回调 `localhost:1455`，或 `auth.openai.com/codex/device` 设备码），请求发往 ChatGPT 的 Codex 后端并计入订阅额度；令牌过期前自动刷新，`/status` 显示额度窗口用量 |
+| 第三方 API | 任意 OpenAI 兼容 `/chat/completions` 服务；保存服务地址、API Key 与模型 |
+| 环境变量 | 使用下表中的 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` |
+
+选择与凭据保存在 `DEEPSEEK_AUTH_FILE`（默认 `~/.agents/aster/auth.json`，权限 0600）。保存的选择优先于环境变量；没有保存的选择时，单次执行和非交互运行直接使用环境变量。ChatGPT 刷新令牌只能使用一次，多个 Aster 进程通过同目录的锁文件共享刷新结果；请不要把该文件复制给其他程序同时使用。
+
 | 环境变量 | 用途 |
 | --- | --- |
-| `DEEPSEEK_API_KEY` | 模型凭据，运行模型功能需要 |
+| `DEEPSEEK_AUTH_FILE` | 登录选择与凭据文件，默认 `~/.agents/aster/auth.json` |
+| `DEEPSEEK_API_KEY` | 环境变量方式的模型凭据 |
 | `DEEPSEEK_BASE_URL` | 模型服务地址，默认 `https://api.deepseek.com` |
 | `DEEPSEEK_MODEL` | 模型名称，默认 `deepseek-chat` |
 | `DEEPSEEK_ENV_FILE` | 私密配置文件位置；启动脚本固定使用程序目录的 `.env` |

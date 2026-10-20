@@ -40,7 +40,7 @@ class InteractionReliabilityTests(unittest.TestCase):
     def run_main(self, arguments, **patches):
         with (
             patch("sys.argv", ["main.py", *arguments]),
-            patch("main.Settings.from_env", return_value=self.settings),
+            patch("main.load_settings", return_value=self.settings),
             patch("main.DeepSeekClient", return_value=FakeClient()),
             patch("main.Console", return_value=self.console),
             ExitStack() as stack,

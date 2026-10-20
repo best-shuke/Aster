@@ -313,7 +313,7 @@ class WebSearchTests(unittest.TestCase):
             )
             with (
                 self.subTest(configured=configured, enabled=enabled),
-                patch("main.Settings.from_env", return_value=current),
+                patch("main.load_settings", return_value=current),
                 patch("main.Console"),
                 patch("main.Conversation") as conversation,
                 patch("main.run_interactive"),

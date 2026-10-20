@@ -130,12 +130,16 @@ class _StreamAccumulator:
         self.reasoning_chars = 0
         self.paragraph_tail = ""
         self.paragraphs: dict[str, int] = {}
+        # Provider state kept with the message but never sent back as wire content.
+        self.metadata: dict[str, Any] = {}
 
     def snapshot(self) -> Message:
         message: Message = {"role": "assistant", "content": "".join(self.content) or None}
         message.update({key: "".join(parts) for key, parts in self.reasoning.items()})
         if self.tool_calls:
             message["tool_calls"] = [self.tool_calls[index] for index in sorted(self.tool_calls)]
+        if self.metadata:
+            message[LOCAL_METADATA] = dict(self.metadata)
         return message
 
     def _append_reasoning(self, delta: dict[str, Any]) -> bool:
@@ -587,6 +591,19 @@ class DeepSeekClient:
         if tools is not None:
             body.update(tools=tools, tool_choice="auto")
 
+        output_tokens = self._output_tokens(messages, tools, max_output_tokens)
+        if output_tokens is not None:
+            body["max_tokens"] = output_tokens
+
+        self._set_reasoning_parameters(body)
+        return body
+
+    def _output_tokens(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None,
+        max_output_tokens: int | None,
+    ) -> int | None:
         output_tokens = (
             self.settings.max_output_tokens if max_output_tokens is None else max_output_tokens
         )
@@ -603,11 +620,7 @@ class DeepSeekClient:
             output_tokens = (
                 min(output_tokens, available) if output_tokens is not None else available
             )
-        if output_tokens is not None:
-            body["max_tokens"] = output_tokens
-
-        self._set_reasoning_parameters(body)
-        return body
+        return output_tokens
 
     def _set_reasoning_parameters(self, body: dict[str, Any]) -> None:
         host = urlsplit(self.settings.base_url).hostname or ""
@@ -702,7 +715,7 @@ class DeepSeekClient:
     def _perform_request(
         self,
         request: urllib.request.Request,
-        body: dict[str, Any],
+        input_messages: list[Message],
         tools: list[dict[str, Any]] | None,
         on_content: ContentCallback | None,
         purpose: str,
@@ -726,6 +739,7 @@ class DeepSeekClient:
             # Headers confirm acceptance; a long healthy reasoning stream must
             # not hold all other recovery requests behind the probe.
             self.request_gate.accepted(admission)
+            self._observe_headers(getattr(response, "headers", None) or {})
             if on_content is None:
                 message = self._read_nonstream_response(response, observed)
             else:
@@ -741,7 +755,49 @@ class DeepSeekClient:
                     metrics=metrics,
                     on_delta=on_progress if purpose in {"solve", "final"} else None,
                 )
-        return self._attach_usage(message, body["messages"], tools, observed)
+        return self._attach_usage(message, input_messages, tools, observed)
+
+    def _observe_headers(self, headers: dict[str, str]) -> None:
+        """Response headers of an accepted request; providers may report quota here."""
+
+    def _http_request(self, body: dict[str, Any]) -> urllib.request.Request:
+        return urllib.request.Request(
+            f"{self.settings.base_url}/chat/completions",
+            data=json.dumps(body, ensure_ascii=False).encode(),
+            headers={
+                "Authorization": f"Bearer {self.settings.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+    @staticmethod
+    def _system_fingerprint(body: dict[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "model": body.get("model"),
+                    "system": [
+                        message for message in body["messages"] if message.get("role") == "system"
+                    ],
+                    "tools": body.get("tools"),
+                    "reasoning_effort": body.get("reasoning_effort"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _http_error(self, exc: urllib.error.HTTPError) -> CompletionError:
+        retry_after = retry_after_seconds(exc.headers.get("Retry-After")) if exc.headers else None
+        exc.close()
+        # Provider error bodies may echo credentials. Never publish them.
+        return CompletionError(
+            f"http_{exc.code}",
+            f"Model API returned HTTP {exc.code}",
+            retryable=exc.code in {408, 429} or exc.code >= 500,
+            retry_after=retry_after,
+        )
 
     def _complete_once(
         self,
@@ -760,29 +816,8 @@ class DeepSeekClient:
     ) -> Message:
         cache_stats = self.cache_stats
         body = self._request_body(messages, tools, on_content is not None, max_output_tokens)
-        system_fingerprint = hashlib.sha256(
-            json.dumps(
-                {
-                    "model": body.get("model"),
-                    "system": [
-                        message for message in body["messages"] if message.get("role") == "system"
-                    ],
-                    "tools": body.get("tools"),
-                    "reasoning_effort": body.get("reasoning_effort"),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
-        request = urllib.request.Request(
-            f"{self.settings.base_url}/chat/completions",
-            data=json.dumps(body, ensure_ascii=False).encode(),
-            headers={
-                "Authorization": f"Bearer {self.settings.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+        system_fingerprint = self._system_fingerprint(body)
+        request = self._http_request(body)
         generation_deadline, effective_deadline, remaining, io_deadline = self._request_timing(
             timeout, generation_timeout, deadline
         )
@@ -790,7 +825,7 @@ class DeepSeekClient:
         try:
             return self._perform_request(
                 request,
-                body,
+                messages,
                 tools,
                 on_content,
                 purpose,
@@ -804,17 +839,7 @@ class DeepSeekClient:
                 _admission,
             )
         except urllib.error.HTTPError as exc:
-            retry_after = (
-                retry_after_seconds(exc.headers.get("Retry-After")) if exc.headers else None
-            )
-            exc.close()
-            # Provider error bodies may echo credentials. Never publish them.
-            raise CompletionError(
-                f"http_{exc.code}",
-                f"Model API returned HTTP {exc.code}",
-                retryable=exc.code in {408, 429} or exc.code >= 500,
-                retry_after=retry_after,
-            ) from exc
+            raise self._http_error(exc) from exc
         except http_transport.TransportCancelled as exc:
             raise CompletionError("cancelled", "Model request cancelled") from exc
         except http_transport.TransportDeadline as exc:
@@ -827,7 +852,7 @@ class DeepSeekClient:
         except urllib.error.URLError as exc:
             raise CompletionError(
                 "connection_error",
-                f"Cannot reach DeepSeek API: {exc.reason}",
+                f"Cannot reach model API: {exc.reason}",
                 retryable=not isinstance(exc.reason, ssl.SSLCertVerificationError),
             ) from exc
         except (TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException) as exc:
@@ -927,8 +952,9 @@ class DeepSeekClient:
                 metrics.observe(payload)
             state.add_payload(payload)
 
-    @staticmethod
+    @classmethod
     def _read_stream(
+        cls,
         response: Any,
         on_content: ContentCallback,
         *,
@@ -941,9 +967,7 @@ class DeepSeekClient:
     ) -> Message:
         state = _StreamAccumulator(on_content, max_reasoning_chars, on_delta)
         try:
-            DeepSeekClient._consume_stream(
-                response, state, deadline, generation_deadline, on_usage, metrics
-            )
+            cls._consume_stream(response, state, deadline, generation_deadline, on_usage, metrics)
         except CompletionError as exc:
             exc.partial_message = state.snapshot()
             raise
