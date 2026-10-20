@@ -5,12 +5,14 @@ from contextlib import suppress
 from pathlib import Path
 from typing import cast
 
+from auth import AuthStore
 from commands import CommandActions, CommandExecution, CommandName, EffectKind, ParsedCommand
-from config import REASONING_EFFORTS
+from config import REASONING_EFFORTS, LoginRequired, auth_file
 from conversation import Conversation
 from environment_commands import enter_multiagents, environment_subcommand
 from environment_definitions import SUBCOMMANDS
 from execution_history import execution_entries
+from login_ui import describe, logout, model_client, run_login
 from ui import Console
 
 
@@ -509,6 +511,32 @@ def update_effort(conversation: Conversation, console: Console, arguments: list[
         console.success(f"推理强度已设为 {effort}，从下一次提问生效（含子任务，仅当前进程）。")
     except ValueError as exc:
         console.error(exc)
+
+
+def use_login(conversation: Conversation, console: Console, arguments: list[str]) -> None:
+    store = AuthStore(conversation.settings.auth_file or auth_file())
+    login = run_login(console, store)
+    if login is None:
+        console.info("登录方式未改变。")
+        return
+    try:
+        conversation.switch_login(login, model_client(conversation.settings.with_login(login)))
+    except (LoginRequired, RuntimeError, ValueError) as exc:
+        console.warning(f"新的登录方式已保存，重启 Aster 后生效；当前会话未切换：{exc}")
+        return
+    settings = conversation.settings
+    console.model = settings.model
+    console.account = describe(settings)
+    console.update_context(conversation.context_status())
+    console.success(f"已切换到 {settings.model}（{console.account}），从下一次提问生效。")
+
+
+def use_logout(conversation: Conversation, console: Console, arguments: list[str]) -> None:
+    if logout(console, AuthStore(conversation.settings.auth_file or auth_file())):
+        if conversation.settings.provider == "chatgpt":
+            console.info("当前会话无法再使用 ChatGPT 账户；用 /login 重新登录或改用第三方 API。")
+        else:
+            console.info("当前进程仍使用已加载的 API 配置，退出后失效。")
 
 
 def sync_environment_ui(conversation: Conversation, console: Console) -> None:

@@ -8,7 +8,14 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from config import Settings, environment_context, parse_reasoning_effort, system_prompt
+from config import (
+    Login,
+    Settings,
+    environment_context,
+    login_fields,
+    parse_reasoning_effort,
+    system_prompt,
+)
 from context_budget import WireCache, context_snapshot
 from context_management import compact_messages, summarize
 from contracts import (
@@ -414,6 +421,25 @@ class Conversation:
         self.settings = settings
         if self.tools is not None:
             self.tools.attach_reasoning(self.client, max_workers=settings.max_subagents)
+
+    def switch_login(self, login: Login, client: CompletionClient) -> None:
+        """Continue this conversation on another model service from the next request."""
+        with self._exclusive_operation("任务或环境切换正在运行，不能切换登录"):
+            if self.team is not None:
+                raise RuntimeError("团队成员正在使用当前登录；先 /env exit，或重启 Aster 后生效")
+            fields = login_fields(login)  # Raises before anything changes.
+            self._baseline_settings = replace(self._baseline_settings, **fields)
+            self.environments.baseline = replace(self.environments.baseline, **fields)
+            if self.active_environment is not None:
+                self.active_environment = replace(
+                    self.active_environment,
+                    settings=replace(self.active_environment.settings, **fields),
+                )
+            self.settings = replace(self.settings, **fields)
+            client.settings = self.settings
+            self.client = client
+            if self.tools is not None:
+                self.tools.attach_reasoning(client, max_workers=self.settings.max_subagents)
 
     def apply_environment(
         self,

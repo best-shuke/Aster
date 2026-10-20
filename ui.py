@@ -1,3 +1,4 @@
+import asyncio
 import difflib
 import os
 import select
@@ -50,6 +51,7 @@ from execution_history import (
 )
 from execution_trace import current_trace
 from terminal_rendering import StreamingDisplay, TaskLive
+from usage import coarse_duration
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -110,6 +112,8 @@ _SLASH_COMMANDS = {
     "/exit": "退出",
     "/help": "查看帮助",
     "/history": "查看对话历史",
+    "/login": "选择登录方式：ChatGPT 账户或第三方 API",
+    "/logout": "退出登录并删除保存的凭据",
     "/multiagents": "进入默认多代理团队环境",
     "/trace": "浏览执行轨迹、命令和工具结果",
     "/tool": "按编号查看某次工具调用",
@@ -342,6 +346,30 @@ def _duration_short(seconds: float) -> str:
     return f"{seconds:.1f}s" if seconds < 60 else _duration(seconds, compact=True)
 
 
+def _quota_text(quota: dict[str, Any]) -> str:
+    """Plan usage windows from the provider, e.g. ``5 小时 9% · 7 天 1%``."""
+    parts = []
+    for name in ("primary", "secondary"):
+        window = quota.get(name)
+        if not isinstance(window, dict) or "used-percent" not in window:
+            continue
+        minutes = window.get("window-minutes")
+        label = (
+            f"{minutes / 1440:g} 天"
+            if minutes and minutes >= 1440
+            else f"{minutes / 60:g} 小时"
+            if minutes
+            else "窗口"
+        )
+        text = f"{label} 已用 {window['used-percent']:g}%"
+        reset = window.get("reset-after-seconds")
+        if reset:
+            elapsed = time.time() - quota.get("observed_at", time.time())
+            text += f"（{coarse_duration(max(0, reset - elapsed))}后重置）"
+        parts.append(text)
+    return " · ".join(parts)
+
+
 def _token_count(value: int) -> str:
     if value >= 1_000_000:
         return f"{value / 1_000_000:.1f}M".replace(".0M", "M")
@@ -564,6 +592,11 @@ class Console:
         self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self.colors = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
         self.model = model
+        # Which login serves the model, e.g. "ChatGPT · name@example.com · Plus".
+        self.account = ""
+        # The status toolbar under prompts; off before any model is configured.
+        self.toolbar = True
+        self.quota_provider: Callable[[], dict[str, Any] | None] | None = None
         self.workspace = workspace or Path.cwd()
         self.reasoning_effort = reasoning_effort
         self.websearch_status = websearch_status
@@ -933,6 +966,8 @@ class Console:
             return Group(*rows)
 
         model = Text.assemble(("模型    ", "bright_black"), (self.model, "bold bright_cyan"))
+        if self.account:
+            model.append(f"  {self.account}", style="dim")
         branch = _git_branch(self.workspace)
         branch_label = Text(f"⎇ {branch}", style="magenta") if branch else None
         reserved = 8 + (_display_width(branch_label.plain) + 2 if branch_label else 0)
@@ -1063,6 +1098,7 @@ class Console:
         }.get(health, (health, "yellow"))
         runtime: list[tuple[str, Any]] = [
             ("模型", Text(self.model, style="bold cyan")),
+            *([("登录", self.account)] if self.account else []),
             ("推理", self.reasoning_effort),
             (
                 "环境",
@@ -1133,6 +1169,9 @@ class Console:
                 )
             else:
                 usage.append(("压缩阈值", f"{snapshot['budget_tokens']:,} tokens"))
+        quota = self.quota_provider() if self.quota_provider else None
+        if quota:
+            usage.append(("额度", _quota_text(quota)))
         usage.append(("速度", self._tps_label()))
         output_tokens = self._output_tokens()
         if output_tokens:
@@ -1225,7 +1264,15 @@ class Console:
         with self._suspend_live():
             return self._read_prompt(prompt)
 
-    def _read_prompt(self, prompt: str, *, isolated: bool = False) -> str:
+    def _read_prompt(
+        self,
+        prompt: str,
+        *,
+        isolated: bool = False,
+        secret: bool = False,
+        until: threading.Event | None = None,
+    ) -> str:
+        """``until`` ends an isolated prompt early with an empty answer once it is set."""
         if not self.interactive:
             return input(prompt)
         if isolated or self._prompt_session is None:
@@ -1301,7 +1348,7 @@ class Console:
                 ),
                 reserve_space_for_menu=0 if isolated else 6,
                 include_default_pygments_style=False,
-                bottom_toolbar=self._toolbar_fragments,
+                bottom_toolbar=self._toolbar_fragments if self.toolbar else None,
                 style=Style.from_dict(
                     {
                         "bottom-toolbar": "fg:ansibrightblack bg:default noreverse",
@@ -1326,9 +1373,25 @@ class Console:
                 self._prompt_session = session
         else:
             session = self._prompt_session
+
+        def watch_until() -> None:
+            app = get_app()
+
+            async def wait() -> None:
+                while not until.is_set():
+                    await asyncio.sleep(0.1)
+                app.exit(result="")
+
+            app.create_background_task(wait())
+
+        options: dict[str, Any] = {}
+        if secret:
+            options["is_password"] = True
+        if until is not None:
+            options["pre_run"] = watch_until
         # Team members may report from their threads while the prompt waits for input.
         with patch_stdout(raw=True):
-            return session.prompt([("class:prompt.marker", prompt)])
+            return session.prompt([("class:prompt.marker", prompt)], **options)
 
     @contextmanager
     def interrupt_on_escape(self):
@@ -1360,11 +1423,16 @@ class Console:
         value = self._read_input("  You  › ")
         return value if self.interactive else value.strip()
 
-    def read_value(self, prompt: str) -> str | None:
+    def read_value(
+        self, prompt: str, *, secret: bool = False, until: threading.Event | None = None
+    ) -> str | None:
         self._clear_status()
+        options: dict[str, Any] = {"secret": True} if secret else {}
+        if until is not None:
+            options["until"] = until
         with self._suspend_live():
             try:
-                return self._read_prompt(prompt, isolated=True)
+                return self._read_prompt(prompt, isolated=True, **options)
             except (EOFError, KeyboardInterrupt):
                 return None
 

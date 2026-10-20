@@ -24,7 +24,7 @@ class CliBrandingTests(unittest.TestCase):
         with (
             patch("sys.argv", ["main.py", "--help"]),
             patch("sys.stdout", output),
-            patch("main.Settings.from_env") as settings,
+            patch("main.load_settings") as settings,
             self.assertRaises(SystemExit) as raised,
         ):
             main()
@@ -108,7 +108,7 @@ class SessionCommandTests(unittest.TestCase):
             console.update_mcp.assert_called_once_with(servers)
 
         with (
-            patch("main.Settings.from_env", return_value=settings),
+            patch("main.load_settings", return_value=settings),
             patch("main.McpManager", return_value=manager),
             patch("main.Console") as console,
             patch("main.Conversation") as conversations,
@@ -137,7 +137,7 @@ class SessionCommandTests(unittest.TestCase):
             },
         )
         with (
-            patch("main.Settings.from_env", return_value=settings),
+            patch("main.load_settings", return_value=settings),
             patch("main.McpManager", return_value=manager),
             patch("main.Console") as console,
             patch("main.Conversation") as conversations,
@@ -354,7 +354,7 @@ class SkillStartupTests(unittest.TestCase):
             with self.subTest(enabled=enabled):
                 settings = Mock(mcp_enabled=False, websearch_enabled=False, skills_enabled=enabled)
                 with (
-                    patch("main.Settings.from_env", return_value=settings),
+                    patch("main.load_settings", return_value=settings),
                     patch("main.Console") as console,
                     patch("main.Conversation") as conversations,
                     patch("main.SkillCatalog") as catalog,
@@ -382,7 +382,7 @@ class SkillStartupTests(unittest.TestCase):
         settings = Mock(mcp_enabled=False, websearch_enabled=False, skills_enabled=True)
         error = ValueError("没有找到 skill：missing；用 /skills 查看可用技能。")
         with (
-            patch("main.Settings.from_env", return_value=settings),
+            patch("main.load_settings", return_value=settings),
             patch("main.Console") as console,
             patch("main.Conversation") as conversations,
             patch("main.SkillCatalog"),

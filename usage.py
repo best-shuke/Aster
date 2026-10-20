@@ -71,6 +71,15 @@ class UsageAccumulator:
         return usage or None
 
 
+def coarse_duration(seconds: float) -> str:
+    """A reset countdown for plan usage limits: minutes, hours or days."""
+    minutes = max(1, round(seconds / 60))
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours = minutes / 60
+    return f"{hours:.0f} 小时" if hours < 48 else f"{hours / 24:.0f} 天"
+
+
 def uncached_tokens(usage) -> int | None:
     """Prompt tokens not served from the provider's cache, plus output tokens.
 

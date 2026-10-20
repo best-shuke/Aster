@@ -1,6 +1,6 @@
 import os
 import platform
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,6 +15,9 @@ DEFAULT_WORKFLOWS_DIR = PROGRAM_DIR / "workflows"
 DEFAULT_ENVIRONMENTS_DIR = PROGRAM_DIR / "environments"
 DEFAULT_ENVIRONMENT_STATE_DIR = Path.home() / ".agents" / "environment-state"
 DEFAULT_MCP_CONFIG_FILE = PROGRAM_DIR / "mcp.json"
+# The saved login choice and its credentials; outside the program directory and Git.
+DEFAULT_AUTH_FILE = Path.home() / ".agents" / "aster" / "auth.json"
+CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 # Framework-provided resources: collaboration skills and environment templates.
 BUILTIN_DIR = PROGRAM_DIR / "builtin"
 BUILTIN_SKILLS_DIR = BUILTIN_DIR / "skills"
@@ -30,6 +33,26 @@ def parse_reasoning_effort(value: str | None) -> str:
     if effort not in REASONING_EFFORTS:
         raise ValueError(f"无效的推理强度 {value!r}；可选值：{' / '.join(REASONING_EFFORTS)}")
     return DEFAULT_REASONING_EFFORT if effort == "default" else effort
+
+
+class LoginRequired(RuntimeError):
+    """No saved login and no model credentials in the environment."""
+
+
+@dataclass(frozen=True)
+class Login:
+    """A saved login choice: ``chatgpt``, ``api`` (stored endpoint) or ``env`` (variables)."""
+
+    provider: str
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    context_window: int | None = None
+    account: str = ""
+
+
+def auth_file() -> Path:
+    return Path(os.environ.get("DEEPSEEK_AUTH_FILE", str(DEFAULT_AUTH_FILE))).expanduser().resolve()
 
 
 def load_env(path: Path | None = None) -> None:
@@ -84,6 +107,9 @@ class Settings:
     environments_dir: Path = DEFAULT_ENVIRONMENTS_DIR
     environment_state_dir: Path = DEFAULT_ENVIRONMENT_STATE_DIR
     builtin_skills_dir: Path = BUILTIN_SKILLS_DIR
+    provider: str = "api"
+    auth_file: Path | None = None
+    account: str = ""
 
     @property
     def resolved_websearch_api_key(self) -> str | None:
@@ -96,12 +122,13 @@ class Settings:
             return self.api_key
         return None
 
+    def with_login(self, login: Login | None) -> "Settings":
+        return replace(self, **login_fields(login))
+
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls, login: Login | None = None) -> "Settings":
         load_env()
-        api_key = os.environ.get("DEEPSEEK_API_KEY")
-        if not api_key:
-            raise RuntimeError("DEEPSEEK_API_KEY is not configured in .env")
+        fields = login_fields(login)
 
         workspace = Path.cwd()
         session_file = Path(
@@ -117,9 +144,7 @@ class Settings:
             prompt_file = workspace / prompt_file
 
         return cls(
-            api_key=api_key,
-            base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
-            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            **fields,
             session_file=session_file.resolve(),
             max_context_chars=optional_limit("DEEPSEEK_MAX_CONTEXT_CHARS", int),
             keep_recent_turns=max(1, int(os.environ.get("DEEPSEEK_KEEP_RECENT_TURNS", "6"))),
@@ -188,12 +213,51 @@ class Settings:
             retry_backoff_seconds=max(
                 0, float(os.environ.get("DEEPSEEK_RETRY_BACKOFF_SECONDS", "2"))
             ),
-            context_window_tokens=optional_limit("DEEPSEEK_CONTEXT_WINDOW_TOKENS", int),
             context_reserve_tokens=max(
                 1, int(os.environ.get("DEEPSEEK_CONTEXT_RESERVE_TOKENS", "16384"))
             ),
             keep_recent_tokens=max(1, int(os.environ.get("DEEPSEEK_KEEP_RECENT_TOKENS", "20000"))),
         )
+
+
+def login_fields(login: Login | None) -> dict:
+    """The model endpoint and credentials a login selects; ``None`` reads the environment."""
+    if login is None or login.provider == "env":
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise LoginRequired("DEEPSEEK_API_KEY is not configured in .env; run /login to sign in")
+        fields = {
+            "provider": "api",
+            "api_key": api_key,
+            "base_url": os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            "account": "",
+        }
+    elif login.provider == "chatgpt":
+        # Tokens rotate, so they stay in the auth file rather than in copied settings.
+        fields = {
+            "provider": "chatgpt",
+            "api_key": "",
+            "base_url": CHATGPT_BASE_URL,
+            "model": login.model,
+            "account": login.account,
+        }
+    elif login.provider == "api":
+        fields = {
+            "provider": "api",
+            "api_key": login.api_key,
+            "base_url": login.base_url,
+            "model": login.model,
+            "account": urlsplit(login.base_url).hostname or login.base_url,
+        }
+    else:
+        raise ValueError(f"Unknown login provider {login.provider!r}")
+    fields["base_url"] = fields["base_url"].rstrip("/")
+    fields["auth_file"] = auth_file()
+    fields["context_window_tokens"] = (
+        login.context_window if login is not None else None
+    ) or optional_limit("DEEPSEEK_CONTEXT_WINDOW_TOKENS", int)
+    return fields
 
 
 def optional_limit(name, convert, default=""):

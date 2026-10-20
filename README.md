@@ -15,12 +15,20 @@ uv sync --locked
 ./bin/agent --help
 ```
 
-在自己的终端环境中设置 `DEEPSEEK_API_KEY`，并按服务需要设置 `DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL`。也可以自行在项目目录创建私密的 `.env` 文件；该文件被 Git 忽略，仓库不提供实际配置文件。
+首次在终端启动时会询问登录方式：
+
+- **ChatGPT 账户（Plus / Pro）**：用 ChatGPT 订阅额度运行。可选浏览器登录，或在手机/任意电脑上输入设备码登录（适合 SSH 和无图形界面的服务器）；登录后从账户可用的模型中选择。
+- **第三方 API（OpenAI 兼容）**：填写服务地址、API Key 和模型名称，保存前会尝试验证 Key。
+- **沿用环境变量配置**：已设置 `DEEPSEEK_API_KEY`（及可选的 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`）时出现，保持原有用法。
+
+选择与凭据保存在 `~/.agents/aster/auth.json`（仅当前用户可读，不在仓库内）。之后可随时用 `/login` 切换登录方式或模型、`/logout` 退出登录，或用 `./bin/agent --login` 在启动前重新选择。
 
 ```sh
 ./bin/agent
 ./bin/agent "说明当前工作区的代码结构"
 ```
+
+也可以只用环境变量：在终端环境或项目目录的私密 `.env` 文件中设置 `DEEPSEEK_API_KEY` 等变量；`.env` 被 Git 忽略，仓库不提供实际配置文件。单次执行（带任务参数）且已配置环境变量时不会弹出登录菜单。
 
 `bin/agent` 固定读取程序目录的 `.env`，并保留当前调用目录作为工作区。直接运行 `uv run --locked python main.py` 时，默认从当前工作目录读取 `.env`。已有进程环境变量优先于文件配置。
 
@@ -36,7 +44,7 @@ uv sync --locked
 - 环境：按环境独立选择技能、MCP 服务与工具权限；`multi-agent` 环境运行多个独立成员代理，支持直接通信、任务依赖、共享产物与会议/辩论/独立调查等可选协议；交互会话中成员可在两次提问之间继续后台工作，并发编辑同一文件时自动三方合并。
 - 交互式终端、命令补全和 Markdown 输出。
 
-常用命令：`/help`、`/status`、`/new`、`/history`、`/resume`、`/trace`、`/tasks`、`/skills`、`/environment`（`/env`）、`/multiagents`。完整说明可在运行后用 `/help` 与 `/env help` 查看。
+常用命令：`/help`、`/status`、`/login`、`/new`、`/history`、`/resume`、`/trace`、`/tasks`、`/skills`、`/environment`（`/env`）、`/multiagents`。完整说明可在运行后用 `/help` 与 `/env help` 查看。
 
 快捷键：行尾输入 `\` 再回车换行，`Tab` 补全命令，`Ctrl-T` 打开执行轨迹，任务运行中按 `Esc` 或 `Ctrl-C` 暂停。
 
