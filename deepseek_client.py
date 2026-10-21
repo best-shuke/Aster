@@ -48,6 +48,19 @@ from model_rate_limit import retry_after_seconds, shared_gate
 from tool_runtime import validate_tool_calls
 from usage import CacheStats, UsageAccumulator
 
+# What an OpenAI-compatible service usually means by a status it rejects a request with.
+HTTP_ERROR_HINTS = {
+    400: "请求被拒绝，常见原因是模型名称、参数或上下文长度不受支持；可用 /login 检查模型",
+    401: "API Key 无效或已过期；用 /login 重新填写，或检查 DEEPSEEK_API_KEY",
+    402: "账户余额或额度不足",
+    403: "API Key 没有访问该模型或服务的权限",
+    404: "服务地址或模型不存在；用 /login 检查服务地址与模型名称",
+    408: "请求超时",
+    413: "请求内容过大",
+    422: "请求参数不被支持；可用 /login 检查模型",
+    429: "请求过于频繁或额度已用尽",
+}
+
 
 def has_unexecuted_tool_text(text: str) -> bool:
     return bool(re.search(r"<(?!/)[^<>\s]*DSML[^<>\s]*\s+(?:calls|invoke)\b", text))
@@ -791,10 +804,14 @@ class DeepSeekClient:
     def _http_error(self, exc: urllib.error.HTTPError) -> CompletionError:
         retry_after = retry_after_seconds(exc.headers.get("Retry-After")) if exc.headers else None
         exc.close()
-        # Provider error bodies may echo credentials. Never publish them.
+        # Provider error bodies may echo credentials. Never publish them; say what the
+        # status usually means instead, so a misconfigured endpoint can be fixed.
+        hint = HTTP_ERROR_HINTS.get(exc.code) or (
+            "模型服务暂时不可用，稍后重试" if exc.code >= 500 else ""
+        )
         return CompletionError(
             f"http_{exc.code}",
-            f"Model API returned HTTP {exc.code}",
+            f"模型服务返回 HTTP {exc.code}" + (f"：{hint}" if hint else ""),
             retryable=exc.code in {408, 429} or exc.code >= 500,
             retry_after=retry_after,
         )

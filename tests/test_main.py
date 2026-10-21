@@ -103,7 +103,7 @@ class SessionCommandTests(unittest.TestCase):
         manager.connect_all.return_value = ToolResult(data={"servers": servers, "failures": []})
         manager.status.return_value = ToolResult(data={"servers": servers})
 
-        def verify_ready(conversation, console):
+        def verify_ready(conversation, console, *, notices=()):
             manager.connect_all.assert_called_once()
             console.update_mcp.assert_called_once_with(servers)
 
@@ -150,9 +150,45 @@ class SessionCommandTests(unittest.TestCase):
             console.return_value.interactive = False
             main.main()
         run.assert_called_once()
+        # Shown under the banner, which run_interactive prints first.
+        console.return_value.warning.assert_not_called()
+        for notice in run.call_args.kwargs["notices"]:
+            notice()
         self.assertIn("broken", console.return_value.warning.call_args.args[0])
         conversations.return_value.close.assert_called_once()
         self.assertIs(conversations.call_args.kwargs["mcp_manager"], manager)
+
+    def test_unreadable_session_file_is_reported_without_a_traceback(self):
+        import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            settings = make_settings(
+                api_key="test",
+                base_url="https://example.invalid",
+                model="test",
+                workspace=workspace,
+                session_file=workspace / "session.json",
+                max_context_chars=120000,
+                keep_recent_turns=6,
+                max_task_seconds=3600,
+                max_subagents=4,
+                mcp_enabled=False,
+            )
+            settings.session_file.write_text("{broken")
+            with (
+                patch("main.load_settings", return_value=settings),
+                patch("main.Console") as console,
+                patch("main.run_interactive") as run,
+                patch("sys.argv", ["main.py"]),
+            ):
+                console.return_value.interactive = False
+                self.assertEqual(main.main(), 2)
+            run.assert_not_called()
+            message = str(console.return_value.error.call_args.args[0])
+            self.assertIn("session.json", message)
+            self.assertIn("/resume", message)
+            self.assertEqual(settings.session_file.read_text(), "{broken")  # Left untouched.
 
 
 class ResumeCommandTests(unittest.TestCase):

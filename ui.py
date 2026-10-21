@@ -19,12 +19,12 @@ from prompt_toolkit.application import Application, get_app, run_in_terminal
 from prompt_toolkit.buffer import CompletionState
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Condition
+from prompt_toolkit.filters import Condition, is_done
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.input import Input, create_input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
@@ -50,6 +50,7 @@ from execution_history import (
     result_summary,
 )
 from execution_trace import current_trace
+from sessions import displayed_text
 from terminal_rendering import StreamingDisplay, TaskLive
 from usage import coarse_duration
 
@@ -74,6 +75,7 @@ _TOOL_LABELS = {
     "find": "查找文件",
     "ls": "查看目录",
     "delegate": "并行调查",
+    "mcp": "MCP 工具",
     "team": "团队协作",
     "update_plan": "更新计划",
 }
@@ -208,6 +210,30 @@ def _wrap_display(text: str, max_width: int) -> list[str]:
             current.append(character)
             used += character_width
         lines.append("".join(current).rstrip())
+    return lines
+
+
+def _wrap_words(text: str, max_width: int) -> list[str]:
+    """Wrap one line to a display width, breaking at a space rather than inside a word."""
+    max_width = max(1, max_width)
+    lines = []
+    while _display_width(text) > max_width:
+        used = cut = 0
+        for index, character in enumerate(text):
+            used += _display_width(character)
+            if used > max_width:
+                break
+            cut = index + 1
+        cut = max(1, cut)
+        if cut < len(text) and not text[cut].isspace():
+            space = text.rfind(" ", 0, cut)
+            # Prefer the space unless it would leave a mostly empty line.
+            if space > 0 and _display_width(text[:space]) * 2 >= max_width:
+                cut = space
+        lines.append(text[:cut].rstrip())
+        text = text[cut:].lstrip(" ")
+    if text or not lines:
+        lines.append(text)
     return lines
 
 
@@ -623,14 +649,18 @@ class Console:
         self._tool_parameter_progress = False
         self._status_visible = False
         self._screen_active = False
+        # An error shown on the session screen that no later prompt has let the user read.
+        self._unseen_error: str | None = None
         self._task_started: float | None = None
         self._prompt_session: PromptSession | None = None
+        # Typed messages stay reachable with ↑ across /new, /resume and environment switches.
+        self._input_history = InMemoryHistory()
         self._task_input_monitor: _TaskInputMonitor | None = None
         self._live: TaskLive | None = None
         self._task_title = ""
         self._task_state = "pending"
         self._task_activity = ""
-        self._task_elapsed = 0.0
+        self._task_elapsed: float | None = 0.0
         self._todos: list[dict[str, str]] = []
         self._agents: dict[str, dict[str, Any]] = {}
         # Latest team status from the team runtime, shown while main is not in a turn.
@@ -642,6 +672,9 @@ class Console:
         self.skill_status: dict[str, Any] | None = None
         self._mcp_servers: list[dict[str, Any]] = []
         self.execution_provider: Callable[[], list[ExecutionEntry]] | None = None
+        # The conversation's messages, to draw the latest exchanges again after the trace
+        # inspector has scrolled them off the session screen.
+        self.history_provider: Callable[[], list[dict[str, Any]]] | None = None
         self.cache_provider: Callable[[], dict[str, Any] | None] | None = None
         self._active_tool_number = 0
         self._active_tool: tuple[str, dict[str, Any]] | None = None
@@ -1074,6 +1107,11 @@ class Console:
                 self._screen_active = False
                 stream.write("\033[0m\033[?25h\033[?1049l")
                 stream.flush()
+                # The session screen vanishes on exit: repeat an error nobody saw, such as
+                # a startup failure that ends the process before the first prompt.
+                unseen, self._unseen_error = self._unseen_error, None
+                if unseen:
+                    print(unseen, file=sys.stderr)
 
     def status(self, session_file: Path, history_count: int) -> None:
         self._clear_status()
@@ -1199,7 +1237,7 @@ class Console:
             usage.append(("缓存", " · ".join(parts)))
 
         session = [
-            ("记录", f"{'已恢复' if history_count else '空'} · {history_count} 条"),
+            ("记录", f"{history_count} 条" if history_count else "空"),
             ("文件", Text(_short_path(session_file, value_width), style="dim")),
         ]
         rich.print()
@@ -1244,7 +1282,9 @@ class Console:
 
     def configuration_notice(self) -> None:
         if self.websearch_status == "未配置":
-            self.info("联网搜索未配置；需要时请设置 DEEPSEEK_WEBSEARCH_API_KEY。")
+            self.info(
+                "联网搜索未配置；需要时用 /login 登录 ChatGPT 账户，或设置 DEEPSEEK_WEBSEARCH_API_KEY。"
+            )
 
     @contextmanager
     def _suspend_live(self):
@@ -1332,7 +1372,7 @@ class Console:
                     buffer.complete_next()
 
             session = PromptSession(
-                history=InMemoryHistory(),
+                history=InMemoryHistory() if isolated else self._input_history,
                 key_bindings=bindings,
                 completer=completer,
                 multiline=False,
@@ -1421,6 +1461,8 @@ class Console:
 
     def prompt(self) -> str:
         self._clear_status()
+        # Anything printed before this prompt has been on screen for the user to read.
+        self._unseen_error = None
         value = self._read_input("  You  › ")
         return value if self.interactive else value.strip()
 
@@ -1482,6 +1524,7 @@ class Console:
 
     def _select_prompt(self, question, options, default_index, title):
         selected_index = default_index
+        cancelled = False
         bindings = KeyBindings()
 
         @bindings.add("up")
@@ -1504,17 +1547,25 @@ class Console:
         @bindings.add("c-c")
         @bindings.add("c-d")
         def cancel(event):
+            nonlocal cancelled
+            cancelled = True
             event.app.exit(result=None)
 
         def heading():
             fragments = [("class:heading", f"\n  {title}\n")]
             for line in _wrap_display(question, self.terminal_width() - 4):
                 fragments.append(("", f"  {line}\n"))
-            fragments.append(("", "\n"))
+            # The last line break already ends the window with one blank separator line.
             return fragments
 
         def choices():
             width = self.terminal_width()
+            if get_app().is_done:
+                # Leave the answer in the scrollback, not a stale menu with its key hints.
+                if cancelled:
+                    return []
+                label = _ellipsize(options[selected_index]["label"], width - 6)
+                return [("class:selected", f"  › {label}")]
             fragments = []
             for index, option in enumerate(options):
                 selected = index == selected_index
@@ -1547,7 +1598,10 @@ class Console:
                     [
                         Window(FormattedTextControl(heading), dont_extend_height=True),
                         Window(control, dont_extend_height=True, always_hide_cursor=True),
-                        Window(FormattedTextControl(hints), dont_extend_height=True),
+                        ConditionalContainer(
+                            Window(FormattedTextControl(hints), dont_extend_height=True),
+                            filter=~is_done,
+                        ),
                     ]
                 ),
                 focused_element=control,
@@ -1597,7 +1651,9 @@ class Console:
                         }
                     self.warning("答案不能为空")
             selected = all_options[selected_index]
-            self.success(f"已选择：{selected['label']}")
+            if not self.interactive:
+                # The interactive menu already collapses to the chosen answer.
+                self.success(f"已选择：{selected['label']}")
             return {
                 "answer": selected["label"],
                 "selected_index": selected_index + 1,
@@ -1620,7 +1676,7 @@ class Console:
         )
         content = []
         if compact:
-            status = f"{state} · {_duration(elapsed, compact=True)}"
+            status = state if elapsed is None else f"{state} · {_duration(elapsed, compact=True)}"
             title_width = max(1, min(36, width - _display_width(status) - 7))
             marker = _TASK_MARKERS.get(self._task_state, "◇")
             heading = Text(f"  {marker} ", style=style)
@@ -1632,7 +1688,9 @@ class Console:
             content.append(heading)
         else:
             content.append(Text(self._task_title or "暂无任务", style="bold"))
-            content.append(Text(f"{state} · {_duration(elapsed)}", style=style))
+            content.append(
+                Text(state if elapsed is None else f"{state} · {_duration(elapsed)}", style=style)
+            )
         if self._task_activity:
             activity = f"  ↳ {self._task_activity}" if compact else self._task_activity
             content.append(Text(_ellipsize(activity, available), style="dim"))
@@ -1982,6 +2040,9 @@ class Console:
 
     def tasks(self) -> None:
         self._clear_status()
+        if not (self._task_title or self._todos or self._agents):
+            self.info("当前没有任务；提问后这里显示任务计划、Todo 和子代理状态。")
+            return
         self._rich().print(self._dashboard(compact=False))
 
     def restore_task(
@@ -1992,7 +2053,11 @@ class Console:
         self._task_title = title
         self._todos = [dict(item) for item in (plan or {}).get("steps", [])]
         self._task_state = status or ("completed" if completed else "restored")
-        self.tasks()
+        # The restored task's run time was not saved; show no duration rather than 0.
+        self._task_elapsed = None
+        # A finished task without a plan adds nothing to the history shown above.
+        if self._todos or self._task_state != "completed":
+            self.tasks()
 
     def reset_session(
         self,
@@ -2109,7 +2174,8 @@ class Console:
                 + (f"（{'、'.join(names)}）" if names else "")
                 + "；完成时会在这里提示，/env results 查看结果。"
             )
-        if self.interactive:
+        if self.interactive and self._task_state not in {"error", "paused"}:
+            # A failed or paused task is followed by its reason; the caller spaces that.
             print()
         self._task_started = None
 
@@ -2148,7 +2214,8 @@ class Console:
             line.append(
                 f"{_TASK_MARKERS.get(self._task_state, '◇')} {label}", style=f"bold {style}"
             )
-            line.append(f" · {_duration(self._task_elapsed)}", style=style)
+            if self._task_elapsed is not None:
+                line.append(f" · {_duration(self._task_elapsed)}", style=style)
         for text, part_style in self._metric_parts():
             separator = " · " if line.plain.strip() else ""
             if line.cell_len + len(separator) + _display_width(text) > width:
@@ -2425,7 +2492,7 @@ class Console:
                 facts.append(" ")
                 facts.append(f"-{removed}", style="red")
         else:
-            facts.append(result_summary({**result, "error": None}))
+            facts.append(result_summary({**result, "error": None}, brief=True))
         for extra in (
             "已合并并行修改" if data.get("merged") else "",
             _duration_short(duration)
@@ -2565,6 +2632,8 @@ class Console:
                     colors=self.colors,
                     full_screen=not self._screen_active,
                 ).run()
+            if self._screen_active:
+                self._redraw_recent_history()
             return
         if selected is not None:
             self._rich().print(Text(entries[selected].detail(entries)))
@@ -2589,21 +2658,57 @@ class Console:
                 )
             )
 
+    def _notice(self, marker: str, message: object) -> str:
+        """A marked message whose continuation lines align under its text, not column 0."""
+        first = f"  {marker} "
+        indent = " " * _display_width(first)
+        width = self.terminal_width() - 1 - len(indent)
+        lines = []
+        for index, line in enumerate(str(message).splitlines() or [""]):
+            parts = _wrap_words(line, width) if self.interactive else [line]
+            lines.extend(
+                (first if index == 0 and number == 0 else indent) + part
+                for number, part in enumerate(parts)
+            )
+        return "\n".join(lines)
+
+    def _redraw_recent_history(self) -> None:
+        """Show the latest exchanges again after the inline trace inspector.
+
+        The session screen keeps no scrollback, and the inspector drawn inside it pushes
+        the conversation off the top; without this the screen is left empty.
+        """
+        messages = self.history_provider() if self.history_provider is not None else []
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+        visible = [message for message in messages if message.get("role") in {"user", "assistant"}]
+        if not visible:
+            return
+        # Start at a question: the last exchange, and the one before it when both are short.
+        users = [index for index, message in enumerate(visible) if message["role"] == "user"]
+        start = users[-1] if users else 0
+        if len(users) > 1 and len(visible) - users[-2] <= 6:
+            start = users[-2]
+        self.history(messages, max(1, min(8, len(visible) - start)))
+
     def success(self, message: str) -> None:
         self._clear_status()
-        print(self.style(f"  ✓ {message}", GREEN))
+        print(self.style(self._notice("✓", message), GREEN))
 
     def error(self, error: Exception) -> None:
         self._clear_status()
-        print(self.style(f"\n  ✗ {error}", RED), file=sys.stderr)
+        text = self.style("\n" + self._notice("✗", error), RED)
+        if self._screen_active:
+            self._unseen_error = text
+        print(text, file=sys.stderr)
 
     def info(self, message: str) -> None:
         self._clear_status()
-        print(self.style(f"  • {message}", BLUE))
+        print(self.style(self._notice("•", message), BLUE))
 
     def warning(self, message: str) -> None:
         self._clear_status()
-        print(self.style(f"  ! {message}", YELLOW))
+        print(self.style(self._notice("!", message), YELLOW))
 
     def cache(self, stats, *, compact: bool = False) -> None:
         def rate(value, digits=2):
@@ -2669,7 +2774,7 @@ class Console:
 
         for message in selected:
             is_user = message["role"] == "user"
-            content = history_text(message.get("content"))
+            content = history_text(displayed_text(message) if is_user else message.get("content"))
             print()
             if is_user:
                 self._section("› 你", style="green")
@@ -2680,6 +2785,9 @@ class Console:
                 self._rich().print(self._reasoning_heading())
                 self._markdown(reasoning, dim=True)
             if content:
+                if reasoning:
+                    # Same spacing as the live answer under its reasoning.
+                    print()
                 self._section("◆ 回答", style="cyan")
                 self._markdown(content)
             tool_calls = message.get("tool_calls") or []

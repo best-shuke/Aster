@@ -168,6 +168,25 @@ class RateLimitTests(unittest.TestCase):
         self.assertTrue(body.closed)
         self.assertNotIn("private", str(caught.exception))
 
+    def test_http_errors_explain_the_status_without_publishing_the_body(self):
+        for status, expected in (
+            (400, "模型名称"),
+            (401, "/login"),
+            (404, "服务地址"),
+            (502, "稍后"),
+        ):
+            body = io.BytesIO(b'{"error": {"message": "private fixture sk-secret"}}')
+            error = urllib.error.HTTPError("https://fixture.invalid", status, "fixture", {}, body)
+            with (
+                self.subTest(status=status),
+                patch("http_transport.open_url", side_effect=error),
+                self.assertRaises(CompletionError) as caught,
+            ):
+                DeepSeekClient(settings())._complete_once([])
+            self.assertIn(f"HTTP {status}", str(caught.exception))
+            self.assertIn(expected, str(caught.exception))
+            self.assertNotIn("private", str(caught.exception))
+
     def test_stream_rate_limit_after_http_acceptance_is_classified_and_keeps_partial(self):
         for code in (429, "429", "rate_limit", "rate_limit_exceeded"):
             with self.subTest(code=code):

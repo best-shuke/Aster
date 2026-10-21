@@ -32,6 +32,36 @@ def call(name, arguments, identity="fixes-call"):
     }
 
 
+class EnvFileTests(unittest.TestCase):
+    def test_common_env_file_syntax_is_read_as_written(self):
+        from config import load_env
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / ".env"
+            path.write_text(
+                "\ufeffDEEPSEEK_API_KEY=sk-first\n"
+                "export DEEPSEEK_MODEL=deepseek-chat  # default model\n"
+                "DEEPSEEK_BASE_URL='https://api.example.com/v1' # quoted\n"
+                'DEEPSEEK_PROMPT_FILE="prompt #1.md"\n'
+                "DEEPSEEK_SESSION_FILE=a#b.json\n"
+                "# DEEPSEEK_MAX_SUBAGENTS=3\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                load_env(path)
+                loaded = dict(os.environ)
+        self.assertEqual(
+            loaded,
+            {
+                "DEEPSEEK_API_KEY": "sk-first",
+                "DEEPSEEK_MODEL": "deepseek-chat",
+                "DEEPSEEK_BASE_URL": "https://api.example.com/v1",
+                "DEEPSEEK_PROMPT_FILE": "prompt #1.md",
+                "DEEPSEEK_SESSION_FILE": "a#b.json",
+            },
+        )
+
+
 class HarnessFixTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

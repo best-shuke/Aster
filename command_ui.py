@@ -30,16 +30,24 @@ def use_goal(conversation: Conversation, console: Console, arguments: list[str],
     goal = prepare_goal(conversation, command)
     if command.action in {"start", "resume"}:
         interrupt = console.interrupt_on_escape() if console.interactive is True else nullcontext()
-        with interrupt:
-            GoalRuntime(
-                conversation,
-                ask_turn=lambda prompt, **options: ask_task(conversation, console, prompt, **options),
-                on_progress=console.progress,
-                on_round=lambda state: console.info(
-                    f"目标第 {state.rounds}/{state.max_rounds} 轮：{state.objective}"
-                ),
-                on_review=lambda state: console.info("正在核对目标、验收条件与执行证据…"),
-            ).run()
+        try:
+            with interrupt:
+                GoalRuntime(
+                    conversation,
+                    ask_turn=lambda prompt, **options: ask_task(
+                        conversation, console, prompt, title=f"目标 · {goal.objective}", **options
+                    ),
+                    on_progress=console.progress,
+                    on_round=lambda state: console.info(
+                        f"目标第 {state.rounds}/{state.max_rounds} 轮：{state.objective}"
+                    ),
+                    on_review=lambda state: console.info("正在核对目标、验收条件与执行证据…"),
+                ).run()
+        except KeyboardInterrupt:
+            if console.interactive is True:
+                # The session goes on: say how to pick the goal up again.
+                console.info("目标已暂停；/goal resume 继续，/goal status 查看进展。")
+            raise
         console.update_context(conversation.context_status())
     for line in goal.status_lines():
         console.info(line)
@@ -543,6 +551,17 @@ def update_effort(conversation: Conversation, console: Console, arguments: list[
         console.error(exc)
 
 
+def websearch_status(conversation: Conversation) -> str:
+    settings = conversation.settings
+    if not settings.websearch_enabled:
+        return "关闭"
+    names = {item["function"]["name"] for item in conversation.definitions}
+    if "websearch" in names:
+        return "可用"
+    # A configured backend without the tool means the environment's tool policy denies it.
+    return "策略禁用" if settings.websearch_provider else "未配置"
+
+
 def use_login(conversation: Conversation, console: Console, arguments: list[str]) -> None:
     store = AuthStore(conversation.settings.auth_file or auth_file())
     login = run_login(console, store)
@@ -557,6 +576,7 @@ def use_login(conversation: Conversation, console: Console, arguments: list[str]
     settings = conversation.settings
     console.model = settings.model
     console.account = describe(settings)
+    console.websearch_status = websearch_status(conversation)
     console.update_context(conversation.context_status())
     console.success(f"已切换到 {settings.model}（{console.account}），从下一次提问生效。")
 
@@ -596,17 +616,10 @@ def sync_environment_ui(conversation: Conversation, console: Console) -> None:
         if skills is not None
         else None
     )
-    names = {item["function"]["name"] for item in conversation.definitions}
     console.mcp_policy_enabled = (
         conversation.tools.policy.permits("mcp") if conversation.tools is not None else False
     )
-    console.websearch_status = (
-        "关闭"
-        if not settings.websearch_enabled
-        else "可用"
-        if "websearch" in names
-        else "未配置或策略禁用"
-    )
+    console.websearch_status = websearch_status(conversation)
     console.mcp_provider = (
         (lambda: conversation.mcp_manager.status().data["servers"])
         if conversation.mcp_manager is not None
@@ -681,16 +694,7 @@ def use_environment(conversation: Conversation, console: Console, arguments: lis
             console.info(
                 f"MCP：{conversation.mcp_manager.config_file if conversation.mcp_manager else '未挂载'}"
             )
-            console.info(
-                "websearch："
-                + (
-                    "可用"
-                    if any(
-                        item["function"]["name"] == "websearch" for item in conversation.definitions
-                    )
-                    else "不可用（关闭、未配置或策略禁用）"
-                )
-            )
+            console.info(f"websearch：{websearch_status(conversation)}")
             if conversation.tools is not None:
                 console.info(
                     "tools.deny：" + (", ".join(sorted(conversation.tools.policy.deny)) or "无")

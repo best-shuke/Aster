@@ -2,11 +2,12 @@ import fcntl
 import hashlib
 import json
 import re
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from context_budget import LOCAL_METADATA
 from file_state import atomic_write_text, file_digest
 from goals import GoalState
 from tool_runtime import validate_tool_calls
@@ -14,6 +15,13 @@ from tool_runtime import validate_tool_calls
 
 class SessionConflictError(RuntimeError):
     pass
+
+
+def displayed_text(message: dict) -> object:
+    """A message as the user wrote it: a /skill: command rather than the skill it loaded."""
+    metadata = message.get(LOCAL_METADATA)
+    display = metadata.get("display") if isinstance(metadata, dict) else None
+    return display if isinstance(display, str) else message.get("content")
 
 
 @dataclass(frozen=True)
@@ -106,8 +114,12 @@ class SessionStore:
         ) as exc:
             raise RuntimeError(f"Cannot load session file {path}: {exc}") from exc
 
-    @staticmethod
-    def _write(path: Path, content: str) -> None:
+    def _write(self, path: Path, content: str) -> None:
+        if path.parent == self.directory and not (self.directory / ".gitignore").exists():
+            # Saved conversations stay out of `git status` in the user's repository.
+            self.directory.mkdir(parents=True, exist_ok=True)
+            with suppress(OSError):
+                (self.directory / ".gitignore").write_text("# Aster sessions\n*\n", "utf-8")
         atomic_write_text(path, content)
 
     @contextmanager
@@ -182,11 +194,11 @@ class SessionStore:
                     continue
                 title = next(
                     (
-                        " ".join(message["content"].split())[:80]
+                        " ".join(text.split())[:80]
                         for message in messages
                         if message["role"] == "user"
-                        and isinstance(message.get("content"), str)
-                        and message["content"].strip()
+                        and isinstance(text := displayed_text(message), str)
+                        and text.strip()
                     ),
                     (data.get("goal") or {}).get("objective", "未命名会话"),
                 )

@@ -28,6 +28,7 @@ from ui import (
     _reasoning_text,
     _short_path,
     _TaskInputMonitor,
+    _wrap_words,
 )
 
 
@@ -279,6 +280,58 @@ class ConsoleLayoutTests(unittest.TestCase):
         self.assertFalse(console._screen_active)
         self.assertTrue(output.getvalue().startswith("\033[?1049h\033[2J\033[H"))
         self.assertTrue(output.getvalue().endswith("\033[0m\033[?25h\033[?1049l"))
+
+    def test_errors_nobody_saw_are_repeated_after_leaving_the_session_screen(self):
+        for prompted in (False, True):
+            console = Console()
+            console.interactive = True
+            console.colors = False
+            errors = io.StringIO()
+            with (
+                self.subTest(prompted=prompted),
+                patch("sys.stdout", io.StringIO()),
+                patch("sys.stderr", errors),
+                patch.dict(os.environ, {"TERM": "xterm-256color"}),
+                patch.object(console, "_read_input", return_value=""),
+                console.session_screen(),
+            ):
+                console.error(ValueError("环境 'x' 未找到"))
+                if prompted:
+                    console.prompt()
+            # A startup failure ends the session before any prompt: show it again.
+            self.assertEqual(errors.getvalue().count("环境 'x' 未找到"), 1 if prompted else 2)
+
+    def test_closing_the_inline_trace_redraws_the_latest_exchanges(self):
+        from execution_history import ExecutionEntry
+
+        console = Console()
+        console.interactive = True
+        console.colors = False
+        console._screen_active = True
+        console.execution_provider = lambda: [ExecutionEntry(1, {"tool": "read"})]
+        messages = [
+            {"role": "user", "content": "OLD_QUESTION"},
+            {"role": "assistant", "content": "OLD_ANSWER"},
+            {"role": "user", "content": "LAST_QUESTION"},
+            {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "read"}}]},
+            {"role": "tool", "content": "{}"},
+            {"role": "assistant", "content": "LAST_ANSWER"},
+        ]
+        console.history_provider = lambda: messages
+        output = io.StringIO()
+        with (
+            patch("sys.stdout", output),
+            patch("trace_ui.TraceInspector") as inspector,
+            patch("ui.patch_stdout", return_value=nullcontext()),
+        ):
+            console.trace()
+        inspector.return_value.run.assert_called_once()
+        self.assertFalse(inspector.call_args.kwargs["full_screen"])
+        rendered = output.getvalue()
+        self.assertIn("\033[2J", rendered)
+        # Both exchanges are short, so the redraw starts at the earlier question.
+        for text in ("OLD_QUESTION", "OLD_ANSWER", "LAST_QUESTION", "LAST_ANSWER"):
+            self.assertIn(text, rendered)
 
     def test_nested_session_screens_enter_and_leave_once(self):
         output = io.StringIO()
@@ -1368,6 +1421,7 @@ class ConsoleLayoutTests(unittest.TestCase):
         output = io.StringIO()
         with patch("sys.stdout", output):
             console = Console()
+            console._task_title = "任务"
             console.update_context(
                 {
                     "tokens": 12000,
@@ -1771,6 +1825,75 @@ class ReadableOutputTests(unittest.TestCase):
             action()
         return output.getvalue()
 
+    def test_multiline_messages_keep_their_indentation(self):
+        console = self.console()
+        rendered = self.render(lambda: console.info("第一行\n第二行"))
+        self.assertEqual(rendered.splitlines(), ["  • 第一行", "    第二行"])
+        errors = io.StringIO()
+        with patch("sys.stderr", errors):
+            self.render(lambda: console.error(ValueError("用法：a\nb")))
+        self.assertEqual(errors.getvalue().splitlines(), ["", "  ✗ 用法：a", "    b"])
+
+    def test_interactive_messages_wrap_under_their_text(self):
+        console = self.console()
+        console.interactive = True
+        rendered = self.render(lambda: console.info("word " * 30), width=40)
+        lines = rendered.splitlines()
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(lines[0].startswith("  • word"))
+        self.assertTrue(all(line.startswith("    word") for line in lines[1:]))
+        self.assertTrue(all(_display_width(line) <= 39 for line in lines))
+
+    def test_word_wrapping_breaks_at_spaces_and_handles_wide_text(self):
+        self.assertEqual(_wrap_words("alpha beta gamma", 11), ["alpha beta", "gamma"])
+        self.assertEqual(_wrap_words("中文中文中文", 4), ["中文", "中文", "中文"])
+        self.assertEqual(_wrap_words("中", 1), ["中"])
+        self.assertEqual(_wrap_words("abcd ", 4), ["abcd"])
+        self.assertEqual(_wrap_words("", 10), [""])
+
+    def test_input_history_survives_a_new_session(self):
+        console = self.console()
+        console.interactive = True
+        with (
+            patch("ui.PromptSession") as session,
+            patch("ui.patch_stdout", return_value=nullcontext()),
+        ):
+            session.return_value.prompt.return_value = "hello"
+            console._read_prompt("  You  › ")
+            self.render(lambda: console.reset_session(Path("/tmp/session.json")))
+            console._read_prompt("  You  › ")
+            console._read_prompt("  API Key › ", isolated=True, secret=True)
+        histories = [call.kwargs["history"] for call in session.call_args_list]
+        self.assertEqual(len(histories), 3)
+        self.assertIs(histories[0], histories[1])
+        # Answers such as keys never join the message history.
+        self.assertIsNot(histories[2], histories[0])
+
+    def test_tasks_without_a_task_say_so_instead_of_an_empty_panel(self):
+        console = self.console()
+        rendered = self.render(console.tasks)
+        self.assertIn("当前没有任务", rendered)
+        self.assertNotIn("0.0 秒", rendered)
+
+    def test_restored_tasks_show_no_made_up_duration(self):
+        console = self.console()
+        plan = {"steps": [{"step": "写测试", "status": "in_progress"}]}
+        rendered = self.render(lambda: console.restore_task("恢复任务", plan, completed=False))
+        self.assertIn("已恢复", rendered)
+        self.assertNotIn("0.0 秒", rendered)
+        # A finished question without a plan is already visible in the restored history.
+        console = self.console()
+        rendered = self.render(lambda: console.restore_task("问答", None, completed=True))
+        self.assertEqual(rendered, "")
+        self.assertEqual(console._task_state, "completed")
+
+    def test_status_counts_records_without_claiming_a_restore(self):
+        console = self.console()
+        rendered = self.render(lambda: console.status(Path("/tmp/session.json"), 2))
+        self.assertIn("记录      2 条", rendered)
+        self.assertNotIn("已恢复", rendered)
+        self.assertIn("空", self.render(lambda: console.status(Path("/tmp/session.json"), 0)))
+
     def test_long_paths_keep_their_root_and_final_directories(self):
         path = "/tmp/claude-1000/-home-opc-project/0123456789abcdef/scratchpad/workspace"
         shortened = _short_path(path, 40)
@@ -1788,6 +1911,23 @@ class ReadableOutputTests(unittest.TestCase):
 
         rendered = self.render(run)
         self.assertEqual(rendered.splitlines(), ["  ✓ 读取  src/app.py:40  2 行  #1"])
+
+    def test_background_session_line_names_the_state_once_with_a_short_id(self):
+        console = self.console()
+        session_id = "cd3215374dd04cce86a2119ccc4df6d5"
+
+        def run(state, status="ok"):
+            console.tool("exec", {"command": "sleep 30", "background": True})
+            console.tool_result(
+                "exec", {"status": status, "data": {"session_id": session_id, "state": state}}
+            )
+
+        line = self.render(lambda: run("running"))
+        self.assertIn("运行中 · 进程 cd321537", line)
+        self.assertNotIn(session_id, line)
+        self.assertNotIn("running", line)
+        line = self.render(lambda: run("timed_out", "timeout"))
+        self.assertIn("进程 cd321537 · 超时终止", line)
 
     def test_narrow_lines_keep_the_outcome_and_call_number(self):
         console = self.console()
@@ -2037,7 +2177,7 @@ class ReadableOutputTests(unittest.TestCase):
         for value in ("运行", "能力", "用量", "会话", "12k / 1M tokens · 1.2%", "会话 50.0%"):
             self.assertIn(value, rendered)
         self.assertIn("最近一次 90.0%", rendered)
-        self.assertIn("已恢复 · 4 条", rendered)
+        self.assertIn("记录      4 条", rendered)
 
     def test_git_branch_is_read_from_head_including_worktree_pointers(self):
         with tempfile.TemporaryDirectory() as directory:

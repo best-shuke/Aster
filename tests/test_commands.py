@@ -4,7 +4,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock
 
-from command_ui import present_command
+from command_ui import present_command, websearch_status
 from commands import (
     CommandActions,
     CommandName,
@@ -53,6 +53,19 @@ class CommandBoundaryTests(unittest.TestCase):
         for command in ("/exit now", "/new extra", "/tasks extra", "/status extra"):
             with self.subTest(command=command):
                 self.assertIsNone(parse_command(command))
+
+    def test_websearch_status_tells_missing_setup_from_a_policy_denial(self):
+        def conversation(enabled=True, provider=None, tools=()):
+            settings = Mock(websearch_enabled=enabled, websearch_provider=provider)
+            definitions = [{"function": {"name": name}} for name in tools]
+            return Mock(settings=settings, definitions=definitions)
+
+        self.assertEqual(websearch_status(conversation(enabled=False)), "关闭")
+        self.assertEqual(
+            websearch_status(conversation(provider="cline", tools=["websearch"])), "可用"
+        )
+        self.assertEqual(websearch_status(conversation()), "未配置")
+        self.assertEqual(websearch_status(conversation(provider="chatgpt")), "策略禁用")
 
     def test_exit_has_an_explicit_result_without_effects(self):
         execution = execute_command(parse_command("/exit"), None)

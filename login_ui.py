@@ -144,6 +144,10 @@ def login_chatgpt(console: Console, store: AuthStore) -> Login | None:
                 tokens = store.read().get("chatgpt") or saved
             except LoginExpired as exc:
                 console.warning(f"{exc}；请重新授权。")
+            except AuthError as exc:
+                # A network failure while refreshing: the saved login may still be valid.
+                console.error(exc)
+                return None
     if tokens is None:
         try:
             tokens = _authorize(console)
@@ -310,7 +314,7 @@ def login_api(console: Console, store: AuthStore) -> Login | None:
         else None
     )
     while True:
-        prompt = "API Key（输入不显示" + ("；回车沿用已有 Key）" if known_key else "）")
+        prompt = "API Key（输入以 * 遮挡" + ("；回车沿用已有 Key）" if known_key else "）")
         api_key = _ask(console, prompt, known_key or "", secret=True)
         if api_key is None:
             return None

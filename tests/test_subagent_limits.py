@@ -55,6 +55,20 @@ class SubagentLimitTests(unittest.TestCase):
             ):
                 self.assertEqual(Settings.from_env().max_subagents, expected)
 
+    def test_malformed_numbers_name_their_variable(self):
+        for name, value in (
+            ("DEEPSEEK_MAX_SUBAGENTS", "abc"),
+            ("DEEPSEEK_MAX_TASK_SECONDS", "soon"),
+            ("DEEPSEEK_REQUEST_TIMEOUT_SECONDS", "1m"),
+        ):
+            with (
+                self.subTest(name=name),
+                patch("config.load_env"),
+                patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test", name: value}, clear=True),
+                self.assertRaisesRegex(ValueError, f"{name}.*{value!r}"),
+            ):
+                Settings.from_env()
+
     def test_reasoning_runner_uses_twenty_as_default_and_hard_limit(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)

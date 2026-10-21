@@ -28,6 +28,16 @@ class SessionStoreTests(unittest.TestCase):
             "tool_runs": [],
         }
 
+    def test_saved_sessions_and_tool_output_ignore_themselves_in_git(self):
+        from tool_runtime import ArtifactStore
+
+        self.store.save(self.data())
+        self.assertEqual((self.store.directory / ".gitignore").read_text().splitlines()[-1], "*")
+        self.assertEqual(len(self.store.list()), 1)
+        artifacts = ArtifactStore(self.root)
+        artifacts.new_path(".json")
+        self.assertEqual((artifacts.directory / ".gitignore").read_text().splitlines()[-1], "*")
+
     def test_save_preserves_unicode_in_active_file_and_snapshot(self):
         data = self.data()
         self.store.save(data)

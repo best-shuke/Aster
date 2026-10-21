@@ -1,3 +1,4 @@
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from conversation import Conversation
 from skills import SkillCatalog
 from tests.support import make_settings
 from tests.test_conversation import FakeClient
+from ui import Console
 
 
 class SkillCatalogTests(unittest.TestCase):
@@ -313,6 +315,34 @@ class SkillConversationTests(unittest.TestCase):
         self.assertIn(str(path.parent), user["content"])
         self.assertTrue(user["content"].endswith("User request:\ninspect main.py"))
         self.assertNotIn("Use the checklist.", conversation.system_message["content"])
+
+    def test_history_and_session_list_show_the_typed_command_not_the_skill_text(self):
+        path = SkillCatalogTests.create_skill(
+            self.workspace / "skills", "review", "Review.", "Use the checklist."
+        )
+        catalog = SkillCatalog(
+            self.workspace, path.parent, include_defaults=False, extra_dirs=(path,)
+        )
+        client = FakeClient({"role": "assistant", "content": "Reviewed."})
+        conversation = Conversation(self.settings, client, None, skills=catalog)
+        self.addCleanup(conversation.close)
+        conversation.ask("/skill:review inspect main.py")
+        session_id = conversation.session_id
+        conversation.clear()
+
+        [saved] = conversation.sessions.list()
+        self.assertEqual(saved.session_id, session_id)
+        self.assertEqual(saved.title, "/skill:review inspect main.py")
+        messages = conversation.sessions.read(conversation.sessions.snapshot_path(session_id))[
+            "messages"
+        ]
+        output = io.StringIO()
+        console = Console()
+        console.interactive = console.colors = False
+        with patch("sys.stdout", output):
+            console.history(messages, None)
+        self.assertIn("/skill:review inspect main.py", output.getvalue())
+        self.assertNotIn("Use the checklist.", output.getvalue())
 
     def test_invalid_or_disabled_invocation_does_not_call_the_model_or_append_messages(self):
         catalog = SkillCatalog(self.workspace, self.workspace / "skills", include_defaults=False)

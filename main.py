@@ -2,6 +2,7 @@ import argparse
 import os
 import shlex
 import sys
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -54,7 +55,7 @@ from skills import SkillCatalog
 from tools import CodingTools
 from ui import Console
 from usage import CacheStats
-from websearch import WebSearchClient
+from websearch import websearch_client
 
 HELP = (
     (
@@ -172,15 +173,21 @@ def handle_command(conversation: Conversation, console: Console, prompt: str) ->
     return execution.result
 
 
-def run_interactive(conversation: Conversation, console: Console) -> None:
+def run_interactive(
+    conversation: Conversation, console: Console, *, notices: Sequence[Callable[[], None]] = ()
+) -> None:
+    """``notices`` report startup problems, such as MCP failures, under the banner."""
     # Another message may follow, so team members can keep working between turns.
     conversation.team_background = True
     console.execution_provider = lambda: execution_entries(
         conversation.execution_snapshot(), conversation.messages
     )
+    console.history_provider = lambda: conversation.messages
     sync_environment_ui(conversation, console)
     console.update_context(conversation.context_status())
     console.banner(conversation.settings.session_file, conversation_count(conversation))
+    for notice in notices:
+        notice()
     console.configuration_notice()
     if conversation.last_environment_id and conversation.environment_id is None:
         console.info(
@@ -231,8 +238,10 @@ def run_interactive(conversation: Conversation, console: Console) -> None:
             ask(conversation, console, prompt)
         except KeyboardInterrupt:
             console.info("当前任务已暂停，已保存可恢复的进展。")
+            print()
         except Exception as exc:
             console.error(exc)
+            print()
 
 
 def cache_totals(conversation: Conversation) -> dict | None:
@@ -240,12 +249,20 @@ def cache_totals(conversation: Conversation) -> dict | None:
     return stats.totals() if isinstance(stats, CacheStats) else None
 
 
-def ask(conversation: Conversation, console: Console, prompt: str, **task_options) -> str:
+def ask(
+    conversation: Conversation,
+    console: Console,
+    prompt: str,
+    *,
+    title: str | None = None,
+    **task_options,
+) -> str:
+    """Run one task; ``title`` names it in the task display when the prompt is generated."""
     console.execution_provider = lambda: execution_entries(
         conversation.execution_snapshot(), conversation.messages
     )
     console.update_context(conversation.context_status())
-    console.task_start(prompt)
+    console.task_start(title or prompt)
     completed = False
     failed = False
     status = "incomplete"
@@ -299,7 +316,10 @@ def load_settings(*, choose: bool, one_shot: bool) -> Settings | None:
         if choose or (login is None and not configured):
             console = Console()
             console.toolbar = False
-            login = run_login(console, store, first_run=not choose) or login
+            try:
+                login = run_login(console, store, first_run=not choose) or login
+            except (AuthError, OSError) as exc:
+                console.error(exc)
     try:
         return Settings.from_env(login)
     except LoginRequired:
@@ -308,6 +328,9 @@ def load_settings(*, choose: bool, one_shot: bool) -> Settings | None:
             "或设置 DEEPSEEK_API_KEY。",
             file=sys.stderr,
         )
+        return None
+    except ValueError as exc:
+        print(f"配置无效：{exc}", file=sys.stderr)
         return None
 
 
@@ -343,7 +366,7 @@ def main() -> int:
     )
     if not settings.websearch_enabled:
         websearch_status = "关闭"
-    elif settings.resolved_websearch_api_key:
+    elif settings.websearch_provider:
         websearch_status = "可用"
     else:
         websearch_status = "未配置"
@@ -376,17 +399,32 @@ def main() -> int:
     )
     if console.interactive is True:
         tools.attach_user_input(console.ask_user)
-    if settings.websearch_enabled and settings.resolved_websearch_api_key:
-        tools.attach_websearch(WebSearchClient(settings))
+    search = websearch_client(settings)
+    if search is not None:
+        tools.attach_websearch(search)
     if mcp_manager is not None and mcp_manager.server_count:
         tools.attach_mcp(mcp_manager)
-    conversation = Conversation(
-        settings,
-        ChatGPTClient(settings) if settings.provider == "chatgpt" else DeepSeekClient(settings),
-        tools,
-        skills=skills,
-        mcp_manager=mcp_manager,
-    )
+    try:
+        conversation = Conversation(
+            settings,
+            ChatGPTClient(settings) if settings.provider == "chatgpt" else DeepSeekClient(settings),
+            tools,
+            skills=skills,
+            mcp_manager=mcp_manager,
+        )
+    except RuntimeError as exc:
+        # An unreadable session file: say how to continue instead of a traceback.
+        snapshots = settings.session_file.with_name(f"{settings.session_file.stem}.sessions")
+        console.error(
+            RuntimeError(
+                f"{exc}\n移走或修复该文件后重新启动；已保存的历史会话在 {snapshots}，"
+                "启动后可用 /resume 恢复。也可以用 DEEPSEEK_SESSION_FILE 指定另一个会话文件。"
+            )
+        )
+        tools.close()
+        if mcp_manager is not None:
+            mcp_manager.close()
+        return 2
     # The status bar, /status and task summaries show prompt cache hit rates.
     console.cache_provider = lambda: cache_totals(conversation)
     # A ChatGPT account reports its plan usage windows with each response.
@@ -397,10 +435,13 @@ def main() -> int:
     screen = (
         console.session_screen() if console.interactive is True and not prompt else nullcontext()
     )
+    # An interactive session shows startup problems under its banner, not above it.
+    notices: list[Callable[[], None]] = []
+    report = notices.append if not prompt else (lambda notice: notice())
     with screen:
         try:
             if mcp_error:
-                console.error(ValueError(f"MCP: {mcp_error}"))
+                report(lambda: console.error(ValueError(f"MCP: {mcp_error}")))
             if arguments.environment:
                 options = [arguments.environment, *(["--yes"] if arguments.yes else [])]
                 if not use_environment(conversation, console, options):
@@ -410,9 +451,10 @@ def main() -> int:
                 startup = mcp_manager.connect_all(on_connect=console.mcp_connecting)
                 console.update_mcp(startup.data["servers"])
                 for failure in startup.data["failures"]:
-                    console.warning(
+                    message = (
                         f"MCP {failure['server']} 连接失败：{failure['error']}；使用时会自动重试。"
                     )
+                    report(lambda message=message: console.warning(message))
             if prompt:
                 if command is not None and command.name is CommandName.GOAL:
                     try:
@@ -454,7 +496,7 @@ def main() -> int:
                     console.error(exc)
                     return 1
                 return 0 if (conversation.last_outcome or {}).get("status") == "completed" else 1
-            run_interactive(conversation, console)
+            run_interactive(conversation, console, notices=notices)
             return 0
         finally:
             conversation.close()

@@ -23,6 +23,16 @@ STATUS_DISPLAY = {
     "not_executed": ("○", "warn", "未执行"),
 }
 HEALTHY_STATUSES = frozenset({"ok", "completed", "pending", "running"})
+# Background command session states, in the same language as the rest of the display.
+PROCESS_STATES = {
+    "running": "运行中",
+    "waiting": "等待中",
+    "ready": "条件满足",
+    "completed": "已结束",
+    "failed": "失败退出",
+    "timed_out": "超时终止",
+    "stopped": "已停止",
+}
 
 
 def plain(value: Any) -> str:
@@ -48,11 +58,20 @@ def pretty(value: Any) -> str:
     return plain(json.dumps(value, ensure_ascii=False, indent=2))
 
 
-def result_summary(result: dict) -> str:
+def result_summary(result: dict, *, brief: bool = False) -> str:
+    """One line of result facts; ``brief`` is for a call line that already shows its state."""
     data = result.get("data") or {}
     parts = []
     if data.get("session_id"):
-        parts.append(f"进程 {data['session_id']} · {data.get('state', 'unknown')}")
+        session = str(data["session_id"])
+        state = data.get("state", "unknown")
+        label = PROCESS_STATES.get(state, state)
+        if brief:
+            # The call line labels a healthy running or waiting session already.
+            shown = result.get("status") == "ok" and state in {"running", "waiting"}
+            parts.append(f"进程 {session[:8]}" + ("" if shown else f" · {label}"))
+        else:
+            parts.append(f"进程 {session} · {label}")
     if data.get("event") == "waiting":
         parts.append("条件未满足")
     if data.get("exit_code") is not None:

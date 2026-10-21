@@ -118,6 +118,12 @@ class ArtifactStore:
 
     def new_path(self, suffix: str = ".txt") -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)
+        # Command output and checkpoints may hold private task text: keep them out of
+        # `git status` and `git add -A` in the user's repository without editing its ignores.
+        ignore = self.directory / ".gitignore"
+        if not ignore.exists():
+            with suppress(OSError):
+                ignore.write_text("# Aster tool output\n*\n", encoding="utf-8")
         return self.directory / f"{uuid4().hex}{suffix}"
 
     def render(self, result: ToolResult, limit: int = MAX_RESULT_CHARS) -> str:

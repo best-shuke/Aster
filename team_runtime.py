@@ -10,6 +10,7 @@ background time limit passes, or the next turn takes it over. Every change is pe
 so a later turn, /resume, or a new process continues where work stopped.
 """
 
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -1786,7 +1787,14 @@ class TeamRuntime:
                     if key not in {"id", "at", "type", "actor"} and value not in (None, [], {})
                 }
                 stamp = time.strftime("%H:%M:%S", time.localtime(event["at"]))
-                lines.append(f"{stamp} {event['actor']} {event['type']} {details}")
+                # key=value pairs read better than a Python dict repr ("{}" when empty).
+                line = f"{stamp} {event['actor']} {event['type']}"
+                for key, value in details.items():
+                    text = (
+                        value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                    )
+                    line += f" · {key}={text}"
+                lines.append(line)
             return lines
 
     def execution_context(self, activation: Activation) -> ExecutionContext:
