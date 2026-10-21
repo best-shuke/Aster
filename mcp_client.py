@@ -18,9 +18,12 @@ import httpx2
 from jsonschema.exceptions import SchemaError
 from jsonschema.validators import validator_for
 from mcp import Client
+from mcp import types as mcp_types
+from mcp.client.session import IncomingMessage
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from referencing import Registry
 from referencing.exceptions import Unresolvable
 
@@ -286,7 +289,11 @@ class _Connection:
         self.instructions: str | None = None
         self.state = "not-connected"
         self.error: str | None = None
-        self._queue: asyncio.Queue[_Request] | None = None
+        self._queue: asyncio.Queue[_Request | None] | None = None
+        self._tools_revision = 0
+        self._catalog_revision = -1
+        self._refresh_pending = False
+        self._catalog_error: str | None = None
         self._ready: concurrent.futures.Future[None] | None = None
         self._lifetime: concurrent.futures.Future[None] | None = None
         self._lock = threading.Lock()
@@ -329,15 +336,84 @@ class _Connection:
             target = streamable_http_client(self.config.url or "", http_client=http_client)
         else:
             target = self.config.url or ""
-        return await stack.enter_async_context(
-            Client(target, read_timeout_seconds=self.config.timeout, mode=self.config.mode)
+        client = await stack.enter_async_context(
+            Client(
+                target,
+                read_timeout_seconds=self.config.timeout,
+                mode=self.config.mode,
+                message_handler=self._handle_message,
+            )
         )
+        if (
+            client.protocol_version in MODERN_PROTOCOL_VERSIONS
+            and client.server_capabilities.tools is not None
+        ):
+            subscribed = asyncio.get_running_loop().create_future()
+            watcher = asyncio.create_task(self._watch_tools(client, subscribed))
+            stack.push_async_callback(self._stop_watcher, watcher)
+            # Subscribe before the initial listing so no change is lost in between.
+            await subscribed
+        return client
+
+    @staticmethod
+    async def _stop_watcher(watcher: asyncio.Task) -> None:
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+
+    async def _watch_tools(self, client: Client, subscribed) -> None:
+        while True:
+            try:
+                async with client.listen(tools_list_changed=True) as subscription:
+                    if not subscribed.done():
+                        subscribed.set_result(None)
+                    else:
+                        # A reopened stream has no replay; re-list to recover missed changes.
+                        self._tools_changed()
+                    async for _ in subscription:
+                        # Notifications also reach _handle_message. Drain the stream
+                        # without scheduling a second refresh for the same event.
+                        pass
+                self._catalog_error = "MCP tool subscription closed"
+            except Exception as exc:
+                if not subscribed.done():
+                    subscribed.set_exception(exc)
+                    return
+                self._catalog_error = str(exc) or type(exc).__name__
+            self._tools_changed()
+            await asyncio.sleep(1)
+
+    async def _handle_message(self, message: IncomingMessage) -> None:
+        if isinstance(message, mcp_types.ToolListChangedNotification):
+            self._tools_changed()
+
+    def _tools_changed(self) -> None:
+        if not self._closed:
+            self._tools_revision += 1
+            self._schedule_refresh()
+
+    def _schedule_refresh(self) -> None:
+        if self._queue is not None and not self._refresh_pending and not self._closed:
+            self._refresh_pending = True
+            self._queue.put_nowait(None)
+
+    async def _refresh_tools(self, client: Client) -> None:
+        revision = self._tools_revision
+        try:
+            tools = await self._list_tools(client)
+        except Exception as exc:
+            self._catalog_error = str(exc) or type(exc).__name__
+            raise
+        # Publish all pages together; a notification during the fetch stays dirty.
+        self.tools = tools
+        self._catalog_revision = revision
+        self._catalog_error = None
 
     async def _list_tools(self, client: Client) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         cursor = None
         while True:
-            result = await client.list_tools(cursor=cursor)
+            result = await client.list_tools(cursor=cursor, cache_mode="refresh")
             for tool in result.tools:
                 tools.append(
                     {
@@ -361,7 +437,11 @@ class _Connection:
         if request.operation == "call":
             return await client.call_tool(request.payload["name"], request.payload.get("arguments"))
         if request.operation == "refresh":
-            self.tools = await self._list_tools(client)
+            await self._refresh_tools(client)
+            return self.tools
+        if request.operation == "catalog":
+            while self._catalog_revision != self._tools_revision:
+                await self._refresh_tools(client)
             return self.tools
         raise ValueError(f"Unknown MCP operation {request.operation!r}")
 
@@ -371,11 +451,12 @@ class _Connection:
         queue = None
         try:
             async with AsyncExitStack() as stack:
+                queue = self._queue = asyncio.Queue()
+                self._refresh_pending = False
                 async with asyncio.timeout(self.config.timeout):
                     client = await self._open_client(stack)
-                    self.tools = await self._list_tools(client)
+                    await self._refresh_tools(client)
                 self.instructions = client.instructions
-                queue = self._queue = asyncio.Queue()
                 with self._lock:
                     self.state = "connected"
                 if not ready.done():
@@ -383,6 +464,17 @@ class _Connection:
 
                 while True:
                     request = await queue.get()
+                    if request is None:
+                        self._refresh_pending = False
+                        try:
+                            if self._catalog_revision != self._tools_revision:
+                                async with asyncio.timeout(self.config.timeout):
+                                    await self._refresh_tools(client)
+                        except Exception as exc:
+                            # Keep the last complete catalog. Discovery retries the
+                            # dirty listing; a failed background refresh cannot end a call.
+                            self._catalog_error = str(exc) or type(exc).__name__
+                        continue
                     if request.operation == "close":
                         close_request = request
                         break
@@ -437,7 +529,7 @@ class _Connection:
             if queue is not None:
                 while not queue.empty():
                     request = queue.get_nowait()
-                    if not request.future.done():
+                    if request is not None and not request.future.done():
                         request.future.set_exception(
                             RuntimeError("MCP connection closed before execution")
                         )
@@ -515,6 +607,8 @@ class _Connection:
             if self.state == "connected" and not self.config.disabled
             else 0,
             "catalog_tool_count": len(self.tools),
+            "catalog_stale": self._catalog_revision != self._tools_revision,
+            "catalog_error": self._catalog_error,
             "available": self.state == "connected" and not self.config.disabled,
             "error": self.error,
         }
@@ -831,7 +925,10 @@ class McpManager:
             try:
                 connection = self._connection(config.name)
                 connection.start(self._remaining(context, config), cancelled=context.cancelled)
-                catalog.extend((config.name, tool) for tool in connection.tools)
+                tools = connection.request(
+                    "catalog", {}, self._remaining(context, config), context=context
+                )
+                catalog.extend((config.name, tool) for tool in tools)
             except Exception as exc:
                 failures.append({"server": config.name, "error": str(exc)})
         return catalog, failures
