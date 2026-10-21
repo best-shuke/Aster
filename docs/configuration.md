@@ -35,7 +35,7 @@
 | `DEEPSEEK_MAX_OUTPUT_TOKENS` / `DEEPSEEK_MAX_TASK_SECONDS` | 输出上限与任务时限 |
 | `DEEPSEEK_MAX_SUBAGENTS` | 子代理并发上限 |
 
-配置先从进程环境读取；本地文件只补充尚未设置的值。直接运行 Python 入口时，未指定配置文件则读取当前目录的 `.env`；`bin/agent` 则使用程序目录的 `.env`。
+配置先从进程环境读取；本地文件只补充尚未设置的值。文件每行一个 `KEY=value`，可带 `export` 前缀，值可加引号，未加引号的值中 ` #` 之后视为注释。数值项写错时启动会指出具体变量，不会继续运行。直接运行 Python 入口时，未指定配置文件则读取当前目录的 `.env`；`bin/agent` 则使用程序目录的 `.env`。
 
 `DEEPSEEK_MAX_TASK_SECONDS` 默认 `unlimited`，主任务不因固定总时长结束。已有配置中的数字仍生效；
 希望持续工作时将该项改为 `unlimited` 并重启。网络空闲、单个工具操作的超时和用户取消分别处理。

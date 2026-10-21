@@ -16,7 +16,7 @@ from config import (
     parse_reasoning_effort,
     system_prompt,
 )
-from context_budget import WireCache, context_snapshot
+from context_budget import LOCAL_METADATA, WireCache, context_snapshot
 from context_management import compact_messages, summarize
 from contracts import (
     CompletionClient,
@@ -853,7 +853,11 @@ class Conversation:
             else nullcontext()
         ):
             team_note = self.team.turn_context() if self.team is not None else ""
-            self.messages.append({"role": "user", "content": expanded_prompt})
+            user_message: Message = {"role": "user", "content": expanded_prompt}
+            if expanded_prompt != prompt:
+                # History and session lists show what the user typed, not the loaded skill.
+                user_message[LOCAL_METADATA] = {"display": prompt.strip()}
+            self.messages.append(user_message)
             # Task-specific context belongs to this turn, never to the shared prefix.
             self.messages.append(
                 {

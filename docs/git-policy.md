@@ -4,6 +4,8 @@
 
 默认忽略本地环境配置、凭据文件、会话、命令输出、检查点、数据库、缓存、虚拟环境和编辑器文件。`skills/`、`environments/`、`templates/` 和 `workflows/` 中的用户资源默认忽略，仅保留目录说明。
 
+在其他仓库中运行 Aster 时，工作区里的 `.agent-artifacts/`（命令输出与检查点）和会话快照目录 `.deepseek-session.sessions/` 会自带只含 `*` 的 `.gitignore`，不会出现在 `git status` 中；会话文件 `.deepseek-session.json` 及其锁文件仍在工作区根目录，可加入该仓库的忽略规则，或用 `DEEPSEEK_SESSION_FILE` 放到别处。
+
 提交前检查：
 
 ```sh

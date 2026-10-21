@@ -655,6 +655,26 @@ class LoginFlowTests(TempDirTest):
         exchange.assert_called_once_with("c", "v", auth.REDIRECT_URI)
         self.assertEqual(login.model, "gpt-5.5")
 
+    def test_keeping_an_account_reports_an_unreachable_refresh_without_crashing(self):
+        self.save_chatgpt(expires_in=10)  # Due for a refresh.
+        console = ScriptedConsole([0, 0, None])
+        with patch("auth._post", side_effect=OSError("offline")):
+            self.assertIsNone(login_ui.run_login(console, self.store))
+        self.assertTrue(any("无法连接" in message for message in console.messages))
+        self.assertEqual(len(console.questions), 3)  # Back to the menu, then cancelled.
+
+    def test_startup_reports_malformed_settings_by_variable_name(self):
+        piped = SimpleNamespace(isatty=lambda: False)
+        configured = {"DEEPSEEK_API_KEY": "k", "DEEPSEEK_MAX_SUBAGENTS": "many"}
+        with (
+            patch.dict(os.environ, configured),
+            patch("sys.stdin", piped),
+            patch("sys.stderr", io.StringIO()) as errors,
+        ):
+            self.assertIsNone(main.load_settings(choose=False, one_shot=True))
+        self.assertIn("DEEPSEEK_MAX_SUBAGENTS", errors.getvalue())
+        self.assertIn("'many'", errors.getvalue())
+
     def test_logout_removes_saved_credentials_from_running_clients_too(self):
         self.save_chatgpt()
         account = auth.chatgpt_account(self.store.path)

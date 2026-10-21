@@ -1,5 +1,6 @@
 import os
 import platform
+import re
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
@@ -62,12 +63,24 @@ def load_env(path: Path | None = None) -> None:
     if not path.exists():
         return
 
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig: editors on Windows may start the file with a byte order mark.
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
+        # Shell-sourceable files write "export KEY=value".
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        os.environ.setdefault(key.strip(), env_file_value(value.strip()))
+
+
+def env_file_value(value: str) -> str:
+    """A .env value: quoted text as written, or unquoted text before a ` #` comment."""
+    quote = value[:1]
+    if quote in {"'", '"'} and (end := value.find(quote, 1)) != -1:
+        return value[1:end]
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip().strip("'\"")
 
 
 @dataclass(frozen=True)
@@ -155,14 +168,11 @@ class Settings:
             **fields,
             session_file=session_file.resolve(),
             max_context_chars=optional_limit("DEEPSEEK_MAX_CONTEXT_CHARS", int),
-            keep_recent_turns=max(1, int(os.environ.get("DEEPSEEK_KEEP_RECENT_TURNS", "6"))),
+            keep_recent_turns=max(1, env_number("DEEPSEEK_KEEP_RECENT_TURNS", int, "6")),
             max_task_seconds=optional_limit("DEEPSEEK_MAX_TASK_SECONDS", int, default="unlimited"),
             max_subagents=max(
                 1,
-                min(
-                    MAX_SUBAGENTS,
-                    int(os.environ.get("DEEPSEEK_MAX_SUBAGENTS", str(MAX_SUBAGENTS))),
-                ),
+                min(MAX_SUBAGENTS, env_number("DEEPSEEK_MAX_SUBAGENTS", int, str(MAX_SUBAGENTS))),
             ),
             workspace=workspace,
             prompt_file=prompt_file.resolve(),
@@ -193,17 +203,16 @@ class Settings:
             .expanduser()
             .resolve(),
             request_timeout_seconds=max(
-                1, float(os.environ.get("DEEPSEEK_REQUEST_TIMEOUT_SECONDS", "180"))
+                1, env_number("DEEPSEEK_REQUEST_TIMEOUT_SECONDS", float, "180")
             ),
-            max_output_tokens=max(1, int(os.environ.get("DEEPSEEK_MAX_OUTPUT_TOKENS", "131072"))),
-            websearch_enabled=os.environ.get("DEEPSEEK_WEBSEARCH_ENABLED", "1").lower()
-            not in {"0", "false", "no", "off"},
+            max_output_tokens=max(1, env_number("DEEPSEEK_MAX_OUTPUT_TOKENS", int, "131072")),
+            websearch_enabled=env_flag("DEEPSEEK_WEBSEARCH_ENABLED", True),
             websearch_base_url=os.environ.get(
                 "DEEPSEEK_WEBSEARCH_BASE_URL", "https://api.cline.bot/api/v1"
             ).rstrip("/"),
             websearch_api_key=os.environ.get("DEEPSEEK_WEBSEARCH_API_KEY") or None,
             max_output_continuations=(
-                max(0, int(os.environ["DEEPSEEK_MAX_OUTPUT_CONTINUATIONS"]))
+                max(0, env_number("DEEPSEEK_MAX_OUTPUT_CONTINUATIONS", int, "0"))
                 if os.environ.get("DEEPSEEK_MAX_OUTPUT_CONTINUATIONS", "").lower()
                 not in {"", "unlimited", "none"}
                 else None
@@ -211,20 +220,18 @@ class Settings:
             generation_timeout_seconds=optional_limit("DEEPSEEK_GENERATION_TIMEOUT_SECONDS", float),
             max_reasoning_chars=optional_limit("DEEPSEEK_MAX_REASONING_CHARS", int),
             summary_timeout_seconds=max(
-                1, float(os.environ.get("DEEPSEEK_SUMMARY_TIMEOUT_SECONDS", "45"))
+                1, env_number("DEEPSEEK_SUMMARY_TIMEOUT_SECONDS", float, "45")
             ),
             finalization_reserve_seconds=max(
-                1, float(os.environ.get("DEEPSEEK_FINALIZATION_RESERVE_SECONDS", "120"))
+                1, env_number("DEEPSEEK_FINALIZATION_RESERVE_SECONDS", float, "120")
             ),
             reasoning_effort=parse_reasoning_effort(os.environ.get("DEEPSEEK_REASONING_EFFORT")),
-            request_retries=max(0, int(os.environ.get("DEEPSEEK_REQUEST_RETRIES", "3"))),
-            retry_backoff_seconds=max(
-                0, float(os.environ.get("DEEPSEEK_RETRY_BACKOFF_SECONDS", "2"))
-            ),
+            request_retries=max(0, env_number("DEEPSEEK_REQUEST_RETRIES", int, "3")),
+            retry_backoff_seconds=max(0, env_number("DEEPSEEK_RETRY_BACKOFF_SECONDS", float, "2")),
             context_reserve_tokens=max(
-                1, int(os.environ.get("DEEPSEEK_CONTEXT_RESERVE_TOKENS", "16384"))
+                1, env_number("DEEPSEEK_CONTEXT_RESERVE_TOKENS", int, "16384")
             ),
-            keep_recent_tokens=max(1, int(os.environ.get("DEEPSEEK_KEEP_RECENT_TOKENS", "20000"))),
+            keep_recent_tokens=max(1, env_number("DEEPSEEK_KEEP_RECENT_TOKENS", int, "20000")),
         )
 
 
@@ -268,9 +275,21 @@ def login_fields(login: Login | None) -> dict:
     return fields
 
 
+def env_number(name: str, convert, default: str):
+    """A numeric variable; a malformed value names the variable instead of a bare traceback."""
+    value = os.environ.get(name, default).strip()
+    try:
+        return convert(value)
+    except ValueError:
+        kind = "整数" if convert is int else "数字"
+        raise ValueError(f"{name} 应为{kind}，当前值为 {value!r}") from None
+
+
 def optional_limit(name, convert, default=""):
     value = os.environ.get(name, default).strip().lower()
-    return None if value in {"", "none", "unlimited", "0"} else max(1, convert(value))
+    if value in {"", "none", "unlimited", "0"}:
+        return None
+    return max(1, env_number(name, convert, default))
 
 
 def env_flag(name: str, default: bool) -> bool:

@@ -1507,6 +1507,9 @@ class TeamCommandTests(TeamTestCase):
         self.assertIn("任务 t1 · completed", text)
         self.assertIn("task_created", text)
         self.assertIn("activation_finished", text)
+        # Event details read as key=value pairs, not a Python dict.
+        self.assertNotIn("{'", text)
+        self.assertNotIn(" {}", text)
 
 
 class TeamProgressTests(TeamTestCase):

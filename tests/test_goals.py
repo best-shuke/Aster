@@ -2,6 +2,7 @@ import json
 import tempfile
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -454,6 +455,21 @@ class GoalRuntimeTests(unittest.TestCase):
         self.assertTrue(use_goal(conversation, console, ["写一份报告"], ask_task=run))
         self.assertEqual(conversation.goal.status, "completed")
         self.assertTrue(any("已完成" in call.args[0] for call in console.info.call_args_list))
+
+    def test_interrupted_goal_tells_an_interactive_user_how_to_resume(self):
+        conversation = self.conversation(assessment())
+        console = Mock(spec=Console)
+        console.interactive = True
+        console.interrupt_on_escape.return_value = nullcontext()
+
+        def run(conv, output, prompt, **options):
+            self.assertEqual(options["title"], "目标 · 写一份报告")
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            use_goal(conversation, console, ["写一份报告"], ask_task=run)
+        self.assertEqual(conversation.goal.status, "paused")
+        self.assertIn("/goal resume", console.info.call_args.args[0])
 
     def test_one_shot_cli_returns_goal_exit_status_and_preserves_quoted_arguments(self):
         from main import main
