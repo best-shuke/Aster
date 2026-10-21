@@ -22,6 +22,7 @@ from tool_runtime import ExecutionContext, ToolResult
 from tools import CodingTools, ToolPolicy
 from ui import Console
 from usage import CacheStats
+from websearch import WebSearchClient
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -79,7 +80,7 @@ class EnvironmentTestCase(unittest.TestCase):
         client.settings = settings
         client.cache_stats = CacheStats()
         tools = CodingTools(self.workspace)
-        tools.attach_websearch(Mock())
+        tools.attach_websearch(WebSearchClient(settings))
         if manager is not None and manager.server_count:
             tools.attach_mcp(manager)
         conversation = Conversation(

@@ -122,6 +122,14 @@ class Settings:
             return self.api_key
         return None
 
+    @property
+    def websearch_provider(self) -> str | None:
+        """``cline`` with a Cline key (configured explicitly, so it wins), else ``chatgpt``
+        when signed in to a ChatGPT account; ``None`` when neither can search."""
+        if self.resolved_websearch_api_key:
+            return "cline"
+        return "chatgpt" if self.provider == "chatgpt" else None
+
     def with_login(self, login: Login | None) -> "Settings":
         return replace(self, **login_fields(login))
 

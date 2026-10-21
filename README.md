@@ -32,6 +32,8 @@ uv sync --locked
 
 `bin/agent` 固定读取程序目录的 `.env`，并保留当前调用目录作为工作区。直接运行 `uv run --locked python main.py` 时，默认从当前工作目录读取 `.env`。已有进程环境变量优先于文件配置。
 
+联网搜索：以 ChatGPT 账户登录时直接使用账户自带的搜索，无需额外配置；第三方 API 登录时需另行提供 Cline 搜索凭据（`DEEPSEEK_WEBSEARCH_API_KEY`），详见[配置入口](docs/configuration.md)。
+
 如不需要扩展，可通过自己的环境变量设置 `DEEPSEEK_MCP_ENABLED=0`、`DEEPSEEK_SKILLS_ENABLED=0` 和 `DEEPSEEK_WEBSEARCH_ENABLED=0`。缺少 MCP 配置或技能目录不会要求安装具体服务。
 
 ## 框架能力

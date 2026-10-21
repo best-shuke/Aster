@@ -49,6 +49,7 @@ from templates import SavedTemplate, TemplateStore
 from tool_runtime import ToolResult, validate
 from tools import CodingTools, ToolPolicy
 from usage import CacheStats
+from websearch import websearch_client
 from workflows import WorkflowStore
 
 # A standalone rerun of an uncounted check needs this much of the task's time.
@@ -455,7 +456,21 @@ class Conversation:
             client.settings = self.settings
             self.client = client
             if self.tools is not None:
+                self._follow_websearch()
+                # Workers snapshot the registry, so they pick up the new search backend here.
                 self.tools.attach_reasoning(client, max_workers=self.settings.max_subagents)
+
+    def _follow_websearch(self) -> None:
+        """Search through the new login's backend: a ChatGPT account searches on its own."""
+        search = websearch_client(self._baseline_settings)
+        if search is None:
+            self._baseline_registry.pop("websearch", None)
+            self.tools.detach("websearch")
+            return
+        self.tools.attach_websearch(search)
+        self._baseline_registry["websearch"] = self.tools.registry["websearch"]
+        if not self.settings.websearch_enabled:
+            self.tools.detach("websearch")
 
     def apply_environment(
         self,

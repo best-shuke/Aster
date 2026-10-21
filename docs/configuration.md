@@ -29,7 +29,7 @@
 | `DEEPSEEK_ENVIRONMENT_STATE_DIR` | 本地能力环境信任、审计与多代理会话状态目录 |
 | `DEEPSEEK_TEMPLATES_DIR` / `DEEPSEEK_WORKFLOWS_DIR` | 本地模板与 workflow 目录 |
 | `DEEPSEEK_WEBSEARCH_ENABLED` | 联网搜索开关 |
-| `DEEPSEEK_WEBSEARCH_BASE_URL` / `DEEPSEEK_WEBSEARCH_API_KEY` | 搜索服务地址与独立凭据 |
+| `DEEPSEEK_WEBSEARCH_BASE_URL` / `DEEPSEEK_WEBSEARCH_API_KEY` | Cline 搜索服务地址与独立凭据；ChatGPT 账户登录时可不设置 |
 | `DEEPSEEK_REASONING_EFFORT` | 推理档位：`off`、`low`、`high`、`max`、`default` |
 | `DEEPSEEK_MAX_CONTEXT_CHARS` / `DEEPSEEK_CONTEXT_WINDOW_TOKENS` | 上下文预算 |
 | `DEEPSEEK_MAX_OUTPUT_TOKENS` / `DEEPSEEK_MAX_TASK_SECONDS` | 输出上限与任务时限 |
@@ -44,4 +44,4 @@
 
 默认资源目录位于程序目录下：`skills/`、`environments/`、`templates/`、`workflows/` 和 `mcp.json`。本仓库的这些目录只放说明文件，实际资源默认被 Git 忽略。自定义路径与其他参数的具体解析方式见源码；为避免相对路径歧义，可使用自己机器上的绝对路径。
 
-MCP 支持本地子进程与远程服务，接入的服务、参数、认证头和环境变量均由使用者自行管理。联网搜索有独立服务设置，模型凭据仅在服务同源时自动复用；无需搜索时可以禁用。没有外部服务或技能配置时仍可使用核心编程工具。
+MCP 支持本地子进程与远程服务，接入的服务、参数、认证头和环境变量均由使用者自行管理。联网搜索按以下顺序选择后端：设置了 Cline 搜索凭据（`DEEPSEEK_WEBSEARCH_API_KEY`，或模型服务与搜索服务同源时复用的模型凭据）时使用 Cline 原生搜索；否则以 ChatGPT 账户登录时，使用 Codex 后端托管的 `web_search`，由当前模型以低推理档位执行搜索，返回带引用的摘要、实际执行的查询和来源链接，消耗 ChatGPT 套餐额度。两者都没有时显示“未配置”。`/login` 切换登录方式后，搜索后端随之切换。无需搜索时可以禁用。没有外部服务或技能配置时仍可使用核心编程工具。

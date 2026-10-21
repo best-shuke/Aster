@@ -1244,7 +1244,9 @@ class Console:
 
     def configuration_notice(self) -> None:
         if self.websearch_status == "未配置":
-            self.info("联网搜索未配置；需要时请设置 DEEPSEEK_WEBSEARCH_API_KEY。")
+            self.info(
+                "联网搜索未配置；需要时用 /login 登录 ChatGPT 账户，或设置 DEEPSEEK_WEBSEARCH_API_KEY。"
+            )
 
     @contextmanager
     def _suspend_live(self):

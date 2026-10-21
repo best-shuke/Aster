@@ -543,6 +543,13 @@ def update_effort(conversation: Conversation, console: Console, arguments: list[
         console.error(exc)
 
 
+def websearch_status(conversation: Conversation) -> str:
+    if not conversation.settings.websearch_enabled:
+        return "关闭"
+    names = {item["function"]["name"] for item in conversation.definitions}
+    return "可用" if "websearch" in names else "未配置或策略禁用"
+
+
 def use_login(conversation: Conversation, console: Console, arguments: list[str]) -> None:
     store = AuthStore(conversation.settings.auth_file or auth_file())
     login = run_login(console, store)
@@ -557,6 +564,7 @@ def use_login(conversation: Conversation, console: Console, arguments: list[str]
     settings = conversation.settings
     console.model = settings.model
     console.account = describe(settings)
+    console.websearch_status = websearch_status(conversation)
     console.update_context(conversation.context_status())
     console.success(f"已切换到 {settings.model}（{console.account}），从下一次提问生效。")
 
@@ -596,17 +604,10 @@ def sync_environment_ui(conversation: Conversation, console: Console) -> None:
         if skills is not None
         else None
     )
-    names = {item["function"]["name"] for item in conversation.definitions}
     console.mcp_policy_enabled = (
         conversation.tools.policy.permits("mcp") if conversation.tools is not None else False
     )
-    console.websearch_status = (
-        "关闭"
-        if not settings.websearch_enabled
-        else "可用"
-        if "websearch" in names
-        else "未配置或策略禁用"
-    )
+    console.websearch_status = websearch_status(conversation)
     console.mcp_provider = (
         (lambda: conversation.mcp_manager.status().data["servers"])
         if conversation.mcp_manager is not None

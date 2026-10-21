@@ -173,6 +173,60 @@ def response_error(error: Any) -> CompletionError:
     return CompletionError("provider_error", message, retryable=True)
 
 
+def http_error(exc: urllib.error.HTTPError) -> CompletionError:
+    retry_after = retry_after_seconds(exc.headers.get("Retry-After")) if exc.headers else None
+    payload: Any = {}
+    with suppress(OSError, ValueError):
+        payload = json.loads(exc.read(16384) or b"{}")
+    exc.close()
+    error = payload.get("error") if isinstance(payload, dict) else None
+    error = error if isinstance(error, dict) else {}
+    if exc.code == 401:
+        return CompletionError("http_401", "ChatGPT 登录凭据被拒绝")
+    if exc.code == 429 and error.get("type") == "usage_limit_reached":
+        seconds = error.get("resets_in_seconds")
+        if not number(seconds) and number(error.get("resets_at")):
+            seconds = max(0, error["resets_at"] - time.time())
+        when = f"，约 {coarse_duration(seconds)} 后重置" if number(seconds) else ""
+        plan = str(error.get("plan_type") or "").title()
+        return CompletionError(
+            "usage_limit",
+            f"ChatGPT {plan} 用量已达上限{when}；可以等待重置，或用 /login 改用第三方 API",
+        )
+    # The Codex backend reports request problems (such as an unavailable model) as a
+    # short detail; it does not echo credentials, so show it.
+    detail = (payload.get("detail") if isinstance(payload, dict) else None) or error.get("message")
+    message = f"ChatGPT 返回 HTTP {exc.code}"
+    if isinstance(detail, str) and detail.strip():
+        message += f"：{detail.strip()[:300]}"
+    return CompletionError(
+        f"http_{exc.code}",
+        message,
+        retryable=exc.code in {408, 429} or exc.code >= 500,
+        retry_after=retry_after,
+    )
+
+
+def quota_windows(headers: dict[str, str]) -> dict[str, Any] | None:
+    """The plan usage windows the backend reports in response headers, if any."""
+    values = {key.lower(): value for key, value in headers.items()}
+
+    def window(name: str) -> dict[str, float] | None:
+        fields = {}
+        for field in ("used-percent", "window-minutes", "reset-after-seconds"):
+            with suppress(KeyError, TypeError, ValueError):
+                fields[field] = float(values[f"x-codex-{name}-{field}"])
+        return fields if "used-percent" in fields else None
+
+    quota: dict[str, Any] = {
+        name: data for name in ("primary", "secondary") if (data := window(name)) is not None
+    }
+    if not quota:
+        return None
+    quota["observed_at"] = time.time()
+    return quota
+
+
 class _ResponsesEvents:
     """Translate one Responses event stream into chat-completions chunks."""
 
@@ -400,53 +454,9 @@ class ChatGPTClient(DeepSeekClient):
         return super()._complete_once(messages, *args, **kwargs)
 
     def _http_error(self, exc: urllib.error.HTTPError) -> CompletionError:
-        retry_after = retry_after_seconds(exc.headers.get("Retry-After")) if exc.headers else None
-        payload: Any = {}
-        with suppress(OSError, ValueError):
-            payload = json.loads(exc.read(16384) or b"{}")
-        exc.close()
-        error = payload.get("error") if isinstance(payload, dict) else None
-        error = error if isinstance(error, dict) else {}
-        if exc.code == 401:
-            return CompletionError("http_401", "ChatGPT 登录凭据被拒绝")
-        if exc.code == 429 and error.get("type") == "usage_limit_reached":
-            seconds = error.get("resets_in_seconds")
-            if not number(seconds) and number(error.get("resets_at")):
-                seconds = max(0, error["resets_at"] - time.time())
-            when = f"，约 {coarse_duration(seconds)} 后重置" if number(seconds) else ""
-            plan = str(error.get("plan_type") or "").title()
-            return CompletionError(
-                "usage_limit",
-                f"ChatGPT {plan} 用量已达上限{when}；可以等待重置，或用 /login 改用第三方 API",
-            )
-        # The Codex backend reports request problems (such as an unavailable model) as a
-        # short detail; it does not echo credentials, so show it.
-        detail = (payload.get("detail") if isinstance(payload, dict) else None) or error.get(
-            "message"
-        )
-        message = f"ChatGPT 返回 HTTP {exc.code}"
-        if isinstance(detail, str) and detail.strip():
-            message += f"：{detail.strip()[:300]}"
-        return CompletionError(
-            f"http_{exc.code}",
-            message,
-            retryable=exc.code in {408, 429} or exc.code >= 500,
-            retry_after=retry_after,
-        )
+        return http_error(exc)
 
     def _observe_headers(self, headers: dict[str, str]) -> None:
-        values = {key.lower(): value for key, value in headers.items()}
-
-        def window(name: str) -> dict[str, float] | None:
-            fields = {}
-            for field in ("used-percent", "window-minutes", "reset-after-seconds"):
-                with suppress(KeyError, TypeError, ValueError):
-                    fields[field] = float(values[f"x-codex-{name}-{field}"])
-            return fields if "used-percent" in fields else None
-
-        quota = {
-            name: data for name in ("primary", "secondary") if (data := window(name)) is not None
-        }
+        quota = quota_windows(headers)
         if quota:
-            quota["observed_at"] = time.time()
             self.account.quota = quota

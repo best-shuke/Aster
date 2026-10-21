@@ -54,7 +54,7 @@ from skills import SkillCatalog
 from tools import CodingTools
 from ui import Console
 from usage import CacheStats
-from websearch import WebSearchClient
+from websearch import websearch_client
 
 HELP = (
     (
@@ -343,7 +343,7 @@ def main() -> int:
     )
     if not settings.websearch_enabled:
         websearch_status = "关闭"
-    elif settings.resolved_websearch_api_key:
+    elif settings.websearch_provider:
         websearch_status = "可用"
     else:
         websearch_status = "未配置"
@@ -376,8 +376,9 @@ def main() -> int:
     )
     if console.interactive is True:
         tools.attach_user_input(console.ask_user)
-    if settings.websearch_enabled and settings.resolved_websearch_api_key:
-        tools.attach_websearch(WebSearchClient(settings))
+    search = websearch_client(settings)
+    if search is not None:
+        tools.attach_websearch(search)
     if mcp_manager is not None and mcp_manager.server_count:
         tools.attach_mcp(mcp_manager)
     conversation = Conversation(
