@@ -578,10 +578,11 @@ class Conversation:
         if self.mcp_manager is None or self.tools is None or not self.tools.policy.permits("mcp"):
             return "ready"
         servers = self.mcp_manager.status().data["servers"]
+        # A server still connecting in the background is pending, not missing.
         missing = [
             server
             for server in servers
-            if server.get("status") != "disabled"
+            if server.get("status") not in {"disabled", "connecting"}
             and not server.get("available", server.get("status") == "connected")
         ]
         if any(server.get("required") for server in missing):

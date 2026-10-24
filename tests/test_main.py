@@ -90,21 +90,22 @@ class SessionCommandTests(unittest.TestCase):
                 self.assertIs(handle_command(None, console, command), CommandResult.HANDLED)
         self.assertEqual(tasks.call_count, 2)
 
-    def test_main_auto_connects_before_showing_the_ui_and_closes_on_exit(self):
+    def test_main_starts_mcp_in_background_before_showing_the_ui_and_closes_on_exit(self):
         import main
 
         settings = Mock(mcp_enabled=True, websearch_enabled=False)
         manager = Mock(spec=McpManager)
         manager.server_count = 2
         servers = [
-            {"name": "playwright", "status": "connected", "tool_count": 25},
+            {"name": "playwright", "status": "connecting", "tool_count": 0},
             {"name": "js-reverse", "status": "connected", "tool_count": 24},
         ]
-        manager.connect_all.return_value = ToolResult(data={"servers": servers, "failures": []})
         manager.status.return_value = ToolResult(data={"servers": servers})
 
         def verify_ready(conversation, console, *, notices=()):
-            manager.connect_all.assert_called_once()
+            # The UI does not wait for servers to finish connecting.
+            manager.start_all.assert_called_once()
+            manager.connect_all.assert_not_called()
             console.update_mcp.assert_called_once_with(servers)
 
         with (
@@ -123,18 +124,14 @@ class SessionCommandTests(unittest.TestCase):
         conversations.return_value.close.assert_called_once()
         self.assertIs(conversations.call_args.kwargs["mcp_manager"], manager)
 
-    def test_startup_failure_warns_but_does_not_prevent_chat(self):
+    def test_background_startup_failure_warns_once_without_preventing_chat(self):
         import main
 
         settings = Mock(mcp_enabled=True, websearch_enabled=False)
         manager = Mock(spec=McpManager)
         manager.server_count = 1
-        manager.connect_all.return_value = ToolResult(
-            status="error",
-            data={
-                "servers": [{"name": "broken", "status": "failed"}],
-                "failures": [{"server": "broken", "error": "unavailable"}],
-            },
+        manager.status.return_value = ToolResult(
+            data={"servers": [{"name": "broken", "status": "connecting"}]}
         )
         with (
             patch("main.load_settings", return_value=settings),
@@ -150,13 +147,26 @@ class SessionCommandTests(unittest.TestCase):
             console.return_value.interactive = False
             main.main()
         run.assert_called_once()
-        # Shown under the banner, which run_interactive prints first.
         console.return_value.warning.assert_not_called()
-        for notice in run.call_args.kwargs["notices"]:
-            notice()
-        self.assertIn("broken", console.return_value.warning.call_args.args[0])
         conversations.return_value.close.assert_called_once()
         self.assertIs(conversations.call_args.kwargs["mcp_manager"], manager)
+
+        # The interactive loop reports a failure once the background startup ends.
+        manager.background_failures.side_effect = [
+            [{"server": "broken", "error": "unavailable"}],
+            [],
+        ]
+        shown = Mock()
+        conversation = Mock(mcp_manager=manager)
+        main.report_mcp_failures(conversation, shown)
+        main.report_mcp_failures(conversation, shown)
+        shown.warning.assert_called_once()
+        self.assertIn("broken", shown.warning.call_args.args[0])
+        self.assertIn("自动重试", shown.warning.call_args.args[0])
+
+        manager.background_failures.side_effect = [[{"server": "broken", "error": "gone"}]]
+        main.report_mcp_failures(conversation, shown, retry=False)
+        self.assertNotIn("自动重试", shown.warning.call_args.args[0])
 
     def test_unreadable_session_file_is_reported_without_a_traceback(self):
         import main

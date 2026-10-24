@@ -210,6 +210,7 @@ def run_interactive(
     while True:
         try:
             sync_environment_ui(conversation, console)
+            report_mcp_failures(conversation, console)
             if conversation.skills is not None:
                 conversation.skills.reload()
             console.update_context(conversation.context_status())
@@ -242,6 +243,20 @@ def run_interactive(
         except Exception as exc:
             console.error(exc)
             print()
+
+
+def report_mcp_failures(
+    conversation: Conversation, console: Console, *, retry: bool = True
+) -> None:
+    """Warn once about each MCP server whose background startup failed."""
+    manager = getattr(conversation, "mcp_manager", None)
+    if not isinstance(manager, McpManager):
+        return
+    for failure in manager.background_failures():
+        console.warning(
+            f"MCP {failure['server']} 连接失败：{failure['error']}"
+            + ("；使用时会自动重试。" if retry else "。")
+        )
 
 
 def cache_totals(conversation: Conversation) -> dict | None:
@@ -448,13 +463,10 @@ def main() -> int:
                     return 2
             elif mcp_manager is not None and mcp_manager.server_count and not environment_command:
                 console.mcp_provider = lambda: conversation.mcp_manager.status().data["servers"]
-                startup = mcp_manager.connect_all(on_connect=console.mcp_connecting)
-                console.update_mcp(startup.data["servers"])
-                for failure in startup.data["failures"]:
-                    message = (
-                        f"MCP {failure['server']} 连接失败：{failure['error']}；使用时会自动重试。"
-                    )
-                    report(lambda message=message: console.warning(message))
+                # Servers connect in the background: the first request does not wait for
+                # servers a task may never use, and an MCP tool call waits for its server.
+                mcp_manager.start_all()
+                console.update_mcp(mcp_manager.status().data["servers"])
             if prompt:
                 if command is not None and command.name is CommandName.GOAL:
                     try:
@@ -495,6 +507,8 @@ def main() -> int:
                 except Exception as exc:
                     console.error(exc)
                     return 1
+                finally:
+                    report_mcp_failures(conversation, console, retry=False)
                 return 0 if (conversation.last_outcome or {}).get("status") == "completed" else 1
             run_interactive(conversation, console, notices=notices)
             return 0

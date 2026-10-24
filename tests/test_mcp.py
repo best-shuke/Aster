@@ -254,6 +254,29 @@ class McpIntegrationTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["data"]["result"]["structuredContent"], {"result": 5})
 
+    def test_search_ranks_partial_matches_and_lists_tools_when_nothing_matches(self):
+        # Words absent from a description no longer hide a tool another word names.
+        found = self.manager.search("add numbers calculator", None, 10, self.context())
+        self.assertEqual([match["path"] for match in found.data["matches"]], ["test/add"])
+        self.assertNotIn("available_tools", found.data)
+        snake = self.manager.search("echo_text", None, 10, self.context())
+        self.assertEqual(snake.data["matches"][0]["path"], "test/echo")
+
+        missing = self.manager.search("math", None, 10, self.context())
+        self.assertEqual(missing.status, "ok")
+        self.assertEqual(missing.data["matches"], [])
+        self.assertEqual(missing.data["available_tools"], ["test/add", "test/echo"])
+        self.assertEqual(missing.data["available_tool_count"], 2)
+        self.assertIn("'*'", missing.data["guidance"])
+
+    def test_unmatched_search_lists_only_tools_within_scope(self):
+        from mcp_scope import McpScope, ScopedMcp, ToolRule
+
+        scoped = ScopedMcp(self.manager, McpScope({"test": (ToolRule(allow=("echo",)),)}))
+        missing = scoped.execute("search", query="math", _context=self.context())
+        self.assertEqual(missing.data["matches"], [])
+        self.assertEqual(missing.data["available_tools"], ["test/echo"])
+
     def test_startup_connects_without_needing_a_search_and_reuses_connection(self):
         result = self.manager.connect_all()
         self.assertEqual(result.status, "ok")
@@ -769,6 +792,19 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertEqual(result.status, "unknown")
         self.assertEqual(result.error["code"], "execution_unknown")
 
+    def test_close_does_not_wait_out_a_connection_still_starting(self):
+        self.startup.clear()
+        self.assertIsNotNone(self.connection.begin())
+        self.assertTrue(self.opened.wait(1))
+        started = time.monotonic()
+        self.connection.close()
+        # Waiting on the close request would take the full five-second timeout.
+        self.assertLess(time.monotonic() - started, 1)
+        deadline = time.monotonic() + 2
+        while self.connection.state != "closed" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.connection.state, "closed")
+
     def test_closed_connection_cannot_be_reopened(self):
         self.connection.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
@@ -793,6 +829,103 @@ class ConnectionLifecycleTests(unittest.TestCase):
         thread.join(1)
         self.assertEqual(len(results), 1)
         self.assertIsInstance(results[0], RuntimeError)
+
+
+class ManagerStartupTests(unittest.TestCase):
+    def setUp(self):
+        self.opened: list[str] = []
+        self.release = threading.Event()
+        self.open_client = None
+        owner = self
+
+        class Client:
+            instructions = None
+
+        async def open_client(connection, stack):
+            owner.opened.append(connection.config.name)
+            await owner.open_client(connection.config.name)
+            return Client()
+
+        async def list_tools(connection, client):
+            return []
+
+        for name, replacement in (("_open_client", open_client), ("_list_tools", list_tools)):
+            patcher = patch.object(_Connection, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def manager(self, *names: str) -> McpManager:
+        manager = McpManager(
+            Path("unused.json"),
+            Path.cwd(),
+            servers={name: McpServerConfig(name, timeout=2) for name in names},
+        )
+        self.addCleanup(manager.close)
+        return manager
+
+    def test_connect_all_starts_servers_concurrently(self):
+        both = asyncio.Event()
+
+        async def open_client(name):
+            # Each server waits for the other to start; one at a time would time out.
+            if len(self.opened) == 2:
+                both.set()
+            await both.wait()
+
+        self.open_client = open_client
+        manager = self.manager("first", "second")
+        announced = []
+        result = manager.connect_all(timeout=2, on_connect=announced.append)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(sorted(self.opened), ["first", "second"])
+        self.assertEqual(announced, ["first, second"])
+
+    def test_start_all_returns_at_once_and_reports_each_failure_once(self):
+        async def open_client(name):
+            if name == "broken":
+                raise RuntimeError("boom")
+            while not self.release.is_set():
+                await asyncio.sleep(0.005)
+
+        self.open_client = open_client
+        manager = self.manager("slow", "broken")
+        manager.start_all()
+        states = {server["name"]: server["status"] for server in manager.status().data["servers"]}
+        self.assertEqual(states["slow"], "connecting")
+
+        failures = []
+        deadline = time.monotonic() + 2
+        while not failures and time.monotonic() < deadline:
+            failures = manager.background_failures()
+            time.sleep(0.01)
+        self.assertEqual(failures, [{"server": "broken", "error": "boom"}])
+        self.assertEqual(manager.background_failures(), [])
+
+        # Using a server waits for its background startup instead of opening another.
+        self.release.set()
+        connected = manager.connect("slow", ExecutionContext(time.monotonic() + 2))
+        self.assertEqual(connected.data["status"], "connected")
+        self.assertEqual(manager.background_failures(), [])
+        # A failed background startup is retried when the server is used.
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            manager.connect("broken", ExecutionContext(time.monotonic() + 2))
+        self.assertEqual(sorted(self.opened), ["broken", "broken", "slow"])
+
+    def test_background_failure_is_not_reported_after_a_successful_retry(self):
+        async def open_client(name):
+            if self.opened.count(name) == 1:
+                raise RuntimeError("first attempt")
+
+        self.open_client = open_client
+        manager = self.manager("flaky")
+        manager.start_all()
+        deadline = time.monotonic() + 2
+        while manager.status().data["servers"][0]["status"] != "failed":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        manager.connect("flaky", ExecutionContext(time.monotonic() + 2))
+        self.assertEqual(manager.background_failures(), [])
+        self.assertEqual(self.opened, ["flaky", "flaky"])
 
 
 if __name__ == "__main__":

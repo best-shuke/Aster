@@ -762,14 +762,18 @@ class CodingTools:
     def attach_mcp(self, manager: McpManager) -> None:
         self.registry["mcp"] = ToolSpec(
             "mcp",
-            "Discover and call tools from configured MCP servers. The application connects enabled servers at startup. Use status to inspect servers, search to find a tool, describe to inspect its schema, then call it. Search/describe/call reconnect automatically if needed; do not ask the user to connect manually.",
+            "Discover and call tools from configured MCP servers. The application starts connecting enabled servers in the background at startup. Use status to inspect servers, search to find a tool, describe to inspect its schema, then call it. Search query '*' lists every tool; other queries rank tools matching any of their words, and a search without matches lists the available tool paths. Search/describe/call wait for a server that is still connecting and reconnect automatically if needed; do not ask the user to connect manually.",
             {
                 "action": {
                     "type": "string",
                     "enum": ["status", "connect", "search", "describe", "call"],
                 },
                 "server": {"type": "string", "minLength": 1},
-                "query": {"type": "string", "minLength": 1},
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Words matched against tool names and descriptions, or '*' for every tool.",
+                },
                 "tool": {
                     "type": "string",
                     "minLength": 1,

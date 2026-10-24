@@ -692,8 +692,11 @@ class Console:
         self._mcp_servers = [dict(server) for server in servers]
         enabled = [server for server in servers if server.get("status") != "disabled"]
         connected = sum(server.get("status") == "connected" for server in enabled)
+        connecting = sum(server.get("status") == "connecting" for server in enabled)
         failed = sum(server.get("status") == "failed" for server in enabled)
         self.mcp_status = f"已连接 {connected}/{len(enabled)}" if enabled else "未配置"
+        if connecting:
+            self.mcp_status += f" · {connecting} 连接中"
         if failed:
             self.mcp_status += f" · {failed} 失败"
         if not self.mcp_policy_enabled:
