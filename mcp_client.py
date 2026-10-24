@@ -43,6 +43,12 @@ def _argument_validator(serialized_schema: str):
 
 SERVER_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 VARIABLE = re.compile(r"\$\{([^}]+)\}")
+# Search terms: runs of letters or digits, so snake_case and paths split into words.
+SEARCH_TERM = re.compile(r"[^\W_]+")
+# Tool paths listed when a search matches nothing, so the model can still pick one.
+AVAILABLE_TOOL_LIMIT = 100
+# Seconds a closing runtime lets connections stop their servers before cancelling them.
+TEARDOWN_TIMEOUT = 5
 ALLOWED_SERVER_FIELDS = {
     "command",
     "args",
@@ -266,16 +272,21 @@ class _AsyncRuntime:
 
     async def _shutdown(self):
         tasks = asyncio.all_tasks() - {asyncio.current_task()}
-        for task in tasks:
-            task.cancel()
+        # Closed connections finish their own teardown, which stops a stdio server
+        # still starting only after the SDK's grace period; cancelling again would cut
+        # that short and orphan the process. Cancel only what outlives the teardown.
         if tasks:
-            await asyncio.wait(tasks, timeout=2)
+            _, pending = await asyncio.wait(tasks, timeout=TEARDOWN_TIMEOUT)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=2)
 
     def close(self) -> None:
         if not self.thread.is_alive():
             return
         with suppress(Exception):
-            self.submit(self._shutdown()).result(timeout=3)
+            self.submit(self._shutdown()).result(timeout=TEARDOWN_TIMEOUT + 3)
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(timeout=2)
         self.loop.close()
@@ -299,20 +310,25 @@ class _Connection:
         self._lock = threading.Lock()
         self._closed = False
 
-    def start(self, timeout: float, *, cancelled=None) -> None:
-        deadline = time.monotonic() + timeout
+    def begin(self) -> concurrent.futures.Future[None] | None:
+        """Start connecting without waiting; ``None`` when already connected."""
         with self._lock:
             if self._closed:
                 raise RuntimeError(f"MCP connection {self.config.name!r} is closed")
             if self.state == "connected" and self._lifetime and not self._lifetime.done():
-                return
+                return None
             if self.state != "connecting" or self._lifetime is None or self._lifetime.done():
                 self.state = "connecting"
                 self.error = None
                 self._ready = concurrent.futures.Future()
                 self._lifetime = self.runtime.submit(self._run(self._ready))
-            ready = self._ready
-        _wait_future(ready, deadline, cancelled)
+            return self._ready
+
+    def start(self, timeout: float, *, cancelled=None) -> None:
+        deadline = time.monotonic() + timeout
+        ready = self.begin()
+        if ready is not None:
+            _wait_future(ready, deadline, cancelled)
 
     async def _open_client(self, stack: AsyncExitStack) -> Client:
         if self.config.command is not None:
@@ -586,9 +602,12 @@ class _Connection:
             if self.state not in {"connected", "connecting"}:
                 self.state = "closed"
                 return
+            starting = self.state == "connecting"
         request = _Request("close", {}, time.monotonic() + timeout)
         try:
-            if self._queue is None:
+            # A starting connection reads no queue yet; cancel it rather than wait out
+            # a server that may never be used, such as one still starting in the background.
+            if self._queue is None or starting:
                 raise TimeoutError("MCP connection is still starting")
             self.runtime.loop.call_soon_threadsafe(self._queue.put_nowait, request)
             _wait_future(request.future, request.deadline)
@@ -714,6 +733,8 @@ class McpManager:
             }
         self._runtime: _AsyncRuntime | None = None
         self._connections: dict[str, _Connection] = {}
+        # Startups begun by start_all whose outcome has not been reported yet.
+        self._background: dict[str, concurrent.futures.Future[None]] = {}
         self._closed = False
         self._lock = threading.Lock()
         self._previous = None
@@ -884,12 +905,24 @@ class McpManager:
     def connect_all(
         self, timeout: float = 10, on_connect: Callable[[str], None] | None = None
     ) -> ToolResult:
-        failures = []
-        for config in self._selected_servers(None):
-            if on_connect:
-                on_connect(config.name)
+        """Connect every enabled server concurrently, waiting up to ``timeout`` for them."""
+        started = time.monotonic()
+        selected = self._selected_servers(None)
+        if on_connect and selected:
+            on_connect(", ".join(config.name for config in selected))
+        pending: list[tuple[McpServerConfig, Any]] = []
+        for config in selected:
             try:
-                self.connect(config.name, ExecutionContext(time.monotonic() + timeout))
+                pending.append((config, self._connection(config.name).begin()))
+            except Exception as exc:
+                pending.append((config, exc))
+        failures = []
+        for config, ready in pending:
+            try:
+                if isinstance(ready, Exception):
+                    raise ready
+                if ready is not None:
+                    _wait_future(ready, started + min(timeout, config.timeout))
             except Exception as exc:
                 failures.append({"server": config.name, "error": str(exc) or type(exc).__name__})
         servers = self.status().data["servers"]
@@ -898,6 +931,31 @@ class McpManager:
             status="partial" if failures and connected else "error" if failures else "ok",
             data={"servers": servers, "failures": failures},
         )
+
+    def start_all(self) -> None:
+        """Begin connecting every enabled server in the background without waiting.
+
+        Discovery and calls wait for a server that is still connecting, so nothing
+        blocks on servers a task never uses; ``background_failures`` reports the outcome.
+        """
+        for config in self._selected_servers(None):
+            ready = self._connection(config.name).begin()
+            if ready is not None:
+                self._background[config.name] = ready
+
+    def background_failures(self) -> list[dict[str, str]]:
+        """Failures of ``start_all`` connections that ended since the last call, once each."""
+        failures = []
+        for name, ready in list(self._background.items()):
+            if not ready.done():
+                continue
+            del self._background[name]
+            error = ready.exception()
+            connection = self._connections.get(name)
+            # A use since then may already have reconnected; that failure is moot.
+            if error is not None and not (connection and connection.state == "connected"):
+                failures.append({"server": name, "error": str(error) or type(error).__name__})
+        return failures
 
     def _selected_servers(self, server: str | None, permit=None) -> list[McpServerConfig]:
         if server is not None:
@@ -935,15 +993,24 @@ class McpManager:
 
     @staticmethod
     def _score(tool: dict[str, Any], query: str) -> int:
-        if query == "*":
+        normalized = query.casefold().strip()
+        if normalized == "*":
             return 1
         name = tool["name"].casefold()
-        description = tool.get("description", "").casefold()
-        normalized = query.casefold().strip()
-        terms = normalized.split()
-        if not terms or not all(term in f"{name} {description}" for term in terms):
+        text = f"{name} {tool.get('title') or ''} {tool.get('description') or ''}".casefold()
+        terms = SEARCH_TERM.findall(normalized)
+        # Single letters match nearly any text; keep them only when nothing longer remains.
+        terms = [term for term in terms if len(term) > 1] or terms
+        # Any matching term qualifies a tool, so a query need not guess every word of a
+        # description; tools matching more terms, all of them, or the name rank first.
+        hits = [term for term in terms if term in text]
+        if not hits:
             return 0
-        return (20 if normalized in name else 0) + sum(5 if term in name else 1 for term in terms)
+        return (
+            (20 if normalized in name else 0)
+            + (10 if len(hits) == len(terms) else 0)
+            + sum(5 if term in name else 1 for term in hits)
+        )
 
     def search(
         self,
@@ -972,6 +1039,19 @@ class McpManager:
                 )
         matches.sort(key=lambda item: (-item["score"], item["path"]))
         result = ToolResult(data={"query": query, "matches": matches[:limit], "failures": failures})
+        if not matches:
+            available = sorted(
+                f"{server_name}/{tool['name']}"
+                for server_name, tool in catalog
+                if permit is None or permit.permits(server_name, tool["name"])
+            )
+            if available:
+                result.data["available_tools"] = available[:AVAILABLE_TOOL_LIMIT]
+                result.data["available_tool_count"] = len(available)
+                result.data["guidance"] = (
+                    "No tool matched the query. Pick one from available_tools and describe it, "
+                    "or search '*' to list tools with descriptions."
+                )
         if failures and catalog:
             result.status = "partial"
         elif failures and not catalog:
