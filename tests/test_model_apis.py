@@ -438,6 +438,261 @@ class ModelApiTests(unittest.TestCase):
             ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
         self.assertEqual(raised.exception.code, "invalid_tool_calls")
 
+    def test_responses_unfinalized_call_without_done_event_is_rejected(self):
+        rows = events("openai-responses", payload("openai-responses", tool=True))
+        rows = [row for row in rows if row["type"] != "response.output_item.done"]
+        for row in rows:
+            if row["type"] == "response.completed":
+                row["response"]["output"] = []
+        with self.assertRaises(CompletionError) as raised:
+            ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(raised.exception.code, "invalid_tool_calls")
+
+    def test_responses_changed_function_name_at_done_is_rejected(self):
+        rows = events("openai-responses", payload("openai-responses", tool=True))
+        for row in rows:
+            if row["type"] == "response.output_item.done":
+                row["item"] = {**row["item"], "name": "other_func"}
+            if row["type"] == "response.completed":
+                row["response"]["output"][0]["name"] = "other_func"
+        with self.assertRaises(CompletionError) as raised:
+            ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(raised.exception.code, "invalid_tool_calls")
+
+    def test_responses_changed_call_id_at_done_is_rejected(self):
+        rows = events("openai-responses", payload("openai-responses", tool=True))
+        for row in rows:
+            if row["type"] == "response.output_item.done":
+                row["item"] = {**row["item"], "call_id": "call_different"}
+            if row["type"] == "response.completed":
+                row["response"]["output"][0]["call_id"] = "call_different"
+        with self.assertRaises(CompletionError) as raised:
+            ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(raised.exception.code, "invalid_tool_calls")
+
+    def test_responses_completed_output_mismatch_is_rejected(self):
+        rows = events("openai-responses", payload("openai-responses", tool=True))
+        for row in rows:
+            if row["type"] == "response.completed":
+                row["response"]["output"] = []
+        with self.assertRaises(CompletionError) as raised:
+            ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(raised.exception.code, "invalid_tool_calls")
+
+        rows2 = events("openai-responses", payload("openai-responses", tool=True))
+        for row in rows2:
+            if row["type"] == "response.completed":
+                extra = copy.deepcopy(row["response"]["output"][0])
+                extra["id"] = "fc_extra"
+                extra["call_id"] = "call_extra"
+                row["response"]["output"].append(extra)
+        with self.assertRaises(CompletionError) as raised:
+            ResponsesClient._read_stream(io.BytesIO(encode_sse(rows2)), lambda _: None)
+        self.assertEqual(raised.exception.code, "invalid_tool_calls")
+
+    def test_responses_positive_multi_call_interleaved_and_done_only(self):
+        call1 = {
+            "id": "fc_1",
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "read",
+            "arguments": '{"path":"1.txt"}',
+        }
+        call2 = {
+            "id": "fc_2",
+            "type": "function_call",
+            "call_id": "c2",
+            "name": "write",
+            "arguments": '{"path":"2.txt"}',
+        }
+        call3 = {
+            "id": "fc_3",
+            "type": "function_call",
+            "call_id": "c3",
+            "name": "edit",
+            "arguments": '{"path":"3.txt"}',
+        }
+        rows = [
+            {"type": "response.created", "response": {}},
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {**call1, "arguments": ""},
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {**call2, "arguments": ""},
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_1",
+                "delta": '{"path":',
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "item_id": "fc_2",
+                "delta": '{"path":',
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_1",
+                "delta": '"1.txt"}',
+            },
+            {"type": "response.output_item.done", "output_index": 0, "item": call1},
+            {"type": "response.output_item.done", "output_index": 1, "item": call2},
+            {"type": "response.output_item.done", "output_index": 2, "item": call3},
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [call1, call2, call3],
+                    "usage": {"input_tokens": 10, "output_tokens": 10},
+                },
+            },
+        ]
+        message = ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(len(message["tool_calls"]), 3)
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "read")
+        self.assertEqual(message["tool_calls"][0]["function"]["arguments"], '{"path":"1.txt"}')
+        self.assertEqual(message["tool_calls"][1]["function"]["name"], "write")
+        self.assertEqual(message["tool_calls"][1]["function"]["arguments"], '{"path":"2.txt"}')
+        self.assertEqual(message["tool_calls"][2]["function"]["name"], "edit")
+        self.assertEqual(message["tool_calls"][2]["function"]["arguments"], '{"path":"3.txt"}')
+
+    def test_responses_rejects_restarted_calls_and_arguments_before_start(self):
+        first = {
+            "type": "function_call",
+            "id": "fc_same",
+            "call_id": "call_same",
+            "name": "wr",
+            "arguments": '{"path":"unexpected.txt","content":',
+        }
+        final = {**first, "name": "ite", "arguments": '"fixture"}'}
+        added = "response.output_item.added"
+        done = "response.output_item.done"
+        starts = [
+            [
+                {"type": added, "output_index": 0, "item": first},
+                {"type": added, "output_index": 0, "item": final},
+            ],
+            [
+                {"type": done, "output_index": 0, "item": first},
+                {"type": added, "output_index": 0, "item": final},
+            ],
+            [
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": first["id"],
+                    "output_index": 0,
+                    "delta": first["arguments"],
+                },
+                {"type": added, "output_index": 0, "item": {**final, "name": "write"}},
+            ],
+        ]
+        for index, start in enumerate(starts):
+            rows = [
+                *start,
+                {"type": done, "output_index": 0, "item": final},
+                {"type": "response.completed", "response": {"output": [final]}},
+            ]
+            with self.subTest(sequence=index), self.assertRaises(CompletionError) as raised:
+                ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+            self.assertEqual(raised.exception.code, "invalid_tool_calls")
+
+    def test_responses_requires_complete_tool_identity_at_done_and_completion(self):
+        for kind in ("response.output_item.done", "response.completed"):
+            for field in ("id", "call_id", "name"):
+                rows = events("openai-responses", payload("openai-responses", tool=True))
+                for row in rows:
+                    if row["type"] == kind:
+                        if "item" in row:
+                            row["item"] = dict(row["item"])
+                            row["item"].pop(field)
+                        else:
+                            row["response"]["output"] = [dict(row["response"]["output"][0])]
+                            row["response"]["output"][0].pop(field)
+                with (
+                    self.subTest(event=kind, field=field),
+                    self.assertRaises(CompletionError) as raised,
+                ):
+                    ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+                self.assertEqual(raised.exception.code, "invalid_tool_calls")
+
+    def test_responses_refusal_streaming_and_nonstreaming(self):
+        refusal_content = [{"type": "refusal", "refusal": "I cannot fulfill this request."}]
+        refusal_rows = [
+            {"type": "response.created", "response": {}},
+            {"type": "response.refusal.delta", "output_index": 0, "delta": "I cannot fulfill "},
+            {"type": "response.refusal.delta", "output_index": 0, "delta": "this request."},
+            {
+                "type": "response.refusal.done",
+                "output_index": 0,
+                "refusal": "I cannot fulfill this request.",
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message", "role": "assistant", "content": refusal_content},
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {"type": "message", "role": "assistant", "content": refusal_content}
+                    ],
+                    "usage": {"input_tokens": 5, "output_tokens": 5},
+                },
+            },
+        ]
+        msg = ResponsesClient._read_stream(io.BytesIO(encode_sse(refusal_rows)), lambda _: None)
+        self.assertEqual(msg["content"], "I cannot fulfill this request.")
+
+        payload = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": "I refuse this task."}],
+                }
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 5},
+        }
+        client = ResponsesClient(self.settings("openai-responses"))
+        obs = UsageAccumulator()
+        stream = io.BytesIO(json.dumps(payload).encode())
+        msg_nonstream = client._read_nonstream_response(stream, obs)
+        self.assertEqual(msg_nonstream["content"], "I refuse this task.")
+
+    def test_responses_malformed_refusal_is_rejected(self):
+        bad_delta = [
+            {"type": "response.refusal.delta", "output_index": 0, "delta": 123},
+        ]
+        with self.assertRaises(CompletionError) as raised:
+            ResponsesClient._read_stream(io.BytesIO(encode_sse(bad_delta)), lambda _: None)
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+        payload = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": ["not", "a", "string"]}],
+                }
+            ],
+        }
+        client = ResponsesClient(self.settings("openai-responses"))
+        with self.assertRaises(CompletionError) as raised:
+            stream = io.BytesIO(json.dumps(payload).encode())
+            client._read_nonstream_response(stream, UsageAccumulator())
+        self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_login_switch_updates_search_and_keeps_policy_restrictions(self):
         settings = self.settings("openai-completions")
         tools = CodingTools(self.root)

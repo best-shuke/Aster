@@ -314,13 +314,35 @@ class ResponsesTests(TempDirTest):
             {
                 "type": "response.completed",
                 "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "summary": [{"type": "summary_text", "text": "Plan."}],
+                            "encrypted_content": "enc",
+                        },
+                        {
+                            "type": "message",
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Reading the file."}],
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_9",
+                            "name": "read",
+                            "arguments": '{"path":"a"}',
+                        },
+                    ],
                     "usage": {
                         "input_tokens": 100,
                         "input_tokens_details": {"cached_tokens": 80},
                         "output_tokens": 20,
                         "output_tokens_details": {"reasoning_tokens": 5},
                         "total_tokens": 120,
-                    }
+                    },
                 },
             },
         )

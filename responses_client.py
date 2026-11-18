@@ -67,14 +67,31 @@ class ResponsesClient(DeepSeekClient):
                 raise CompletionError(
                     "invalid_response", "Invalid Responses content blocks", retryable=True
                 )
+            item_id = item.get("id") or index
             if kind == "message":
-                for part in parts:
+                for c_idx, part in enumerate(parts):
                     if part.get("type") == "output_text":
                         if not isinstance(part.get("text"), str):
                             raise CompletionError(
                                 "invalid_response", "Response text must be a string", retryable=True
                             )
                         state.add_payload({"choices": [{"delta": {"content": part["text"]}}]})
+                    elif part.get("type") == "refusal":
+                        refusal = part.get("refusal") if "refusal" in part else part.get("text")
+                        if not isinstance(refusal, str):
+                            raise CompletionError(
+                                "invalid_response", "Refusal must be text", retryable=True
+                            )
+                        state.add_payload({"choices": [{"delta": {"content": refusal}}]})
+                        events.refusal_blocks[(item_id, c_idx)] = refusal
+            elif kind == "refusal":
+                refusal = item.get("refusal") if "refusal" in item else item.get("text")
+                if not isinstance(refusal, str):
+                    raise CompletionError(
+                        "invalid_response", "Refusal must be text", retryable=True
+                    )
+                state.add_payload({"choices": [{"delta": {"content": refusal}}]})
+                events.refusal_blocks[(item_id, 0)] = refusal
             elif kind == "reasoning":
                 for part in parts:
                     if isinstance(part.get("text"), str):

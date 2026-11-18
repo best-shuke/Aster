@@ -205,25 +205,99 @@ class _ResponsesEvents:
 
     def __init__(self) -> None:
         self.tools: dict[Any, int] = {}
+        self.tool_info: dict[int, dict[str, Any]] = {}
         self.arguments: dict[int, str] = {}
         self.reasoning: list[dict[str, Any]] = []
         self.reasoning_part: Any = None
         self.text_item: Any = None
+        self.refusal_blocks: dict[Any, str] = {}
         self.done = False
 
     def _tool(self, event: dict[str, Any], item: dict[str, Any] | None = None) -> int:
-        key = (item or {}).get("id") or event.get("item_id") or event.get("output_index")
-        if not isinstance(key, (str, int)):
+        item = item or {}
+        identities: list[Any] = []
+        for kind, candidate in (
+            ("item", item.get("id")),
+            ("item", event.get("item_id")),
+            ("call", item.get("call_id")),
+        ):
+            if isinstance(candidate, str) and candidate:
+                identities.append((kind, candidate))
+        output_index = event.get("output_index", item.get("output_index"))
+        if isinstance(output_index, int):
+            identities.append(("output", output_index))
+        if not identities:
             raise CompletionError(
                 "invalid_response", "Tool event has no valid identity", retryable=True
             )
-        if key not in self.tools:
-            self.tools[key] = len(self.tools)
-        return self.tools[key]
+        mapped = {self.tools[k] for k in identities if k in self.tools}
+        if len(mapped) > 1:
+            raise CompletionError(
+                "invalid_tool_calls",
+                "Conflicting tool call identities in event",
+                retryable=True,
+            )
+        if mapped:
+            index = next(iter(mapped))
+        else:
+            index = len(self.tool_info)
+            self.tool_info[index] = {
+                "id": item.get("id") or event.get("item_id"),
+                "call_id": item.get("call_id") or "",
+                "name": item.get("name") or "",
+                "arguments": item.get("arguments") or "",
+                "finalized": False,
+            }
+        for k in identities:
+            self.tools[k] = index
+        return index
+
+    @staticmethod
+    def _validate_tool_item(item: dict[str, Any]) -> None:
+        for field in ("id", "call_id", "name"):
+            value = item.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise CompletionError(
+                    "invalid_tool_calls", f"Tool {field} must be non-empty text", retryable=True
+                )
+        if not isinstance(item.get("arguments"), str):
+            raise CompletionError(
+                "invalid_tool_calls", "Tool arguments must be text", retryable=True
+            )
 
     def _arguments(self, index: int, text: str) -> dict[str, Any]:
         self.arguments[index] = self.arguments.get(index, "") + text
         return _chunk(tool_calls=[{"index": index, "function": {"arguments": text}}])
+
+    def _refusal_key(
+        self,
+        event: dict[str, Any],
+        item: dict[str, Any] | None = None,
+        content_index: int = 0,
+    ) -> Any:
+        item = item or {}
+        item_id = item.get("id") or event.get("item_id") or event.get("output_index")
+        c_idx = event.get("content_index", content_index)
+        return (item_id, c_idx)
+
+    def _consume_refusal(
+        self, key: Any, text: Any, *, delta: bool = False
+    ) -> list[dict[str, Any]]:
+        if not isinstance(text, str):
+            raise CompletionError("invalid_response", "Refusal must be text", retryable=True)
+        streamed = self.refusal_blocks.get(key, "")
+        if not delta and not text.startswith(streamed):
+            raise CompletionError(
+                "invalid_response", "Final refusal differs from streamed refusal", retryable=True
+            )
+        fragment = text if delta else text[len(streamed) :]
+        self.refusal_blocks[key] = streamed + fragment
+        if not fragment:
+            return []
+        item = key[0]
+        separator = "\n\n" if self.text_item not in (None, item) else ""
+        self.text_item = item
+        return [_chunk(content=separator + fragment)]
 
     def chunks(self, event: Any) -> list[dict[str, Any]]:
         if not isinstance(event, dict):
@@ -237,6 +311,7 @@ class _ResponsesEvents:
             "response.reasoning_summary_text.delta",
             "response.reasoning_text.delta",
             "response.function_call_arguments.delta",
+            "response.refusal.delta",
         } and not isinstance(delta, str):
             raise CompletionError("invalid_response", "Response delta must be text", retryable=True)
         if kind == "response.output_text.delta":
@@ -244,28 +319,57 @@ class _ResponsesEvents:
             separator = "\n\n" if self.text_item not in (None, item) else ""
             self.text_item = item
             return [_chunk(content=separator + delta)] if isinstance(delta, str) else []
+        if kind == "response.refusal.delta" and isinstance(delta, str):
+            return self._consume_refusal(self._refusal_key(event), delta, delta=True)
+        if kind == "response.refusal.done":
+            return self._consume_refusal(self._refusal_key(event), event.get("refusal"))
         if kind in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
             part = (event.get("item_id"), event.get("summary_index", event.get("content_index")))
             separator = "\n\n" if self.reasoning_part not in (None, part) else ""
             self.reasoning_part = part
             return [_chunk(reasoning_content=separator + delta)] if isinstance(delta, str) else []
         if kind == "response.function_call_arguments.delta" and isinstance(delta, str):
-            return [self._arguments(self._tool(event), delta)]
+            if not any(
+                (kind, key) in self.tools
+                for kind, key in (
+                    ("item", event.get("item_id")), ("output", event.get("output_index"))
+                )
+                if isinstance(key, (str, int))
+            ):
+                raise CompletionError(
+                    "invalid_tool_calls", "Tool arguments received before call start", retryable=True
+                )
+            index = self._tool(event)
+            info = self.tool_info[index]
+            if info["finalized"]:
+                raise CompletionError(
+                    "invalid_tool_calls",
+                    "Tool arguments received after call finalized",
+                    retryable=True,
+                )
+            info["arguments"] += delta
+            return [self._arguments(index, delta)]
         item = event.get("item")
         if kind == "response.output_item.added" and isinstance(item, dict):
             if item.get("type") != "function_call":
                 return []
+            self._validate_tool_item(item)
             index = self._tool(event, item)
-            self.arguments[index] = item.get("arguments") or ""
+            if index in self.arguments:
+                raise CompletionError(
+                    "invalid_tool_calls", "Tool call started more than once", retryable=True
+                )
+            info = self.tool_info[index]
+            self.arguments[index] = item["arguments"]
+            info["arguments"] = self.arguments[index]
             call = {
                 "index": index,
-                "id": item.get("call_id") or "",
-                "function": {"name": item.get("name") or "", "arguments": self.arguments[index]},
+                "id": info["call_id"],
+                "function": {"name": info["name"], "arguments": self.arguments[index]},
             }
             return [_chunk(tool_calls=[call])]
         if kind == "response.output_item.done" and isinstance(item, dict):
             if item.get("type") == "reasoning" and item.get("encrypted_content"):
-                # Replayed on later requests so the model keeps its own reasoning.
                 self.reasoning.append(
                     {
                         "type": "reasoning",
@@ -273,26 +377,109 @@ class _ResponsesEvents:
                         "encrypted_content": item["encrypted_content"],
                     }
                 )
+            if item.get("type") == "refusal":
+                refusal = item.get("refusal") if "refusal" in item else item.get("text")
+                return self._consume_refusal(self._refusal_key(event, item, 0), refusal)
+            if item.get("type") == "message":
+                parts = item.get("content") or []
+                if isinstance(parts, list):
+                    chunks: list[dict[str, Any]] = []
+                    for c_idx, part in enumerate(parts):
+                        if isinstance(part, dict) and part.get("type") == "refusal":
+                            refusal = (
+                                part.get("refusal") if "refusal" in part else part.get("text")
+                            )
+                            chunks.extend(
+                                self._consume_refusal(
+                                    self._refusal_key(event, item, c_idx), refusal
+                                )
+                            )
+                    if chunks:
+                        return chunks
             if item.get("type") != "function_call":
                 return []
-            known = (item.get("id") or event.get("item_id") or event.get("output_index")) in (
-                self.tools
-            )
-            if not known:
-                return self.chunks({**event, "type": "response.output_item.added"})
+            self._validate_tool_item(item)
             index = self._tool(event, item)
-            final, received = item.get("arguments") or "", self.arguments.get(index, "")
-            if final != received and final.startswith(received):
-                return [self._arguments(index, final[len(received) :])]
-            if final != received:
+            info = self.tool_info[index]
+            for field in ("id", "call_id", "name"):
+                if item[field] != info[field]:
+                    raise CompletionError(
+                        "invalid_tool_calls",
+                        f"Final tool {field} differs from streamed {field}",
+                        retryable=True,
+                    )
+            final = item["arguments"]
+            received = self.arguments.get(index, "")
+            if not final.startswith(received):
                 raise CompletionError(
                     "invalid_tool_calls",
                     "Final tool arguments differ from streamed arguments",
                     retryable=True,
                 )
-            return []
+            if info["finalized"] and final != received:
+                raise CompletionError(
+                    "invalid_tool_calls", "Finalized tool arguments changed", retryable=True
+                )
+            info["finalized"] = True
+            info["arguments"] = final
+            if index not in self.arguments:
+                self.arguments[index] = final
+                return [_chunk(tool_calls=[
+                    {
+                        "index": index,
+                        "id": info["call_id"],
+                        "function": {"name": info["name"], "arguments": final},
+                    }
+                ])]
+            suffix = final[len(received) :]
+            return [self._arguments(index, suffix)] if suffix else []
         response = event.get("response") if isinstance(event.get("response"), dict) else {}
         if kind == "response.completed":
+            for index, info in self.tool_info.items():
+                if not info["finalized"]:
+                    raise CompletionError(
+                        "invalid_tool_calls",
+                        f"Tool call '{info['name']}' was not finalized before completion",
+                        retryable=True,
+                    )
+            output_items = response.get("output")
+            if output_items is None and self.tool_info:
+                raise CompletionError(
+                    "invalid_tool_calls",
+                    "Completed response missing output list for streamed tool calls",
+                    retryable=True,
+                )
+            if output_items is not None:
+                if not isinstance(output_items, list):
+                    raise CompletionError(
+                        "invalid_response",
+                        "Completed response output must be a list",
+                        retryable=True,
+                    )
+                final_calls = [
+                    it
+                    for it in output_items
+                    if isinstance(it, dict) and it.get("type") == "function_call"
+                ]
+                if len(self.tool_info) != len(final_calls):
+                    raise CompletionError(
+                        "invalid_tool_calls",
+                        f"Completed response output tool call count ({len(final_calls)}) differs "
+                        f"from streamed count ({len(self.tool_info)})",
+                        retryable=True,
+                    )
+                for index, final_call in enumerate(final_calls):
+                    self._validate_tool_item(final_call)
+                    info = self.tool_info[index]
+                    if any(
+                        final_call[field] != info[field]
+                        for field in ("id", "call_id", "name", "arguments")
+                    ):
+                        raise CompletionError(
+                            "invalid_tool_calls",
+                            "Completed response tool differs from finalized tool",
+                            retryable=True,
+                        )
             self.done = True
             finish = "tool_calls" if self.tools else "stop"
             return [_chunk(finish, chat_usage(response.get("usage")))]
