@@ -559,7 +559,7 @@ def websearch_status(conversation: Conversation) -> str:
     if "websearch" in names:
         return "可用"
     # A configured backend without the tool means the environment's tool policy denies it.
-    return "策略禁用" if settings.websearch_provider else "未配置"
+    return "策略禁用" if settings.available_websearch_provider else "未配置"
 
 
 def use_login(conversation: Conversation, console: Console, arguments: list[str]) -> None:

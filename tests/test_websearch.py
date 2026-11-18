@@ -32,6 +32,7 @@ def settings(workspace, **overrides):
         keep_recent_turns=6,
         max_task_seconds=3600,
         max_subagents=4,
+        websearch_base_url="https://api.cline.bot/api/v1",
     )
     values.update(overrides)
     return make_settings(**values)
@@ -363,7 +364,8 @@ class WebSearchSettingsTests(unittest.TestCase):
             ),
         ):
             configured = Settings.from_env()
-        self.assertEqual(configured.websearch_base_url, "https://api.cline.bot/api/v1")
+        self.assertEqual(configured.resolved_websearch_base_url, "https://api.cline.bot/api/v1")
+        self.assertEqual(configured.resolved_websearch_provider, "cline")
         self.assertEqual(configured.resolved_websearch_api_key, "cline-key")
         self.assertTrue(configured.websearch_enabled)
 
@@ -386,6 +388,232 @@ class WebSearchSettingsTests(unittest.TestCase):
         self.assertEqual(configured.resolved_websearch_api_key, "search")
         self.assertEqual(configured.websearch_base_url, "https://search.invalid/api/v1")
         self.assertFalse(configured.websearch_enabled)
+
+    def test_official_deepseek_defaults_reuse_key_without_cline_configuration(self):
+        with (
+            patch("config.load_env"),
+            patch.dict("os.environ", {"DEEPSEEK_API_KEY": "deepseek-key"}, clear=True),
+        ):
+            configured = Settings.from_env()
+        self.assertEqual(configured.resolved_websearch_provider, "deepseek")
+        self.assertEqual(
+            configured.resolved_websearch_base_url, "https://api.deepseek.com/v1/tools"
+        )
+        self.assertEqual(configured.resolved_websearch_api_key, "deepseek-key")
+        self.assertTrue(configured.websearch_enabled)
+
+    def test_auto_provider_follows_login_but_preserves_explicit_search_settings(self):
+        base = settings(Path("/tmp"), websearch_base_url="")
+        switched = base.with_login(
+            Login("api", "deepseek-flash", "https://api.deepseek.com/v1", "deepseek-key")
+        )
+        self.assertEqual(switched.resolved_websearch_provider, "deepseek")
+        self.assertEqual(switched.resolved_websearch_api_key, "deepseek-key")
+        other = switched.with_login(Login("api", "test", "https://other.invalid", "other-key"))
+        self.assertEqual(other.resolved_websearch_provider, "cline")
+        self.assertIsNone(other.resolved_websearch_api_key)
+        explicit = replace(
+            other,
+            websearch_base_url="https://api.deepseek.com/v1/tools",
+            websearch_api_key="search-key",
+        )
+        self.assertEqual(explicit.resolved_websearch_provider, "deepseek")
+        self.assertEqual(explicit.resolved_websearch_api_key, "search-key")
+
+    def test_deepseek_credentials_never_cross_origins(self):
+        base = settings(Path("/tmp"), base_url="https://api.deepseek.com", websearch_base_url="")
+        for endpoint in [
+            "https://other.invalid/v1/tools",
+            "http://api.deepseek.com/v1/tools",
+            "https://api.deepseek.com:444/v1/tools",
+        ]:
+            with self.subTest(endpoint=endpoint):
+                current = replace(base, websearch_base_url=endpoint, websearch_provider="deepseek")
+                self.assertIsNone(current.resolved_websearch_api_key)
+
+    def test_env_supports_deepseek_search_proxy(self):
+        with (
+            patch("config.load_env"),
+            patch.dict(
+                "os.environ",
+                {
+                    "DEEPSEEK_API_KEY": "model-key",
+                    "DEEPSEEK_BASE_URL": "https://model.invalid",
+                    "DEEPSEEK_WEBSEARCH_PROVIDER": " DeepSeek ",
+                    "DEEPSEEK_WEBSEARCH_BASE_URL": "https://proxy.invalid/v1/tools/",
+                    "DEEPSEEK_WEBSEARCH_API_KEY": "search-key",
+                },
+                clear=True,
+            ),
+        ):
+            configured = Settings.from_env()
+        self.assertEqual(configured.resolved_websearch_provider, "deepseek")
+        self.assertEqual(configured.resolved_websearch_base_url, "https://proxy.invalid/v1/tools")
+        self.assertEqual(configured.resolved_websearch_api_key, "search-key")
+
+
+class DeepSeekWebSearchTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.workspace = Path(temporary.name)
+        self.settings = settings(
+            self.workspace,
+            api_key="deepseek-key",
+            base_url="https://api.deepseek.com/v1",
+            websearch_base_url="",
+            model="deepseek-flash",
+        )
+        self.client = WebSearchClient(self.settings)
+        self.tools = CodingTools(self.workspace)
+        self.tools.attach_websearch(self.client)
+        self.payload = {
+            "results": [
+                {
+                    "title": "Python documentation",
+                    "url": "https://docs.python.org/3/",
+                    "snippet": "Short summary",
+                    "summary": "Long summary for the model",
+                    "content": "",
+                    "site_name": "Python",
+                    "site_icon": "https://python.org/favicon.ico",
+                    "date": "2026-10-20T00:00:00+00:00",
+                    "rerank_score": 2.4,
+                    "authority": 4,
+                }
+            ]
+        }
+
+    def execute(self, payload=None, **arguments):
+        with patch.object(
+            self.client.opener,
+            "open",
+            return_value=io.BytesIO(
+                json.dumps(self.payload if payload is None else payload).encode()
+            ),
+        ) as opened:
+            result = json.loads(self.tools.execute(call(**arguments)))
+        return result, opened
+
+    def test_official_endpoint_body_auth_and_response(self):
+        for base in [
+            "",
+            "https://api.deepseek.com/",
+            "https://api.deepseek.com/v1/",
+            "https://api.deepseek.com/v1/tools/",
+        ]:
+            with self.subTest(base=base):
+                self.client.settings = replace(self.settings, websearch_base_url=base)
+                result, opened = self.execute()
+                request = opened.call_args.args[0]
+                self.assertEqual(request.full_url, "https://api.deepseek.com/v1/tools/search")
+                self.assertEqual(request.get_method(), "POST")
+                self.assertEqual(request.get_header("Authorization"), "Bearer deepseek-key")
+                self.assertEqual(request.get_header("Content-type"), "application/json")
+                self.assertEqual(
+                    json.loads(request.data),
+                    {
+                        "query": "Python latest stable release 2026",
+                        "count": 10,
+                        "need_content": False,
+                    },
+                )
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["data"]["provider"], "deepseek")
+                self.assertEqual(result["data"]["sources"], self.payload["results"])
+                self.assertIn("searched_at", result["data"])
+
+    def test_domain_filters_use_official_query_operators(self):
+        for filters, suffix, normalized in [
+            (
+                {"allowed_domains": [" python.org ", "python.org", "docs.python.org"]},
+                "site:python.org OR site:docs.python.org",
+                ["python.org", "docs.python.org"],
+            ),
+            (
+                {"blocked_domains": ["example.com", "invalid.org"]},
+                "-site:example.com -site:invalid.org",
+                ["example.com", "invalid.org"],
+            ),
+        ]:
+            with self.subTest(filters=filters):
+                result, opened = self.execute(query="Python", **filters)
+                self.assertEqual(
+                    json.loads(opened.call_args.args[0].data),
+                    {
+                        "query": f"Python {suffix}",
+                        "count": 10,
+                        "need_content": False,
+                    },
+                )
+                self.assertEqual(result["data"][next(iter(filters))], normalized)
+                self.assertEqual(result["data"]["query"], "Python")
+
+    def test_query_limits_include_filters_and_invalid_arguments_do_not_make_requests(self):
+        for arguments in [
+            {"query": "搜" * 129},
+            {"query": "x" * 120, "allowed_domains": ["python.org"]},
+            {"allowed_domains": ["python.org OR site:example.com"]},
+            {"allowed_domains": ["https://python.org"]},
+            {"allowed_domains": ["python.org"], "blocked_domains": ["example.com"]},
+            {"query": " "},
+        ]:
+            with self.subTest(arguments=arguments):
+                result, opened = self.execute(**arguments)
+                self.assertEqual(result["error"]["code"], "invalid_arguments")
+                opened.assert_not_called()
+        result, opened = self.execute(query="搜" * 128)
+        self.assertEqual(result["status"], "ok")
+        opened.assert_called_once()
+
+    def test_empty_malformed_and_partial_results(self):
+        result, _ = self.execute({"results": []})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["data"]["sources"], [])
+        for payload in [{}, [], {"results": None}, {"data": {"results": []}}]:
+            with self.subTest(payload=payload):
+                result, _ = self.execute(payload)
+                self.assertEqual(result["error"]["code"], "invalid_response")
+        result, _ = self.execute({"results": [*self.payload["results"], {"url": "javascript:bad"}]})
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["data"]["sources"], self.payload["results"])
+
+    def test_errors_are_structured_and_do_not_echo_credentials(self):
+        result, _ = self.execute({"error": {"message": "deepseek-key"}})
+        self.assertEqual(result["error"]["code"], "provider_error")
+        self.assertNotIn("deepseek-key", json.dumps(result))
+        for code in [401, 402, 429, 504]:
+            with (
+                self.subTest(code=code),
+                patch.object(
+                    self.client.opener,
+                    "open",
+                    side_effect=urllib.error.HTTPError(
+                        "https://api.deepseek.com/v1/tools/search",
+                        code,
+                        "error",
+                        {},
+                        io.BytesIO(b"deepseek-key"),
+                    ),
+                ),
+            ):
+                result = json.loads(self.tools.execute(call()))
+                self.assertEqual(result["error"]["code"], f"http_{code}")
+                self.assertIn("deepseek", result["error"]["message"])
+                self.assertNotIn("deepseek-key", json.dumps(result))
+
+    def test_official_deepseek_registers_search_on_startup(self):
+        import main
+
+        with (
+            patch("main.load_settings", return_value=replace(self.settings, mcp_enabled=False)),
+            patch("main.Console"),
+            patch("main.Conversation") as conversation,
+            patch("main.run_interactive"),
+            patch("sys.argv", ["main.py"]),
+        ):
+            main.main()
+        self.assertIn("websearch", conversation.call_args.args[2].registry)
 
 
 class FakeStream:
@@ -739,7 +967,7 @@ class WebSearchBackendTests(unittest.TestCase):
         ]
         for current, provider, kind in cases:
             with self.subTest(provider=provider, account=current.provider):
-                self.assertEqual(current.websearch_provider, provider)
+                self.assertEqual(current.available_websearch_provider, provider)
                 search = websearch_client(current)
                 self.assertIs(type(search) if search is not None else None, kind)
         self.assertIsNone(websearch_client(replace(account, websearch_enabled=False)))

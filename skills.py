@@ -40,9 +40,12 @@ def _frontmatter(content: str) -> tuple[dict[str, Any], str]:
 
 
 def skill_files(root: Path, *, include_root_files: bool = True) -> list[Path]:
-    if root.is_file():
-        return [root.resolve()]
-    if not root.is_dir():
+    try:
+        if root.is_file():
+            return [root.resolve()]
+        if not root.is_dir():
+            return []
+    except OSError:
         return []
     found: list[Path] = []
     pending = [root]

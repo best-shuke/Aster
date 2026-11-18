@@ -160,6 +160,8 @@ def request_fingerprint(messages, tools, settings, cache: WireCache | None = Non
     head = [
         getattr(settings, "base_url", ""),
         getattr(settings, "model", ""),
+        getattr(settings, "resolved_api", "openai-completions"),
+        getattr(settings, "api_compat", {}),
         parse_reasoning_effort(getattr(settings, "reasoning_effort", None)),
         tools or [],
     ]

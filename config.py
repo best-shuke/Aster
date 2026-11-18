@@ -1,24 +1,29 @@
+import hashlib
 import os
 import platform
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from model_api import compatibility, parse_api_compat, parse_model_api, resolve_model_api
+
 APP_NAME = "Aster"
 CLI_NAME = "agent"
 PROGRAM_DIR = Path(__file__).resolve().parent
+DEFAULT_USER_DIR = Path.home() / ".agents" / "aster"
 DEFAULT_PROMPT_FILE = PROGRAM_DIR / "system_prompt.md"
-DEFAULT_SKILLS_DIR = PROGRAM_DIR / "skills"
-DEFAULT_TEMPLATES_DIR = PROGRAM_DIR / "templates"
-DEFAULT_WORKFLOWS_DIR = PROGRAM_DIR / "workflows"
-DEFAULT_ENVIRONMENTS_DIR = PROGRAM_DIR / "environments"
-DEFAULT_ENVIRONMENT_STATE_DIR = Path.home() / ".agents" / "environment-state"
-DEFAULT_MCP_CONFIG_FILE = PROGRAM_DIR / "mcp.json"
-# The saved login choice and its credentials; outside the program directory and Git.
-DEFAULT_AUTH_FILE = Path.home() / ".agents" / "aster" / "auth.json"
+DEFAULT_SKILLS_DIR = DEFAULT_USER_DIR / "skills"
+DEFAULT_TEMPLATES_DIR = DEFAULT_USER_DIR / "templates"
+DEFAULT_WORKFLOWS_DIR = DEFAULT_USER_DIR / "workflows"
+DEFAULT_ENVIRONMENTS_DIR = DEFAULT_USER_DIR / "environments"
+DEFAULT_ENVIRONMENT_STATE_DIR = DEFAULT_USER_DIR / "environment-state"
+DEFAULT_MCP_CONFIG_FILE = DEFAULT_USER_DIR / "mcp.json"
+DEFAULT_AUTH_FILE = DEFAULT_USER_DIR / "auth.json"
 CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex"
+DEEPSEEK_WEBSEARCH_BASE_URL = "https://api.deepseek.com/v1/tools"
+CLINE_WEBSEARCH_BASE_URL = "https://api.cline.bot/api/v1"
 # Framework-provided resources: collaboration skills and environment templates.
 BUILTIN_DIR = PROGRAM_DIR / "builtin"
 BUILTIN_SKILLS_DIR = BUILTIN_DIR / "skills"
@@ -50,16 +55,32 @@ class Login:
     api_key: str = ""
     context_window: int | None = None
     account: str = ""
+    api: str = "auto"
+    api_compat: dict[str, bool] = field(default_factory=dict)
+
+
+def user_dir() -> Path:
+    """One user-owned root for configuration and persistent application state."""
+    return Path(os.environ.get("ASTER_HOME") or DEFAULT_USER_DIR).expanduser().resolve()
+
+
+def user_path(variable: str, name: str) -> Path:
+    return Path(os.environ.get(variable) or user_dir() / name).expanduser().resolve()
+
+
+def default_session_file(workspace: Path) -> Path:
+    # Canonical paths share history across symlinks, while same-name projects stay separate.
+    workspace_id = hashlib.sha256(os.fsencode(workspace.resolve())).hexdigest()
+    return user_dir() / "sessions" / workspace_id / "session.json"
 
 
 def auth_file() -> Path:
-    return Path(os.environ.get("DEEPSEEK_AUTH_FILE", str(DEFAULT_AUTH_FILE))).expanduser().resolve()
+    return user_path("DEEPSEEK_AUTH_FILE", "auth.json")
 
 
 def load_env(path: Path | None = None) -> None:
     if path is None:
-        configured_path = os.environ.get("DEEPSEEK_ENV_FILE")
-        path = Path(configured_path).expanduser() if configured_path else Path(".env")
+        path = user_path("DEEPSEEK_ENV_FILE", ".env")
     if not path.exists():
         return
 
@@ -96,17 +117,20 @@ class Settings:
     workspace: Path
     prompt_file: Path = DEFAULT_PROMPT_FILE
     skills_enabled: bool = True
-    skills_dir: Path = DEFAULT_SKILLS_DIR
+    skills_dir: Path = field(default_factory=lambda: user_path("DEEPSEEK_SKILLS_DIR", "skills"))
     mcp_enabled: bool = True
-    mcp_config_file: Path = DEFAULT_MCP_CONFIG_FILE
+    mcp_config_file: Path = field(
+        default_factory=lambda: user_path("DEEPSEEK_MCP_CONFIG_FILE", "mcp.json")
+    )
     request_timeout_seconds: float = 180
     task_token_budget: int | None = None
     session_token_budget: int | None = None
     goal_token_budget: int | None = None
     max_output_tokens: int | None = 131072
     websearch_enabled: bool = True
-    websearch_base_url: str = "https://api.cline.bot/api/v1"
+    websearch_base_url: str = ""
     websearch_api_key: str | None = None
+    websearch_provider: str = "auto"
     max_output_continuations: int | None = None
     generation_timeout_seconds: float | None = None
     max_reasoning_chars: int | None = None
@@ -118,15 +142,52 @@ class Settings:
     context_window_tokens: int | None = None
     context_reserve_tokens: int = 16384
     keep_recent_tokens: int = 20000
-    templates_dir: Path = DEFAULT_TEMPLATES_DIR
-    workflows_dir: Path = DEFAULT_WORKFLOWS_DIR
-    environments_dir: Path = DEFAULT_ENVIRONMENTS_DIR
-    environment_state_dir: Path = DEFAULT_ENVIRONMENT_STATE_DIR
+    templates_dir: Path = field(
+        default_factory=lambda: user_path("DEEPSEEK_TEMPLATES_DIR", "templates")
+    )
+    workflows_dir: Path = field(
+        default_factory=lambda: user_path("DEEPSEEK_WORKFLOWS_DIR", "workflows")
+    )
+    environments_dir: Path = field(
+        default_factory=lambda: user_path("DEEPSEEK_ENVIRONMENTS_DIR", "environments")
+    )
+    environment_state_dir: Path = field(
+        default_factory=lambda: user_path("DEEPSEEK_ENVIRONMENT_STATE_DIR", "environment-state")
+    )
     builtin_skills_dir: Path = BUILTIN_SKILLS_DIR
     provider: str = "api"
     auth_file: Path | None = None
     account: str = ""
+    api: str = "auto"
+    api_compat: dict[str, bool] = field(default_factory=dict)
     mcp_config_source: Path | None = None
+
+    @property
+    def resolved_api(self) -> str:
+        return resolve_model_api(self.api, self.base_url, self.provider)
+
+    @property
+    def model_compat(self):
+        return compatibility(self)
+
+    @property
+    def resolved_websearch_provider(self) -> str:
+        if self.websearch_provider != "auto":
+            if self.websearch_provider not in {"deepseek", "cline"}:
+                raise ValueError("DEEPSEEK_WEBSEARCH_PROVIDER must be auto, deepseek or cline")
+            return self.websearch_provider
+        endpoint = self.websearch_base_url or self.base_url
+        return "deepseek" if urlsplit(endpoint).hostname == "api.deepseek.com" else "cline"
+
+    @property
+    def resolved_websearch_base_url(self) -> str:
+        provider = self.resolved_websearch_provider
+        base = self.websearch_base_url.rstrip("/") or (
+            DEEPSEEK_WEBSEARCH_BASE_URL if provider == "deepseek" else CLINE_WEBSEARCH_BASE_URL
+        )
+        if provider == "deepseek" and urlsplit(base).path in {"", "/v1"}:
+            return base.removesuffix("/v1") + "/v1/tools"
+        return base
 
     @property
     def resolved_websearch_api_key(self) -> str | None:
@@ -134,17 +195,16 @@ class Settings:
             return self.websearch_api_key
         # Reuse credentials only within the same origin, never across providers.
         main = urlsplit(self.base_url)
-        search = urlsplit(self.websearch_base_url)
+        search = urlsplit(self.resolved_websearch_base_url)
         if (main.scheme, main.hostname, main.port) == (search.scheme, search.hostname, search.port):
             return self.api_key
         return None
 
     @property
-    def websearch_provider(self) -> str | None:
-        """``cline`` with a Cline key (configured explicitly, so it wins), else ``chatgpt``
-        when signed in to a ChatGPT account; ``None`` when neither can search."""
+    def available_websearch_provider(self) -> str | None:
+        """Use a configured search API, falling back to the signed-in ChatGPT account."""
         if self.resolved_websearch_api_key:
-            return "cline"
+            return self.resolved_websearch_provider
         return "chatgpt" if self.provider == "chatgpt" else None
 
     def with_login(self, login: Login | None) -> "Settings":
@@ -157,7 +217,7 @@ class Settings:
 
         workspace = Path.cwd()
         session_file = Path(
-            os.environ.get("DEEPSEEK_SESSION_FILE", ".deepseek-session.json")
+            os.environ.get("DEEPSEEK_SESSION_FILE") or default_session_file(workspace)
         ).expanduser()
         if not session_file.is_absolute():
             session_file = workspace / session_file
@@ -168,7 +228,7 @@ class Settings:
         if not prompt_file.is_absolute():
             prompt_file = workspace / prompt_file
         mcp_source = Path(
-            os.environ.get("DEEPSEEK_MCP_CONFIG_FILE", str(DEFAULT_MCP_CONFIG_FILE))
+            os.environ.get("DEEPSEEK_MCP_CONFIG_FILE") or user_dir() / "mcp.json"
         ).expanduser().absolute()
         mcp_path = mcp_source.resolve()
 
@@ -185,25 +245,11 @@ class Settings:
             workspace=workspace,
             prompt_file=prompt_file.resolve(),
             skills_enabled=env_flag("DEEPSEEK_SKILLS_ENABLED", True),
-            skills_dir=Path(os.environ.get("DEEPSEEK_SKILLS_DIR", str(DEFAULT_SKILLS_DIR)))
-            .expanduser()
-            .resolve(),
-            templates_dir=Path(os.environ.get("DEEPSEEK_TEMPLATES_DIR", str(DEFAULT_TEMPLATES_DIR)))
-            .expanduser()
-            .resolve(),
-            workflows_dir=Path(os.environ.get("DEEPSEEK_WORKFLOWS_DIR", str(DEFAULT_WORKFLOWS_DIR)))
-            .expanduser()
-            .resolve(),
-            environments_dir=Path(
-                os.environ.get("DEEPSEEK_ENVIRONMENTS_DIR", str(DEFAULT_ENVIRONMENTS_DIR))
-            )
-            .expanduser()
-            .resolve(),
-            environment_state_dir=Path(
-                os.environ.get("DEEPSEEK_ENVIRONMENT_STATE_DIR", str(DEFAULT_ENVIRONMENT_STATE_DIR))
-            )
-            .expanduser()
-            .resolve(),
+            skills_dir=user_path("DEEPSEEK_SKILLS_DIR", "skills"),
+            templates_dir=user_path("DEEPSEEK_TEMPLATES_DIR", "templates"),
+            workflows_dir=user_path("DEEPSEEK_WORKFLOWS_DIR", "workflows"),
+            environments_dir=user_path("DEEPSEEK_ENVIRONMENTS_DIR", "environments"),
+            environment_state_dir=user_path("DEEPSEEK_ENVIRONMENT_STATE_DIR", "environment-state"),
             mcp_enabled=env_flag("DEEPSEEK_MCP_ENABLED", True),
             mcp_config_file=mcp_path,
             mcp_config_source=mcp_source if mcp_source != mcp_path else None,
@@ -215,10 +261,12 @@ class Settings:
             goal_token_budget=optional_limit("ASTER_GOAL_TOKEN_BUDGET", int),
             max_output_tokens=max(1, env_number("DEEPSEEK_MAX_OUTPUT_TOKENS", int, "131072")),
             websearch_enabled=env_flag("DEEPSEEK_WEBSEARCH_ENABLED", True),
-            websearch_base_url=os.environ.get(
-                "DEEPSEEK_WEBSEARCH_BASE_URL", "https://api.cline.bot/api/v1"
-            ).rstrip("/"),
+            websearch_base_url=os.environ.get("DEEPSEEK_WEBSEARCH_BASE_URL", "")
+            .strip()
+            .rstrip("/"),
             websearch_api_key=os.environ.get("DEEPSEEK_WEBSEARCH_API_KEY") or None,
+            websearch_provider=os.environ.get("DEEPSEEK_WEBSEARCH_PROVIDER", "auto").strip().lower()
+            or "auto",
             max_output_continuations=(
                 max(0, env_number("DEEPSEEK_MAX_OUTPUT_CONTINUATIONS", int, "0"))
                 if os.environ.get("DEEPSEEK_MAX_OUTPUT_CONTINUATIONS", "").lower()
@@ -276,6 +324,14 @@ def login_fields(login: Login | None) -> dict:
     else:
         raise ValueError(f"Unknown login provider {login.provider!r}")
     fields["base_url"] = fields["base_url"].rstrip("/")
+    fields["api"] = parse_model_api(
+        os.environ.get("DEEPSEEK_API") if login is None or login.provider == "env" else login.api
+    )
+    fields["api_compat"] = parse_api_compat(
+        os.environ.get("DEEPSEEK_API_COMPAT")
+        if login is None or login.provider == "env"
+        else login.api_compat
+    )
     fields["auth_file"] = auth_file()
     fields["context_window_tokens"] = (
         login.context_window if login is not None else None

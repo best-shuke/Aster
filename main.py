@@ -7,7 +7,6 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from auth import AuthError, AuthStore
-from chatgpt_client import ChatGPTClient
 from command_ui import (
     conversation_count,
     present_command,
@@ -45,12 +44,12 @@ from commands import (
     execute_command,
     parse_command,
 )
-from config import APP_NAME, CLI_NAME, LoginRequired, Settings, auth_file, load_env
+from config import APP_NAME, CLI_NAME, LoginRequired, Settings, auth_file, load_env, user_path
 from conversation import Conversation
-from deepseek_client import DeepSeekClient
 from execution_history import execution_entries
 from login_ui import describe, run_login
 from mcp_client import McpManager
+from model_clients import model_client
 from skills import SkillCatalog
 from tools import CodingTools
 from ui import Console
@@ -318,6 +317,7 @@ def ask(
 
 def load_settings(*, choose: bool, one_shot: bool) -> Settings | None:
     """Settings from the saved login; an interactive first start asks how to sign in."""
+    load_env()
     store = AuthStore(auth_file())
     try:
         login = store.login()
@@ -325,10 +325,10 @@ def load_settings(*, choose: bool, one_shot: bool) -> Settings | None:
         print(f"警告：{exc}", file=sys.stderr)
         login = None
     if sys.stdin.isatty() and sys.stdout.isatty():
-        load_env()
         # A one-shot prompt with model variables already configured runs without a menu.
-        configured = one_shot and bool(os.environ.get("DEEPSEEK_API_KEY"))
-        if choose or (login is None and not configured):
+        configured = bool(os.environ.get("DEEPSEEK_API_KEY"))
+        needs_login = login is None or (login.provider == "env" and not configured)
+        if choose or (needs_login and not (one_shot and configured)):
             console = Console()
             console.toolbar = False
             try:
@@ -340,7 +340,7 @@ def load_settings(*, choose: bool, one_shot: bool) -> Settings | None:
     except LoginRequired:
         print(
             f"尚未登录：在终端运行 {CLI_NAME} 选择 ChatGPT 账户或第三方 API，"
-            "或设置 DEEPSEEK_API_KEY。",
+            f"或在 {user_path('DEEPSEEK_ENV_FILE', '.env')} 中设置 DEEPSEEK_API_KEY。",
             file=sys.stderr,
         )
         return None
@@ -381,7 +381,7 @@ def main() -> int:
     )
     if not settings.websearch_enabled:
         websearch_status = "关闭"
-    elif settings.websearch_provider:
+    elif settings.available_websearch_provider:
         websearch_status = "可用"
     else:
         websearch_status = "未配置"
@@ -422,7 +422,7 @@ def main() -> int:
     try:
         conversation = Conversation(
             settings,
-            ChatGPTClient(settings) if settings.provider == "chatgpt" else DeepSeekClient(settings),
+            model_client(settings),
             tools,
             skills=skills,
             mcp_manager=mcp_manager,

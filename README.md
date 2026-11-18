@@ -18,7 +18,7 @@ uv sync --locked
 首次在终端启动时会询问登录方式：
 
 - **ChatGPT 账户（Plus / Pro）**：用 ChatGPT 订阅额度运行。可选浏览器登录，或在手机/任意电脑上输入设备码登录（适合 SSH 和无图形界面的服务器）；登录后从账户可用的模型中选择。
-- **第三方 API（OpenAI 兼容）**：填写服务地址、API Key 和模型名称，保存前会尝试验证 Key。
+- **API 服务（OpenAI / Anthropic 兼容）**：支持 Chat Completions、Responses、Anthropic Messages；填写服务地址、API Key、协议与模型名称，保存前会尝试验证 Key。
 - **沿用环境变量配置**：已设置 `DEEPSEEK_API_KEY`（及可选的 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`）时出现，保持原有用法。
 
 选择与凭据保存在 `~/.agents/aster/auth.json`（仅当前用户可读，不在仓库内）。之后可随时用 `/login` 切换登录方式或模型、`/logout` 退出登录，或用 `./bin/agent --login` 在启动前重新选择。
@@ -28,11 +28,13 @@ uv sync --locked
 ./bin/agent "说明当前工作区的代码结构"
 ```
 
-也可以只用环境变量：在终端环境或项目目录的私密 `.env` 文件中设置 `DEEPSEEK_API_KEY` 等变量；`.env` 被 Git 忽略，仓库不提供实际配置文件。单次执行（带任务参数）且已配置环境变量时不会弹出登录菜单。
+也可以只用环境变量：在终端环境或 `~/.agents/aster/.env` 中设置 `DEEPSEEK_API_KEY` 等变量；仓库不提供实际配置文件。单次执行（带任务参数）且已配置环境变量时不会弹出登录菜单。
 
-`bin/agent` 固定读取程序目录的 `.env`，并保留当前调用目录作为工作区。直接运行 `uv run --locked python main.py` 时，默认从当前工作目录读取 `.env`。已有进程环境变量优先于文件配置。
+`DEEPSEEK_API` 可显式选择 `openai-completions`、`openai-responses` 或 `anthropic-messages`；默认 `auto` 按服务地址选择，DeepSeek 官方默认沿用 Chat Completions。协议和服务兼容设置见[配置入口](docs/configuration.md#模型通信协议)。
 
-联网搜索：以 ChatGPT 账户登录时直接使用账户自带的搜索，无需额外配置；第三方 API 登录时需另行提供 Cline 搜索凭据（`DEEPSEEK_WEBSEARCH_API_KEY`），详见[配置入口](docs/configuration.md)。
+`bin/agent` 与直接运行 `uv run --locked python main.py` 都默认读取 `~/.agents/aster/.env`，保留当前调用目录作为工作区。配置、登录凭据、技能、模板、workflow、环境状态和会话统一保存在 `~/.agents/aster/`；会话按工作区路径隔离，工作区内不再生成默认会话文件或锁文件。可通过进程环境变量 `ASTER_HOME` 更改整个用户目录，原有 `DEEPSEEK_*` 路径配置仍可单独覆盖。已有进程环境变量优先于文件配置，旧配置的迁移见[配置入口](docs/configuration.md#用户目录与迁移)。
+
+联网搜索：直连 DeepSeek 官方模型时默认使用官方 Search API，复用原有 API Key；以 ChatGPT 账户登录时直接使用账户自带的搜索，无需额外配置；其他第三方 API 可配置 DeepSeek / Cline 搜索凭据（`DEEPSEEK_WEBSEARCH_API_KEY`），详见[配置入口](docs/configuration.md#运行与扩展配置)。
 
 如不需要扩展，可通过自己的环境变量设置 `DEEPSEEK_MCP_ENABLED=0`、`DEEPSEEK_SKILLS_ENABLED=0` 和 `DEEPSEEK_WEBSEARCH_ENABLED=0`。缺少 MCP 配置或技能目录不会要求安装具体服务。
 

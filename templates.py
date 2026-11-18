@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from config import DEFAULT_TEMPLATES_DIR
+from config import user_path
 from sessions import SessionStore
 
 
@@ -26,7 +26,9 @@ class TemplateStore:
     ) -> None:
         self.sessions = sessions
         self.workspace = workspace
-        self.directory = (directory if directory is not None else DEFAULT_TEMPLATES_DIR).resolve()
+        self.directory = (
+            directory if directory is not None else user_path("DEEPSEEK_TEMPLATES_DIR", "templates")
+        ).resolve()
         self.local_directory = sessions.active_file.with_name(
             f"{sessions.active_file.stem}.templates"
         ).resolve()

@@ -11,6 +11,4 @@ while [ -L "$script_path" ]; do
 done
 
 program_dir=$(CDPATH= cd -P "$(dirname "$script_path")/.." && pwd) || exit 1
-export DEEPSEEK_ENV_FILE="$program_dir/.env"
-
 exec "$program_dir/.venv/bin/python" "$program_dir/main.py" "$@"

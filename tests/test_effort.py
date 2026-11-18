@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from config import Settings
+from config import Settings, default_session_file
 from conversation import Conversation
 from deepseek_client import DeepSeekClient
 from main import run_interactive, update_effort
@@ -92,7 +92,7 @@ class EffortTests(unittest.TestCase):
         self.assertEqual(settings.api_key, "from-fixed-config")
         self.assertEqual(settings.model, "fixed-model")
         self.assertEqual(settings.workspace, workspace)
-        self.assertEqual(settings.session_file, (workspace / ".deepseek-session.json").resolve())
+        self.assertEqual(settings.session_file, default_session_file(workspace))
 
     def test_request_parameters_for_direct_and_gateway_routes(self):
         for url, gateway in [
@@ -312,6 +312,42 @@ class EffortTests(unittest.TestCase):
         body = json.loads(opened.call_args.args[0].data)
         self.assertEqual(body["thinking"], {"type": "enabled"})
         self.assertEqual(body["reasoning"], {"enabled": True, "effort": "max"})
+
+    def test_unsupported_reasoning_effort_compat_omits_field_when_enabled_and_off(self):
+        url = "https://proxy.example.com/v1"
+        model = "custom-openai-model"
+        for effort in ("max", "low", "off"):
+            with self.subTest(effort=effort, compat=False):
+                settings = replace(
+                    self.settings,
+                    base_url=url,
+                    model=model,
+                    reasoning_effort=effort,
+                    api_compat={"supports_reasoning_effort": False},
+                )
+                with patch("http_transport.open_url", side_effect=response) as opened:
+                    DeepSeekClient(settings).complete([])
+                body = json.loads(opened.call_args.args[0].data)
+                self.assertNotIn("reasoning_effort", body)
+                self.assertNotIn("reasoning", body)
+                self.assertNotIn("thinking", body)
+
+            with self.subTest(effort=effort, compat=True):
+                settings = replace(
+                    self.settings,
+                    base_url=url,
+                    model=model,
+                    reasoning_effort=effort,
+                    api_compat={"supports_reasoning_effort": True},
+                )
+                with patch("http_transport.open_url", side_effect=response) as opened:
+                    DeepSeekClient(settings).complete([])
+                body = json.loads(opened.call_args.args[0].data)
+                if effort == "off":
+                    self.assertEqual(body["reasoning_effort"], "none")
+                else:
+                    self.assertEqual(body["reasoning_effort"], effort)
+
 
 
 if __name__ == "__main__":

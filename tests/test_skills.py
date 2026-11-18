@@ -277,6 +277,28 @@ class SkillCatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "无法加载 skill known"):
             catalog.expand_command("/skill:known task")
 
+    def test_unreadable_skill_root_is_ignored_without_breaking_discovery(self):
+        self.create_skill(self.program_skills, "valid", "Valid.", "Instructions")
+        unreadable_root = self.root / "restricted_skills"
+        unreadable_root.mkdir()
+        original_is_file = Path.is_file
+
+        def fake_is_file(target, *args, **kwargs):
+            if target == unreadable_root or str(target).startswith(str(unreadable_root)):
+                raise PermissionError(1, "Operation not permitted")
+            return original_is_file(target, *args, **kwargs)
+
+        with patch.object(Path, "is_file", autospec=True, side_effect=fake_is_file):
+            catalog = SkillCatalog(
+                self.workspace,
+                self.program_skills,
+                extra_dirs=(unreadable_root,),
+                fallback_dirs=(self.program_skills,),
+                include_defaults=False,
+            )
+            self.assertEqual([skill.name for skill in catalog.skills], ["valid"])
+
+
 
 class SkillConversationTests(unittest.TestCase):
     def setUp(self):

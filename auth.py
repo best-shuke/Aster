@@ -27,6 +27,7 @@ from typing import Any
 
 from config import CHATGPT_BASE_URL, Login
 from http_transport import build_no_redirect_opener
+from model_api import model_endpoint
 
 ISSUER = "https://auth.openai.com"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # The public Codex PKCE client.
@@ -414,16 +415,17 @@ def list_models(tokens: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(models, key=lambda model: model["priority"])
 
 
-def check_api(base_url: str, api_key: str) -> tuple[int | None, list[str]]:
-    """Probe an OpenAI-compatible ``/models``: (HTTP status or None, model ids)."""
-    request = urllib.request.Request(
-        base_url.rstrip("/") + "/models",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-    )
+def check_api(
+    base_url: str, api_key: str, *, api: str = "openai-completions"
+) -> tuple[int | None, list[str]]:
+    """Probe the selected protocol's model list: (HTTP status or None, model ids)."""
+
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    if api == "anthropic-messages":
+        headers.update({"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(model_endpoint(base_url, api, "models"), headers=headers)
     try:
         with _open(request, timeout=15) as response:
             payload = json.load(response)
@@ -501,7 +503,14 @@ class AuthStore:
         if provider == "api":
             api = data.get("api") or {}
             if api.get("base_url") and api.get("api_key") and api.get("model"):
-                return Login("api", api["model"], api["base_url"], api["api_key"])
+                return Login(
+                    "api",
+                    api["model"],
+                    api["base_url"],
+                    api["api_key"],
+                    api=api.get("api", "auto"),
+                    api_compat=api.get("api_compat") or {},
+                )
         if provider == "chatgpt":
             account = data.get("chatgpt") or {}
             if account.get("refresh_token") and account.get("model"):

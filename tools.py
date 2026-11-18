@@ -737,7 +737,11 @@ class CodingTools:
         return ToolResult(data=self.task_plan)
 
     def attach_websearch(self, client: WebSearchClient | ChatGPTWebSearchClient) -> None:
-        self.registry["websearch"] = ToolSpec(
+        self.registry["websearch"] = self.websearch_spec(client)
+
+    @staticmethod
+    def websearch_spec(client: WebSearchClient | ChatGPTWebSearchClient) -> ToolSpec:
+        return ToolSpec(
             "websearch",
             client.description,
             {

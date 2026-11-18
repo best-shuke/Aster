@@ -220,7 +220,7 @@ class TemplateStoreTests(TemplateFixture, unittest.TestCase):
         self.assertEqual(self.store.read(first)["name"], "基础 A")
         self.assertEqual(self.store.read(second)["name"], "基础/A")
 
-    def test_config_defaults_to_program_directory_and_supports_an_override(self):
+    def test_config_defaults_to_user_directory_and_supports_an_override(self):
         for configured in (None, str(self.template_directory)):
             with self.subTest(configured=configured):
                 environment = {"DEEPSEEK_API_KEY": "test"}

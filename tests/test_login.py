@@ -55,7 +55,7 @@ class TempDirTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.store = AuthStore(self.root / "aster" / "auth.json")
         self.addCleanup(auth.forget_account, self.store.path)
         # A missing env file keeps every load_env() caller away from the repo's real .env.
@@ -589,12 +589,14 @@ class LoginFlowTests(TempDirTest):
         self.assertEqual(self.store.read()["provider"], "env")
 
     def test_api_login_verifies_the_key_and_saves_the_chosen_model(self):
-        console = ScriptedConsole([1, 1], ["https://api.example.com/v1/", "bad-key", "good-key"])
+        console = ScriptedConsole(
+            [1, 1], ["https://api.example.com/v1/", "auto", "bad-key", "good-key"]
+        )
         statuses = [(401, []), (200, ["model-a", "model-b"])]
         with patch("login_ui.check_api", side_effect=statuses) as check:
             login = login_ui.run_login(console, self.store)
         self.assertEqual(login, Login("api", "model-b", "https://api.example.com/v1", "good-key"))
-        self.assertEqual([prompt[1] for prompt in console.prompts], [False, True, True])
+        self.assertEqual([prompt[1] for prompt in console.prompts], [False, False, True, True])
         self.assertEqual(check.call_args.args, ("https://api.example.com/v1", "good-key"))
 
     def test_device_login_waits_for_approval_then_saves_account_and_model(self):
@@ -707,6 +709,35 @@ class LoginFlowTests(TempDirTest):
                     ask.assert_not_called()
                     self.assertEqual(main.load_settings(choose=True, one_shot=True).model, "m")
                     self.assertFalse(ask.call_args.kwargs["first_run"])
+
+    def test_saved_environment_login_without_credentials_opens_login_menu(self):
+        self.store.update(provider="env")
+        terminal = SimpleNamespace(isatty=lambda: True)
+        api = Login("api", "m", "https://x.example/v1", "k")
+        for one_shot in (False, True):
+            with (
+                self.subTest(one_shot=one_shot),
+                patch("sys.stdin", terminal),
+                patch("sys.stdout", terminal),
+                patch("main.Console"),
+                patch("main.run_login", return_value=api) as ask,
+            ):
+                settings = main.load_settings(choose=False, one_shot=one_shot)
+            self.assertIsNotNone(settings)
+            self.assertEqual(settings.model, "m")
+            ask.assert_called_once()
+
+    def test_missing_environment_credentials_report_the_configuration_path(self):
+        self.store.update(provider="env")
+        with (
+            patch("sys.stdin", SimpleNamespace(isatty=lambda: False)),
+            patch("main.run_login") as ask,
+            patch("sys.stderr", io.StringIO()) as errors,
+        ):
+            self.assertIsNone(main.load_settings(choose=False, one_shot=True))
+        ask.assert_not_called()
+        self.assertIn(os.environ["DEEPSEEK_ENV_FILE"], errors.getvalue())
+        self.assertIn("DEEPSEEK_API_KEY", errors.getvalue())
 
 
 if __name__ == "__main__":

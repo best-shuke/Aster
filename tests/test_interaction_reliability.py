@@ -41,7 +41,7 @@ class InteractionReliabilityTests(unittest.TestCase):
         with (
             patch("sys.argv", ["main.py", *arguments]),
             patch("main.load_settings", return_value=self.settings),
-            patch("main.DeepSeekClient", return_value=FakeClient()),
+            patch("main.model_client", return_value=FakeClient()),
             patch("main.Console", return_value=self.console),
             ExitStack() as stack,
         ):

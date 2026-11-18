@@ -326,7 +326,7 @@ with tempfile.TemporaryDirectory() as temporary:
         max_context_chars=120000, keep_recent_turns=6, max_task_seconds=60,
         max_subagents=1, mcp_enabled=False, websearch_enabled=False, skills_enabled=False)
     with patch('main.load_settings', return_value=settings), \\
-            patch('main.DeepSeekClient', return_value=FakeClient()), \\
+            patch('main.model_client', return_value=FakeClient()), \\
             patch('sys.argv', ['main.py']), patch('sys.stdout', output):
         status = main.main()
 captured = ''.join(output.parts)

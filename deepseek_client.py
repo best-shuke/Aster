@@ -33,6 +33,8 @@ from contracts import (
     ProgressCallback as ProgressCallback,
 )
 from generation_metrics import GenerationMetrics
+from model_api import compatibility, message_signature, model_endpoint, protocol_origin
+from model_messages import protocol_messages
 from model_rate_limit import retry_after_seconds, shared_gate
 from model_request import CompletionError as CompletionError
 from model_request import ModelRequestRunner
@@ -316,9 +318,13 @@ class DeepSeekClient(ModelRequestRunner):
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.settings.model,
-            "messages": wire_messages(messages),
+            "messages": wire_messages(protocol_messages(messages, self.settings)),
             "stream": streaming,
         }
+        if compatibility(self.settings).requires_reasoning_content:
+            for message in body["messages"]:
+                if message.get("role") == "assistant":
+                    message.setdefault("reasoning_content", "")
         if streaming:
             body["stream_options"] = {"include_usage": True}
         if tools is not None:
@@ -368,10 +374,11 @@ class DeepSeekClient(ModelRequestRunner):
             body["reasoning"] = (
                 {"enabled": True, "effort": effort} if enabled else {"enabled": False}
             )
-        elif enabled:
-            body["reasoning_effort"] = effort
-        elif not deepseek:
-            body["reasoning_effort"] = "none"
+        elif compatibility(self.settings).supports_reasoning_effort:
+            if enabled:
+                body["reasoning_effort"] = effort
+            elif not deepseek:
+                body["reasoning_effort"] = "none"
 
 
     @staticmethod
@@ -407,6 +414,10 @@ class DeepSeekClient(ModelRequestRunner):
         tools: list[dict[str, Any]] | None,
         observed: UsageAccumulator,
     ) -> Message:
+        message.setdefault(LOCAL_METADATA, {}).update(
+            protocol_origin=protocol_origin(self.settings),
+            protocol_message=message_signature(message),
+        )
         usage = observed.result()
         if usage is not None:
             message.setdefault(LOCAL_METADATA, {}).update(
@@ -425,7 +436,7 @@ class DeepSeekClient(ModelRequestRunner):
 
     def _http_request(self, body: dict[str, Any]) -> urllib.request.Request:
         return urllib.request.Request(
-            f"{self.settings.base_url}/chat/completions",
+            model_endpoint(self.settings.base_url, "openai-completions"),
             data=json.dumps(body, ensure_ascii=False).encode(),
             headers={
                 "Authorization": f"Bearer {self.settings.api_key}",

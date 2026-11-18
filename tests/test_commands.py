@@ -56,7 +56,7 @@ class CommandBoundaryTests(unittest.TestCase):
 
     def test_websearch_status_tells_missing_setup_from_a_policy_denial(self):
         def conversation(enabled=True, provider=None, tools=()):
-            settings = Mock(websearch_enabled=enabled, websearch_provider=provider)
+            settings = Mock(websearch_enabled=enabled, available_websearch_provider=provider)
             definitions = [{"function": {"name": name}} for name in tools]
             return Mock(settings=settings, definitions=definitions)
 

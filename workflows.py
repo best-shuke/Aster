@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from config import DEFAULT_WORKFLOWS_DIR
+from config import user_path
 
 
 @dataclass(frozen=True)
@@ -22,8 +22,10 @@ class SavedWorkflow:
 
 
 class WorkflowStore:
-    def __init__(self, directory: Path = DEFAULT_WORKFLOWS_DIR) -> None:
-        self.directory = directory.expanduser().resolve()
+    def __init__(self, directory: Path | None = None) -> None:
+        self.directory = (
+            directory if directory is not None else user_path("DEEPSEEK_WORKFLOWS_DIR", "workflows")
+        ).expanduser().resolve()
         self.diagnostics: list[str] = []
 
     @staticmethod

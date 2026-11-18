@@ -23,9 +23,9 @@ from auth import (
     poll_device_code,
     request_device_code,
 )
-from chatgpt_client import ChatGPTClient
 from config import Login, Settings, load_env
-from deepseek_client import DeepSeekClient
+from model_api import parse_model_api, resolve_model_api
+from model_clients import model_client as model_client
 from ui import Console
 
 DEFAULT_API_URL = "https://api.deepseek.com"
@@ -37,11 +37,7 @@ def describe(settings: Settings) -> str:
     if settings.provider == "chatgpt":
         return "ChatGPT" + (f" · {settings.account}" if settings.account else "")
     base_url = str(settings.base_url)
-    return f"API · {urlsplit(base_url).hostname or base_url}"
-
-
-def model_client(settings: Settings) -> DeepSeekClient:
-    return (ChatGPTClient if settings.provider == "chatgpt" else DeepSeekClient)(settings)
+    return f"API · {urlsplit(base_url).hostname or base_url} · {settings.resolved_api}"
 
 
 def _saved(store: AuthStore, section: str) -> dict:
@@ -88,8 +84,8 @@ def run_login(console: Console, store: AuthStore, *, first_run: bool = False) ->
             + (f" 已登录：{account_label(chatgpt)}" if chatgpt.get("refresh_token") else ""),
         },
         {
-            "label": "第三方 API（OpenAI 兼容）",
-            "description": "填写服务地址、API Key 和模型，如 DeepSeek、OpenRouter 或自建网关。",
+            "label": "API 服务（OpenAI / Anthropic 兼容）",
+            "description": "支持 Chat Completions、Responses、Anthropic Messages；填写地址、Key 与模型。",
         },
     ]
     if environment is not None:
@@ -296,7 +292,7 @@ def login_api(console: Console, store: AuthStore) -> Login | None:
     load_env()
     saved = _saved(store, "api")
     environment_url = os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_API_URL)
-    console.info("填写 OpenAI 兼容接口（/chat/completions）。直接回车使用方括号中的值。")
+    console.info("填写模型服务。支持 Chat Completions、Responses 和 Anthropic Messages。")
     while True:
         base_url = _ask(console, "服务地址", saved.get("base_url") or environment_url)
         if base_url is None:
@@ -305,6 +301,22 @@ def login_api(console: Console, store: AuthStore) -> Login | None:
         if urlsplit(base_url).scheme in {"http", "https"} and urlsplit(base_url).hostname:
             break
         console.warning("服务地址需要以 http:// 或 https:// 开头，例如 https://api.deepseek.com")
+    selected_api = _ask(
+        console,
+        "协议（auto / openai-completions / openai-responses / anthropic-messages）",
+        saved.get("api") or "auto",
+    )
+    if selected_api is None:
+        return None
+    while True:
+        try:
+            selected_api = parse_model_api(selected_api)
+            break
+        except ValueError as exc:
+            console.warning(str(exc))
+            selected_api = _ask(console, "协议", "auto")
+            if selected_api is None:
+                return None
     # Reuse a known key only for the same endpoint, never across providers.
     known_key = (
         saved.get("api_key")
@@ -322,7 +334,9 @@ def login_api(console: Console, store: AuthStore) -> Login | None:
             console.warning("API Key 不能为空")
             continue
         console.info("正在验证…")
-        status, model_ids = check_api(base_url, api_key)
+        status, model_ids = check_api(
+            base_url, api_key, api=resolve_model_api(selected_api, base_url)
+        )
         if status in {401, 403}:
             console.warning(f"服务拒绝了这个 API Key（HTTP {status}），请重新输入。")
             known_key = None
@@ -357,7 +371,18 @@ def login_api(console: Console, store: AuthStore) -> Login | None:
             return None
         if model_ids and model not in model_ids:
             console.warning(f"{model} 不在服务返回的模型列表中，请确认名称拼写。")
-    store.update(provider="api", api={"base_url": base_url, "api_key": api_key, "model": model})
+    store.update(
+        provider="api",
+        api={
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "api": selected_api,
+            "api_compat": (saved.get("api_compat") or {})
+            if saved.get("base_url") == base_url and saved.get("api", "auto") == selected_api
+            else {},
+        },
+    )
     console.success(f"已保存第三方 API：{model} · {urlsplit(base_url).hostname}")
     return store.login()
 

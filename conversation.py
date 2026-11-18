@@ -519,6 +519,7 @@ class Conversation:
                 self._follow_websearch()
                 # Workers snapshot the registry, so they pick up the new search backend here.
                 self.tools.attach_reasoning(client, max_workers=self.settings.max_subagents)
+                self.reload_prompt()
 
     def _follow_websearch(self) -> None:
         """Search through the new login's backend: a ChatGPT account searches on its own."""

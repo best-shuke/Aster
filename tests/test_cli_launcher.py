@@ -39,7 +39,7 @@ class CliLauncherTests(unittest.TestCase):
             result.stdout.splitlines(),
             [
                 str(self.workspace.resolve()),
-                str(self.project.resolve() / ".env"),
+                environment.get("DEEPSEEK_ENV_FILE", "/old/.env"),
                 str(self.project.resolve() / "main.py"),
                 *self.arguments,
             ],
@@ -48,7 +48,7 @@ class CliLauncherTests(unittest.TestCase):
     def test_direct_launcher_preserves_workspace_and_argument_boundaries(self):
         self.assert_launch(self.launcher)
 
-    def test_installed_absolute_symlink_uses_project_configuration(self):
+    def test_installed_absolute_symlink_preserves_configuration(self):
         command = self.root / "agent"
         command.symlink_to(self.launcher)
         self.assert_launch(command)
@@ -63,3 +63,6 @@ class CliLauncherTests(unittest.TestCase):
         command = self.root / "agent"
         command.symlink_to(self.launcher)
         self.assert_launch("agent", PATH=f"{self.root}{os.pathsep}{os.environ['PATH']}")
+
+    def test_launcher_leaves_default_configuration_to_python(self):
+        self.assert_launch(self.launcher, DEEPSEEK_ENV_FILE="")

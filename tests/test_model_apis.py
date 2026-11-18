@@ -1,0 +1,537 @@
+import copy
+import io
+import json
+import os
+import tempfile
+import threading
+import time
+import unittest
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import patch
+
+from anthropic_client import AnthropicClient
+from auth import AuthStore
+from config import Login, Settings
+from context_budget import LOCAL_METADATA, request_fingerprint
+from conversation import Conversation
+from deepseek_client import CompletionError, DeepSeekClient
+from model_api import model_endpoint, parse_api_compat, parse_model_api
+from model_clients import model_client
+from model_messages import protocol_messages
+from responses_client import ResponsesClient
+from tests.support import make_settings
+from tools import CodingTools
+from usage import UsageAccumulator
+
+APIS = ("openai-responses", "anthropic-messages")
+CALL = {
+    "id": "call_read",
+    "type": "function",
+    "function": {"name": "read", "arguments": '{"path":"note.txt"}'},
+}
+
+
+def payload(api, *, tool=False, reason=None):
+    if api == "openai-responses":
+        output = (
+            [{"type": "function_call", "id": "fc_read", "call_id": CALL["id"], **CALL["function"]}]
+            if tool
+            else [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                }
+            ]
+        )
+        return {
+            "status": "incomplete" if reason else "completed",
+            "incomplete_details": {"reason": reason},
+            "output": output,
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 7},
+            },
+        }
+    return {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "tool_use", "id": CALL["id"], "name": "read", "input": {"path": "note.txt"}}
+        ]
+        if tool
+        else [{"type": "text", "text": "answer"}],
+        "stop_reason": "max_tokens" if reason else "tool_use" if tool else "end_turn",
+        "usage": {
+            "input_tokens": 3,
+            "cache_read_input_tokens": 7,
+            "cache_creation_input_tokens": 2,
+            "output_tokens": 5,
+        },
+    }
+
+
+def events(api, value):
+    if api == "openai-responses":
+        result = [{"type": "response.created", "response": {}}]
+        for index, item in enumerate(value["output"]):
+            start = {**item, "arguments": ""} if item["type"] == "function_call" else item
+            result.append(
+                {"type": "response.output_item.added", "output_index": index, "item": start}
+            )
+            if item["type"] == "function_call":
+                result.append(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": index,
+                        "item_id": item["id"],
+                        "delta": item["arguments"],
+                    }
+                )
+            elif item["type"] == "message":
+                result.append(
+                    {
+                        "type": "response.output_text.delta",
+                        "output_index": index,
+                        "delta": item["content"][0]["text"],
+                    }
+                )
+            result.append(
+                {"type": "response.output_item.done", "output_index": index, "item": item}
+            )
+        return [
+            *result,
+            {
+                "type": "response.incomplete"
+                if value["status"] == "incomplete"
+                else "response.completed",
+                "response": value,
+            },
+        ]
+    result = [
+        {"type": "message_start", "message": {"usage": {**value["usage"], "output_tokens": 0}}}
+    ]
+    for index, block in enumerate(value["content"]):
+        if block["type"] == "tool_use":
+            start = {**block, "input": {}}
+            delta = {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+        else:
+            start = {**block, "text": ""}
+            delta = {"type": "text_delta", "text": block["text"]}
+        result.extend(
+            [
+                {"type": "content_block_start", "index": index, "content_block": start},
+                {"type": "content_block_delta", "index": index, "delta": delta},
+                {"type": "content_block_stop", "index": index},
+            ]
+        )
+    return [
+        *result,
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": value["stop_reason"]},
+            "usage": {"output_tokens": 5},
+        },
+        {"type": "message_stop"},
+    ]
+
+
+def encode_sse(rows):
+    return b": heartbeat\n\n" + b"".join(
+        f"event: {row['type']}\ndata: {json.dumps(row)}\n\n".encode() for row in rows
+    )
+
+
+class ModelApiTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.requests, self.replies = [], []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                owner.requests.append((self.path, dict(self.headers), body))
+                status, content, data = owner.replies.pop(0)
+                self.send_response(status)
+                self.send_header("Content-Type", content)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.base = f"http://127.0.0.1:{server.server_port}"
+
+    def settings(self, api, **values):
+        return make_settings(
+            api_key="synthetic-key",
+            base_url=self.base,
+            model="test-model",
+            workspace=self.root,
+            session_file=self.root / "session.json",
+            max_context_chars=120000,
+            keep_recent_turns=6,
+            max_task_seconds=60,
+            max_subagents=1,
+            api=api,
+            reasoning_effort="off",
+            request_retries=0,
+            **values,
+        )
+
+    def queue(self, api, *, streaming=False, tool=False, reason=None):
+        value = payload(api, tool=tool, reason=reason)
+        data = encode_sse(events(api, value)) if streaming else json.dumps(value).encode()
+        self.replies.append((200, "text/event-stream" if streaming else "application/json", data))
+
+    def test_factory_separates_authentication_from_protocol_and_auto_detection(self):
+        for api, expected in [
+            ("openai-completions", DeepSeekClient),
+            ("openai-responses", ResponsesClient),
+            ("anthropic-messages", AnthropicClient),
+        ]:
+            self.assertIsInstance(model_client(self.settings(api)), expected)
+        for endpoint, expected in [
+            ("https://api.deepseek.com", "openai-completions"),
+            ("https://api.openai.com/v1", "openai-responses"),
+            ("https://api.anthropic.com", "anthropic-messages"),
+            ("https://api.deepseek.com/anthropic", "anthropic-messages"),
+            ("https://proxy.invalid/v1", "openai-completions"),
+        ]:
+            self.assertEqual(
+                replace(self.settings("auto"), base_url=endpoint).resolved_api, expected
+            )
+
+    def test_sync_and_stream_outputs_usage_auth_and_deadlines_share_one_contract(self):
+        for api in APIS:
+            for streaming in (False, True):
+                with self.subTest(api=api, streaming=streaming):
+                    self.queue(api, streaming=streaming)
+                    client = model_client(self.settings(api))
+                    content, progress = [], []
+                    result = client.complete(
+                        [{"role": "user", "content": "task"}],
+                        on_content=content.append if streaming else None,
+                        on_progress=progress.append,
+                    )
+                    self.assertEqual(result["content"], "answer")
+                    usage = result[LOCAL_METADATA]["usage"]
+                    self.assertEqual(usage["prompt_tokens"], 12)
+                    self.assertEqual(usage["completion_tokens"], 5)
+                    self.assertEqual(usage["total_tokens"], 17)
+                    self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], 7)
+                    self.assertEqual(client.cache_stats.snapshot()["calls"], 1)
+                    if streaming:
+                        self.assertEqual("".join(content), "answer")
+                        self.assertTrue(
+                            any(event["phase"] == "response_delta" for event in progress)
+                        )
+                    route, headers, body = self.requests[-1]
+                    self.assertEqual(
+                        route, "/responses" if api == "openai-responses" else "/v1/messages"
+                    )
+                    self.assertEqual(body["stream"], streaming)
+                    if api == "anthropic-messages":
+                        self.assertEqual(headers["X-Api-Key"], "synthetic-key")
+                        self.assertNotIn("Authorization", headers)
+                    else:
+                        self.assertEqual(headers["Authorization"], "Bearer synthetic-key")
+
+    def test_real_http_tool_loop_returns_results_to_each_protocol(self):
+        (self.root / "note.txt").write_text("fixture text")
+        for api in APIS:
+            for streaming in (False, True):
+                with self.subTest(api=api, streaming=streaming):
+                    # TaskRuntime streams internally even without a display callback.
+                    self.queue(api, streaming=True, tool=True)
+                    self.queue(api, streaming=True)
+                    settings = replace(
+                        self.settings(api), session_file=self.root / f"{api}-{streaming}.json"
+                    )
+                    tools = CodingTools(self.root)
+                    conversation = Conversation(settings, model_client(settings), tools)
+                    self.addCleanup(conversation.close)
+                    answer = conversation.ask(
+                        "read note.txt", on_content=(lambda _: None) if streaming else None
+                    )
+                    self.assertEqual(answer, "answer")
+                    body = self.requests[-1][2]
+                    if api == "openai-responses":
+                        result = next(
+                            item for item in body["input"] if item["type"] == "function_call_output"
+                        )
+                        self.assertEqual(result["call_id"], CALL["id"])
+                        self.assertIn("fixture text", result["output"])
+                        self.assertFalse(body["tools"][0]["strict"])
+                    else:
+                        result = body["messages"][-1]["content"][0]
+                        self.assertEqual(result["tool_use_id"], CALL["id"])
+                        self.assertIn("fixture text", result["content"])
+                        self.assertIn("input_schema", body["tools"][0])
+
+    def test_truncated_and_unterminated_streams_never_become_successful_answers(self):
+        for api in APIS:
+            for streaming in (False, True):
+                with self.subTest(api=api, streaming=streaming):
+                    self.queue(api, streaming=streaming, reason="max_output_tokens")
+                    with self.assertRaises(CompletionError) as raised:
+                        model_client(self.settings(api)).complete(
+                            [], on_content=(lambda _: None) if streaming else None
+                        )
+                    self.assertEqual(raised.exception.code, "output_limit")
+                    self.assertEqual(raised.exception.partial_message["content"], "answer")
+            data = encode_sse(events(api, payload(api))[:-1])
+            self.replies.append((200, "text/event-stream", data))
+            with self.assertRaises(CompletionError) as raised:
+                model_client(self.settings(api)).complete([], on_content=lambda _: None)
+            self.assertEqual(raised.exception.code, "incomplete_stream")
+
+    def test_http_errors_are_sanitized_and_401_is_not_retried(self):
+        for api in APIS:
+            self.replies.append((401, "application/json", b'{"error":{"message":"synthetic-key"}}'))
+            with self.assertRaises(CompletionError) as raised:
+                model_client(self.settings(api)).complete([])
+            self.assertEqual(raised.exception.code, "http_401")
+            self.assertNotIn("synthetic-key", str(raised.exception))
+
+    def test_deepseek_compatibility_omits_unsupported_responses_fields(self):
+        settings = replace(
+            self.settings("openai-responses"),
+            base_url="https://api.deepseek.com",
+            reasoning_effort="max",
+        )
+        body = model_client(settings)._request_body(
+            [{"role": "user", "content": "task"}, {"role": "system", "content": "runtime note"}],
+            None,
+            True,
+            200,
+        )
+        self.assertNotIn("store", body)
+        self.assertNotIn("include", body)
+        self.assertEqual(body["input"][-1]["role"], "system")
+        self.assertEqual(body["reasoning"], {"effort": "max"})
+        self.assertEqual(
+            model_endpoint("https://api.deepseek.com/v1", "anthropic-messages"),
+            "https://api.deepseek.com/anthropic/v1/messages",
+        )
+
+    def test_native_thinking_replay_is_scoped_to_model_protocol_endpoint_and_message(self):
+        for api in APIS:
+            settings = self.settings(api)
+            client = model_client(settings)
+            value = payload(api)
+            if api == "openai-responses":
+                value["output"].insert(
+                    0, {"type": "reasoning", "summary": [], "encrypted_content": "opaque"}
+                )
+            else:
+                value["content"].insert(
+                    0, {"type": "thinking", "thinking": "plan", "signature": "signed"}
+                )
+            self.replies.append((200, "application/json", json.dumps(value).encode()))
+            message = client.complete([])
+            body = client._request_body([message], None, False, 200)
+            self.assertIn("opaque" if api == "openai-responses" else "signed", json.dumps(body))
+            for changed in [
+                replace(settings, model="other"),
+                replace(settings, base_url="https://other.invalid"),
+            ]:
+                body = model_client(changed)._request_body([message], None, False, 200)
+                self.assertNotIn(
+                    "opaque" if api == "openai-responses" else "signed", json.dumps(body)
+                )
+            changed_message = copy.deepcopy(message)
+            changed_message["content"] = "edited answer"
+            body = client._request_body([changed_message], None, False, 200)
+            self.assertIn("edited answer", json.dumps(body))
+            self.assertNotIn("opaque" if api == "openai-responses" else "signed", json.dumps(body))
+
+    def test_protocol_and_compatibility_affect_cache_identity(self):
+        settings = self.settings("openai-completions")
+        original = request_fingerprint([], None, settings)
+        self.assertNotEqual(
+            original, request_fingerprint([], None, replace(settings, api="openai-responses"))
+        )
+        self.assertNotEqual(
+            original,
+            request_fingerprint([], None, replace(settings, api_compat={"supports_store": False})),
+        )
+
+    def test_cross_protocol_tool_ids_are_normalized_without_changing_saved_history(self):
+        invalid_id = "fc_" + "x" * 80 + "|native-id"
+        history = [
+            {"role": "assistant", "content": None, "tool_calls": [{**CALL, "id": invalid_id}]},
+            {"role": "tool", "tool_call_id": invalid_id, "content": "result"},
+        ]
+        original = copy.deepcopy(history)
+        for api in APIS:
+            messages = protocol_messages(history, self.settings(api))
+            normalized = messages[0]["tool_calls"][0]["id"]
+            self.assertLessEqual(len(normalized), 64)
+            self.assertNotIn("|", normalized)
+            self.assertEqual(normalized, messages[1]["tool_call_id"])
+            self.assertEqual(history, original)
+
+    def test_malformed_content_and_provider_errors_are_structured(self):
+        for api in APIS:
+            invalid = payload(api)
+            if api == "openai-responses":
+                invalid["output"][0]["content"] = [None]
+            else:
+                invalid["content"] = [None]
+            for bad in [[], invalid]:
+                with self.subTest(api=api, value=bad):
+                    self.replies.append((200, "application/json", json.dumps(bad).encode()))
+                    with self.assertRaises(CompletionError) as raised:
+                        model_client(self.settings(api)).complete([])
+                    self.assertEqual(raised.exception.code, "invalid_response")
+            error = {"type": "error", "error": {"type": "api_error", "message": "synthetic-key"}}
+            self.replies.append((200, "application/json", json.dumps(error).encode()))
+            with self.assertRaises(CompletionError) as raised:
+                model_client(self.settings(api)).complete([])
+            self.assertEqual(raised.exception.code, "provider_error")
+            self.assertNotIn("synthetic-key", str(raised.exception))
+
+    def test_cancellation_and_expired_deadline_do_not_send_a_request(self):
+        for api in APIS:
+            cancelled = threading.Event()
+            cancelled.set()
+            for options, code in [
+                ({"cancelled": cancelled}, "cancelled"),
+                ({"deadline": time.monotonic() - 1}, "task_deadline"),
+            ]:
+                with self.assertRaises(CompletionError) as raised:
+                    model_client(self.settings(api)).complete([], **options)
+                self.assertEqual(raised.exception.code, code)
+        self.assertEqual(self.requests, [])
+
+    def test_anthropic_requires_closed_blocks_and_preserves_empty_tool_arguments(self):
+        value = payload("anthropic-messages", tool=True)
+        value["content"][0]["input"] = {}
+        rows = events("anthropic-messages", value)
+        rows = [row for row in rows if row["type"] != "content_block_delta"]
+        result = AnthropicClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(result["tool_calls"][0]["function"]["arguments"], "{}")
+        rows = [row for row in rows if row["type"] != "content_block_stop"]
+        with self.assertRaises(CompletionError) as raised:
+            AnthropicClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(raised.exception.code, "incomplete_stream")
+
+    def test_responses_rejects_final_tool_arguments_that_differ_from_stream(self):
+        rows = events("openai-responses", payload("openai-responses", tool=True))
+        for row in rows:
+            if row["type"] == "response.output_item.done":
+                row["item"] = {**row["item"], "arguments": '{"path":"other.txt"}'}
+        with self.assertRaises(CompletionError) as raised:
+            ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(raised.exception.code, "invalid_tool_calls")
+
+    def test_login_switch_updates_search_and_keeps_policy_restrictions(self):
+        settings = self.settings("openai-completions")
+        tools = CodingTools(self.root)
+        conversation = Conversation(settings, model_client(settings), tools)
+        self.addCleanup(conversation.close)
+        login = Login(
+            "api",
+            "deepseek-flash",
+            "https://api.deepseek.com",
+            "deepseek-key",
+            api="anthropic-messages",
+        )
+        conversation.switch_login(login, model_client(settings.with_login(login)))
+        self.assertEqual(conversation.settings.resolved_api, "anthropic-messages")
+        self.assertIsInstance(conversation.client, AnthropicClient)
+        search = tools.registry["websearch"].handler.__self__
+        self.assertEqual(search.settings.resolved_websearch_api_key, "deepseek-key")
+        self.assertEqual(search.settings.resolved_websearch_provider, "deepseek")
+        self.assertIn("websearch", conversation._baseline_registry)
+        other = Login("api", "other", "https://other.invalid", "other-key")
+        conversation.switch_login(other, model_client(settings.with_login(other)))
+        self.assertNotIn("websearch", tools.registry)
+        self.assertNotIn("websearch", conversation._baseline_registry)
+
+
+class ModelApiConfigTests(unittest.TestCase):
+    def test_env_and_saved_login_protocols_and_compatibility_are_independent(self):
+        with (
+            patch("config.load_env"),
+            patch.dict(
+                os.environ,
+                {
+                    "DEEPSEEK_API_KEY": "key",
+                    "DEEPSEEK_API": "anthropic-messages",
+                    "DEEPSEEK_API_COMPAT": '{"supports_store":false}',
+                },
+                clear=True,
+            ),
+        ):
+            settings = Settings.from_env()
+            self.assertEqual(settings.resolved_api, "anthropic-messages")
+            self.assertFalse(settings.model_compat.supports_store)
+            saved = Settings.from_env(
+                Login("api", "model", "https://other.invalid", "key", api="openai-responses")
+            )
+            self.assertEqual(saved.resolved_api, "openai-responses")
+            self.assertTrue(saved.model_compat.supports_store)
+        for invalid in ["wrong", "anthropic"]:
+            with self.assertRaises(ValueError):
+                parse_model_api(invalid)
+        for invalid in ["[]", '{"unknown":true}', '{"supports_store":"false"}', "{broken"]:
+            with self.assertRaises(ValueError):
+                parse_api_compat(invalid)
+
+    def test_auth_store_preserves_protocol_and_legacy_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AuthStore(Path(directory) / "auth.json")
+            store.update(
+                provider="api",
+                api={"base_url": "https://proxy.invalid", "api_key": "key", "model": "model"},
+            )
+            self.assertEqual(store.login().api, "auto")
+            store.update(
+                api={
+                    "base_url": "https://proxy.invalid",
+                    "api_key": "key",
+                    "model": "model",
+                    "api": "anthropic-messages",
+                    "api_compat": {"adaptive_thinking": True},
+                }
+            )
+            self.assertEqual(store.login().api, "anthropic-messages")
+            self.assertEqual(store.login().api_compat, {"adaptive_thinking": True})
+
+    def test_anthropic_usage_deltas_do_not_reset_cached_input(self):
+        from anthropic_client import anthropic_usage
+
+        observed = UsageAccumulator()
+        observed.add(
+            {
+                "usage": anthropic_usage(
+                    {
+                        "input_tokens": 3,
+                        "cache_read_input_tokens": 7,
+                        "cache_creation_input_tokens": 2,
+                        "output_tokens": 0,
+                    }
+                )
+            }
+        )
+        observed.add({"usage": anthropic_usage({"output_tokens": 5})})
+        self.assertEqual(observed.result()["prompt_tokens"], 12)
+        self.assertEqual(observed.result()["completion_tokens"], 5)
+
+
+if __name__ == "__main__":
+    unittest.main()

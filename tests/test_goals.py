@@ -685,7 +685,7 @@ class GoalRuntimeTests(unittest.TestCase):
                 with (
                     patch("main.load_settings", return_value=self.settings),
                     patch("main.Console", return_value=console),
-                    patch("main.DeepSeekClient", return_value=client),
+                    patch("main.model_client", return_value=client),
                     patch(
                         "sys.argv",
                         [

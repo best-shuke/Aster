@@ -14,7 +14,8 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-from config import APP_NAME, CLI_NAME, Settings, parse_reasoning_effort
+from config import APP_NAME, CLI_NAME, PROGRAM_DIR, Settings, parse_reasoning_effort
+from config import user_dir as application_user_dir
 from environment_spec import (
     McpSelection,
     TeamSpec,
@@ -157,9 +158,14 @@ class EnvironmentStore:
         self.baseline_skills = baseline_skills
         self.baseline_servers = baseline_servers
         self.templates = templates
+        user_root = (user_dir or application_user_dir() / "environments").resolve()
+        program_root = settings.environments_dir.expanduser().resolve()
+        # Keep the user source addressable when the configured default is the same root.
+        if program_root == user_root:
+            program_root = PROGRAM_DIR / "environments"
         self.roots = {
-            "program": settings.environments_dir.expanduser().resolve(),
-            "user": (user_dir or Path.home() / ".agents" / "environments").resolve(),
+            "program": program_root,
+            "user": user_root,
             "workspace": settings.workspace.resolve() / ".agent" / "environments",
         }
         self.state_dir = settings.environment_state_dir.expanduser().resolve()

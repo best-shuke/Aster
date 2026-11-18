@@ -7,7 +7,7 @@
 | CLI 与交互命令 | `main.py`、`commands.py`、`command_ui.py` |
 | 配置、协议与系统提示 | `config.py`、`contracts.py`、`system_prompt.md` |
 | 登录 | `auth.py`（登录选择存储、ChatGPT OAuth 与令牌刷新）、`login_ui.py`（登录菜单） |
-| 模型、传输、限流与用量 | `deepseek_client.py`（OpenAI 兼容接口）、`chatgpt_client.py`（ChatGPT 账户，Responses 协议转换）、`client_runtime.py`、`http_transport.py`、`model_rate_limit.py`、`usage.py`、`generation_metrics.py` |
+| 模型、传输、限流与用量 | `model_api.py`（协议和服务兼容规则）、`model_clients.py`（客户端工厂）、`deepseek_client.py`（共享传输与 Chat Completions）、`responses_client.py` / `responses_protocol.py`（Responses 转换）、`anthropic_client.py`（Messages 转换）、`chatgpt_client.py`（ChatGPT 账户鉴权）、`client_runtime.py`、`http_transport.py`、`model_rate_limit.py`、`usage.py`、`generation_metrics.py` |
 | 会话与上下文 | `conversation.py`、`sessions.py`、`context_budget.py`、`context_management.py` |
 | 任务编排与验收 | `reasoning.py`、`task_runtime.py`、`task_acceptance.py`、`worker_checkpoint.py` |
 | 持续目标 | `goals.py`（目标状态与命令参数）、`goal_runtime.py`（多轮调度、证据核对与预算） |
@@ -22,6 +22,10 @@
 会话负责组织消息和上下文，任务运行时调度模型与工具调用。子代理的编辑经过文件状态与冲突处理；执行记录用于界面观察和恢复。MCP、技能、环境定义、模板与 workflow 由用户提供资源，框架仓库只保留加载和管理代码；`builtin/` 中的协作技能与环境模板属于框架默认资源。
 
 启动时 MCP 服务在后台并发连接，首个请求不等待；搜索、描述与调用会等待仍在连接的服务，失败的服务在下次使用时重连，交互模式在下一次输入前报告后台连接失败。环境切换仍并发连接并等待结果，以便检查必需服务。搜索按任一词命中工具名或描述排序，`*` 列出全部工具，无匹配时返回权限范围内的工具路径。MCP 工具目录随 `notifications/tools/list_changed` 自动刷新；新版协议在首次查询前通过 `subscriptions/listen` 订阅，旧版使用通知回调。通知回调只标记目录失效，并合并刷新请求；分页查询完成后整体替换缓存，查询期间的新通知会触发下一次刷新。搜索、描述与调用通过同一连接队列获取当前目录，继续应用环境与成员的权限范围。刷新失败保留完整旧快照，并通过状态中的 `catalog_stale`、`catalog_error` 暴露问题；后续目录查询会重试，订阅中断后重新订阅并刷新，工具调用不会因此自动重放。
+模型接入分别处理登录鉴权、通信协议与服务兼容规则。`model_clients.model_client()` 是启动和登录切换的统一入口；`api` 显式选择协议，`api_compat` 覆盖服务差异。各适配器转换请求与原生响应，继续使用 `contracts.Message` 和现有文本、思考、工具增量事件。`model_messages.py` 在发送前转换跨协议工具调用 ID，并同步更新工具结果的引用，不修改保存的历史。任务调度、子代理、重试、限流、取消、输出上限与统计复用同一条执行路径；ChatGPT 的令牌刷新和订阅额度处理独立于 Responses 协议转换。
+
+原生思考块和加密推理保存在模型不可见的 `_harness` 中，附带服务地址、协议、模型与消息内容的身份校验。只在来源和内容均匹配时回传，避免跨服务发送签名状态或在上下文压缩后复用失效内容。请求用量身份也包含协议和兼容选项。SSE 必须收到各协议的完成事件才被接受；仅收到文本或流被截断时仍返回可恢复的失败。
+
 
 修改代码的任务由 `task_acceptance.py` 验收：最后一次修改之后必须有一次退出状态能证明通过的检查（测试运行器、构建/类型检查、带 `assert` 的 `python -c` 或 here-document 程序、使用 `node:assert` 的 `node -e`、直接运行的测试脚本、`diff`/`cmp` 等）。只用 `&&` 串联的命令行中，退出码为零即证明其中每条命令都已成功，因此 `cd 目录 && 检查` 会被计入；管道、`;`、`||`、`&` 与换行会让退出状态不再属于检查本身，不被计入。答复时若唯一缺少的是这类未计入的检查，运行时会单独重跑一次该检查，由真实退出码决定接受或带输出退回，而不是再请求模型。只有能归因于检查本身的失败才会记为未解决的失败；运行器缺失（退出码 127、`No module named pytest` 等）表示检查没有运行，不记为失败。退回提示会写明需要重跑的失败命令及最后一次检查之后改动过的文件。
 

@@ -665,7 +665,7 @@ class EnvironmentTests(EnvironmentTestCase):
                     patch("main.load_settings", return_value=settings),
                     patch("main.McpManager", return_value=manager),
                     patch.object(manager, "connect_all") as connect,
-                    patch("main.DeepSeekClient", return_value=client),
+                    patch("main.model_client", return_value=client),
                     patch("main.Conversation", side_effect=create),
                     patch("main.Console", return_value=console),
                     patch("sys.argv", ["main.py", *arguments]),

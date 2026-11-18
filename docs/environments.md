@@ -2,7 +2,7 @@
 
 环境是一个独立的执行空间：它决定代理可用的技能、MCP 服务、工具权限和资源限制，并可以包含多个独立协作的成员代理。没有启用自定义环境时，程序保持原有的单代理行为。
 
-- **环境定义**：可复用的 JSON 配置，位于程序目录 `environments/`、用户目录 `~/.agents/environments/` 或工作区 `.agent/environments/`。资源指纹与信任机制见 [架构](architecture.md)。
+- **环境定义**：可复用的 JSON 配置，默认写入用户目录 `~/.agents/aster/environments/`（随 `ASTER_HOME` 更改），同时支持程序扩展目录 `environments/` 或工作区 `.agent/environments/`。资源指纹与信任机制见 [架构](architecture.md)。
 - **环境会话**：环境的一次运行实例。每个对话会话（`/new`、`/resume`）对应一个独立的环境会话；多代理环境的任务、消息、会议、成员上下文和事件都保存在会话里，会话之间默认互相隔离。
 
 ## 快速开始
