@@ -40,6 +40,7 @@ class ProcessSession:
     done: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
     watcher: threading.Thread | None = None
+    source_checkpoint: dict | None = None
 
     def terminate(self) -> None:
         with suppress(ProcessLookupError):
@@ -77,15 +78,16 @@ class ProcessSession:
 
     def metadata(self) -> dict:
         with self.lock:
+            finished = self.done.is_set()
             return {
                 "session_id": self.session_id,
                 "pid": self.process.pid,
                 "command": self.command[:240],
                 "command_truncated": len(self.command) > 240,
                 "cwd": str(self.cwd),
-                "state": self.state,
-                "exit_code": self.process.returncode if self.done.is_set() else None,
-                "timed_out": self.state == "timed_out",
+                "state": self.state if finished else "running",
+                "exit_code": self.process.returncode if finished else None,
+                "timed_out": finished and self.state == "timed_out",
                 "duration_seconds": round((self.ended or time.monotonic()) - self.started, 3),
                 "timeout_seconds": self.timeout,
                 "artifact_path": str(self.path),
@@ -140,7 +142,13 @@ class ProcessMonitor:
                 process.stdin.close()
                 self.sessions.pop(session.session_id, None)
                 raise
-        return self.result(session)
+        try:
+            return self.result(session)
+        except BaseException:
+            session.stop()
+            with self.lock:
+                self.sessions.pop(session.session_id, None)
+            raise
 
     def lookup(self, session_id: str) -> ProcessSession | None:
         with self.lock:
@@ -189,6 +197,14 @@ class ProcessMonitor:
                 "message": f"Command exited with code {data['exit_code']}",
             }
         return result
+
+    @staticmethod
+    def output_unavailable(session: ProcessSession, error: Exception, **details) -> ToolResult:
+        message = "Input was sent, but the output could not be read" if details else "Output could not be read"
+        return ToolResult.failure(
+            "output_unavailable", f"{message}: {error}", status="partial",
+            data={**session.metadata(), **details}, artifact_path=str(session.path),
+        )
 
     def wait(
         self,
@@ -315,19 +331,26 @@ class ProcessMonitor:
             context.cancelled.wait(min(0.2, remaining, max(0, until - time.monotonic())))
 
     def send_input(self, session: ProcessSession, text: str, offset: int) -> ToolResult:
+        encoded = text.encode("utf-8")
         with session.lock:
             if session.done.is_set() or session.process.poll() is not None:
                 return ToolResult.failure("process_exited", "The command is no longer running")
             try:
-                written = os.write(session.process.stdin.fileno(), text.encode("utf-8"))
+                written = os.write(session.process.stdin.fileno(), encoded)
             except BlockingIOError:
                 return ToolResult.failure(
                     "stdin_busy", "Command stdin is full; wait before retrying"
                 )
             except BrokenPipeError:
                 return ToolResult.failure("stdin_closed", "Command stdin is closed")
-        result = self.result(session, offset, bytes_written=written)
-        if written < len(text.encode("utf-8")):
+        try:
+            result = self.result(session, offset, bytes_written=written)
+        except (OSError, ValueError) as exc:
+            return self.output_unavailable(session, exc, bytes_written=written)
+        except BaseException:
+            session.stop()
+            raise
+        if written < len(encoded):
             result.status = "partial"
             result.error = {
                 "code": "partial_input",

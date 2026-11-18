@@ -5,7 +5,9 @@ pass kind='change'/'answer'/'inspect' and deterministic checks explicitly.
 """
 
 import ast
+import hashlib
 import json
+import os
 import re
 import shlex
 import time
@@ -14,7 +16,12 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from file_state import SOURCE_NAMES, SOURCE_SUFFIXES, file_digest, source_snapshot
+from file_state import (
+    CODE_SUFFIXES, GENERATED_DIRECTORIES, cached_file_digest, directory_identity, source_snapshot,
+    verification_file,
+)
+from source_events import SourceEvents
+from tool_runtime import command_environment
 
 # The agent cannot go on, or it waits on the user.
 INABILITY = re.compile(
@@ -84,6 +91,10 @@ HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([A-Za-z0-9_
 REVISION_SIMILARITY = 0.6
 # A word that is, or assigns, a command substitution ("x=$(git diff | wc -l)").
 SUBSTITUTION = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=)?(?:\$\(|`)")
+SHELL_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+SHELL_VARIABLE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+SHELL_RAW_WORD = re.compile(r"(?:[^\s'\"\\]+|\\.|'[^']*'|\"(?:[^\"\\]|\\.)*\")+")
+SHELL_WORD_PART = re.compile(r"[^'\"\\]+|\\.|'[^']*'|\"(?:[^\"\\]|\\.)*\"")
 TEST_ENTRY = frozenset({("unittest", "main"), ("pytest", "main"), ("doctest", "testmod")})
 
 
@@ -233,34 +244,203 @@ def _command_text(item):
     return f"{item.text}\n{body}{delimiter}"
 
 
+def shell_path_value(raw, environment, *, assignment=False):
+    """Resolve literal paths and simple local variables without evaluating shell code."""
+    def expand(part, *, quoted):
+        pieces, cursor = [], 0
+        for match in SHELL_VARIABLE.finditer(part):
+            literal = part[cursor:match.start()]
+            value = environment.get(match[1] or match[2])
+            if re.search(r"[$`]", literal) or value is None:
+                return None
+            if not quoted and not assignment and (not value or re.search(r"[\s*?\[]", value)):
+                return None
+            pieces.extend((literal, value))
+            cursor = match.end()
+        if re.search(r"[$`]", part[cursor:]):
+            return None
+        return "".join((*pieces, part[cursor:]))
+
+    pieces = []
+    for part in SHELL_WORD_PART.findall(raw):
+        if part.startswith("'"):
+            value = part[1:-1]
+        elif part.startswith('"'):
+            if "\\" in part:
+                return None
+            value = expand(part[1:-1], quoted=True)
+        elif part.startswith("\\"):
+            value = part[1:]
+        else:
+            if re.search(r"[*?\[{}<>()]", SHELL_VARIABLE.sub("", part)):
+                return None
+            if part.startswith("~") and not pieces:
+                if part != "~" and not part.startswith("~/"):
+                    return None
+                home = environment.get("HOME")
+                if not home:
+                    return None
+                part = home + part[1:]
+            value = expand(part, quoted=False)
+        if value is None:
+            return None
+        pieces.append(value)
+    return "".join(pieces)
+
+
+def cd_target(words, cwd, environment):
+    if words[:1] != ["cd"]:
+        return None
+    operands = iter(words[1:])
+    mode = None
+    for word in operands:
+        if word == "--":
+            word = next(operands, "")
+            break
+        if word in {"-L", "-P", "-LP", "-PL"}:
+            mode = word[-1]
+            continue
+        break
+    else:
+        word = '"$HOME"'
+    if not word or next(operands, None) is not None:
+        return None
+    value = shell_path_value(word, environment)
+    if not value or value.startswith("-"):
+        return None
+    path = Path(value)
+    if not path.is_absolute() and not value.startswith(("./", "../")) and value not in {".", ".."}:
+        if environment.get("CDPATH", "") != "":
+            return None
+    try:
+        if not path.is_absolute():
+            if cwd is None:
+                return None
+            if mode == "P":
+                return (Path(cwd).resolve() / path).resolve()
+            if ".." in path.parts and Path(cwd).resolve() != cwd:
+                return None
+            path = Path(cwd) / path
+        if mode == "P":
+            return path.resolve()
+        logical = Path(os.path.normpath(path))
+        if mode is None and ".." in path.parts and logical.resolve() != path.resolve():
+            return None
+        return logical
+    except (OSError, RuntimeError):
+        return None
+
+
+def update_shell_environment(words, environment):
+    if words[:1] == ["unset"]:
+        for name in words[1:]:
+            environment[name] = ""
+        return True
+    exported = words[:1] == ["export"]
+    assignments = [SHELL_ASSIGNMENT.fullmatch(word) for word in words[1 if exported else 0:]]
+    if not words or (not exported and not all(assignments)):
+        if not words or not SUBSTITUTION.match(words[0]) or assignments[0] is None:
+            return False
+        environment[assignments[0][1]] = None
+        return True
+    for assignment in assignments:
+        if assignment is not None:
+            name, value = assignment.groups()
+            environment[name] = shell_path_value(value, environment, assignment=True)
+    return True
+
+
+@dataclass(frozen=True)
+class ShellStep:
+    command: ShellCommand
+    words: list[str]
+    directory: Path | None
+    target: Path | None
+    changes_directory: bool
+    updates_environment: bool
+
+
+def shell_steps(command, cwd):
+    commands = parse_shell(command)
+    if commands is None:
+        return []
+    environment = command_environment()
+    inherited_pwd = Path(environment.get("PWD", ""))
+    if cwd is not None and inherited_pwd.is_absolute():
+        try:
+            if inherited_pwd.samefile(cwd):
+                cwd = inherited_pwd
+        except OSError:
+            pass
+    environment["PWD"] = str(cwd) if cwd is not None else None
+    steps = []
+    succeeded, failed = {cwd}, set()
+    for position, item in enumerate(commands):
+        raw_words = SHELL_RAW_WORD.findall(item.text)
+        words = command_words(item.words)
+        following = commands[position + 1].operator if position + 1 < len(commands) else None
+        persistent = item.operator not in {"|", "|&"} and following not in {"|", "|&", "&"}
+        if item.operator == "&&":
+            candidates, skipped_success, skipped_failure = succeeded, set(), failed
+        elif item.operator == "||":
+            candidates, skipped_success, skipped_failure = failed, succeeded, set()
+        else:
+            candidates, skipped_success, skipped_failure = succeeded | failed, set(), set()
+        directory = next(iter(candidates)) if len(candidates) == 1 else None
+        plain_cd = raw_words[:1] == ["cd"]
+        changes_directory = (
+            plain_cd or item.words[:1] in {("cd",), ("pushd",), ("popd",)} or words[:1] == ["cd"]
+        )
+        target = cd_target(raw_words, directory, environment) if plain_cd else None
+        updated = dict(environment)
+        assignment = update_shell_environment(raw_words, updated)
+        steps.append(ShellStep(item, words, directory, target, changes_directory, assignment))
+        succeeded = skipped_success | ({target} if persistent and changes_directory else candidates)
+        failed = skipped_failure | candidates
+        if persistent and assignment:
+            if skipped_success or skipped_failure or following == "||":
+                environment.update({
+                    key: None for key in updated if updated[key] != environment.get(key)
+                })
+            else:
+                environment = updated
+        if persistent and changes_directory:
+            environment.update(PWD=None, OLDPWD=None)
+    return steps
+
+
 def standalone_checks(command, cwd):
     """Each check of a command line, alone with the setup "&&" chained before it.
 
     "pytest -q | tail -5" becomes "pytest -q"; "cd app && npm test; echo $?" becomes
     "cd app && npm test". Earlier checks, pipelines and here-documents are not setup.
     """
-    commands = parse_shell(command)
-    if commands is None:
-        return []
-    forms, directory = [], cwd
-    for position, item in enumerate(commands):
-        words = command_words(item.words)
-        if words[:1] == ["cd"] and len(words) == 2:
-            target = Path(directory) / Path(words[1]).expanduser()
-            directory = target.resolve() if target.is_dir() else directory
-            continue
-        if item.operator in {"|", "|&"} or not check_words(words, item.stdin, directory):
+    steps = shell_steps(command, cwd)
+    forms, setup_steps = [], set()
+    for position, step in enumerate(steps):
+        item = step.command
+        if step.changes_directory or step.updates_environment:
+            setup_steps.add(position)
+        if step.directory is None or item.operator in {"|", "|&"} or not check_words(
+            step.words, item.stdin, step.directory,
+        ):
             continue  # Not a check, or it reads another command's output.
         start = position
         while (
             start > 0
-            and commands[start].operator == "&&"
-            and commands[start - 1].operator in {None, "&&"}
-            and commands[start - 1].heredoc is None
-            and not check_words(command_words(commands[start - 1].words), commands[start - 1].stdin)
+            and steps[start].command.operator == "&&"
+            and steps[start - 1].command.operator in {None, "&&"}
+            and steps[start - 1].command.heredoc is None
+            and not check_words(
+                steps[start - 1].words, steps[start - 1].command.stdin, steps[start - 1].directory,
+            )
         ):
             start -= 1
-        forms.append(" && ".join(_command_text(part) for part in commands[start : position + 1]))
+        if any(change < start for change in setup_steps):
+            continue
+        if any(setup.changes_directory and setup.target is None for setup in steps[start:position]):
+            continue
+        forms.append(" && ".join(_command_text(part.command) for part in steps[start:position + 1]))
     return forms
 
 
@@ -270,7 +450,7 @@ def command_words(words):
     if any(SUBSTITUTION.match(word) for word in words):
         return []  # A command substitution runs a command this line does not show.
     while words:
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] in WRAPPERS:
+        if SHELL_ASSIGNMENT.fullmatch(words[0]) or words[0] in WRAPPERS:
             words.pop(0)
         elif words[0] == "timeout":
             words.pop(0)
@@ -441,6 +621,9 @@ class TaskContract:
     kind: str = "auto"
     checks: tuple[Callable[[], str | None], ...] = ()
     description: str = ""
+    verification_required: bool = False
+    background_handoff: bool = True
+    integrate_team: bool = False
 
 
 @dataclass
@@ -454,7 +637,7 @@ class TaskAcceptance:
     # Other agents (team members) whose limitations the answer may report.
     others: tuple[str, ...] = ()
     # Suffixes of files whose own edits need a check.
-    suffixes: frozenset[str] = SOURCE_SUFFIXES
+    suffixes: frozenset[str] = CODE_SUFFIXES
     # Tools that cannot change files (read, grep, ...) skip the workspace walk. A change
     # something else makes meanwhile is found by the next walk: before any edit, command
     # or check, and at validation.
@@ -462,6 +645,9 @@ class TaskAcceptance:
     # File digests by identity, shared across a conversation's turns so that each new
     # task does not hash the whole workspace again.
     digest_cache: dict | None = None
+    configuration_paths: tuple[Path, ...] = ()
+    defer_baseline: bool = False
+    prepare_exec: Callable[[], None] | None = None
 
     def __post_init__(self):
         self.kind = self.contract.kind
@@ -499,16 +685,16 @@ class TaskAcceptance:
                 if self.has_tools and action and not discussion and not writing
                 else "answer"
             )
-        self.handoff_allowed = bool(HANDOFF.search(self.prompt))
+        self.handoff_allowed = self.contract.background_handoff and bool(HANDOFF.search(self.prompt))
         self.status = "in_progress"
         self.evidence = []
         self.check_results = []
         self.last_code_change = -1
         self.last_verification = -1
-        self.code_revision = 0
+        self.code_revision = int(self.contract.verification_required)
         self.verified_revision = -1
         self.failed_verifications = {}
-        # Evidence indexes of this agent's own latest successful source write/edit and of
+        # Evidence indexes of this agent's latest own source change and of
         # where its latest passing standalone check started (a background check finishes
         # later), whatever the code revision then was.
         self.last_own_edit = -1
@@ -522,22 +708,70 @@ class TaskAcceptance:
         self.reruns = []
         self._rerun = set()
         self._roots = {self.workspace.resolve()} if self.workspace is not None else set()
-        self._extra_files = set()
+        self._extra_files = {path.absolute() for path in self.configuration_paths}
+        self._own_paths = set()
+        self._integrating_team = False
+        self._background_exec = set()
+        self.observed_processes = set()
         self._tracking_error = None
         self._snapshot_cache = self.digest_cache if self.digest_cache is not None else {}
-        self._files = self._snapshot() if self.kind == "change" and self._roots else None
-        # The files as they were before this task, to tell its own scratch files apart.
-        self._initial_files = dict(self._files) if self._files is not None else None
+        self._files = None
+        self._identities = {}
+        self._directory_identities = None
+        self._verification_files = ({}, None, None)
+        self._has_prior_source = False
+        if not self.defer_baseline:
+            self.begin()
 
-    def _snapshot(self):
+    def begin(self, *, team_pending=False, team_active=False, prior_revision=None):
+        self._integrating_team |= team_pending and (
+            self.contract.kind != "answer" or self.contract.integrate_team
+        )
+        if (
+            self.kind == "change" or self.contract.verification_required or self._integrating_team
+            or self._has_prior_source
+        ):
+            self._refresh_files(start=True)
+        if prior_revision and self._files is not None:
+            if self._revision_digest(self._files) != prior_revision["digest"]:
+                self.code_revision = max(self.code_revision, 1)
+        if team_active and self.integrates_team:
+            self.code_revision = max(self.code_revision, 1)
+
+    def _relevant(self, path):
+        return path in self._extra_files or verification_file(path, self.suffixes)
+
+    def _extra_digest(self, path, identities):
+        target = path.resolve()
+        digest = cached_file_digest(
+            path, self._snapshot_cache, self._check_deadline, mode_aware=True, identities=identities,
+        )
+        if target != path.resolve():
+            raise OSError(f"Configuration or source link changed while being tracked: {path}")
+        if target == path:
+            return digest
+        if identities is not None:
+            try:
+                modified = path.lstat().st_ctime_ns
+            except FileNotFoundError:
+                modified = None
+            identities[str(path)] = (target, modified, identities.get(str(path)))
+        return json.dumps([str(target), digest])
+
+    def _snapshot(self, identities=None, directory_identities=None):
         files = source_snapshot(
             self._roots,
             ignored=self.ignored_paths,
             deadline=self.deadline,
             cache=self._snapshot_cache,
+            relevant=lambda path: path not in self._extra_files and self._relevant(path),
+            identities=identities,
+            directory_identities=directory_identities,
         )
         for path in self._extra_files:
-            digest = file_digest(path, self._check_deadline)
+            if directory_identities is not None and path.parent not in directory_identities:
+                directory_identity(path.parent, directory_identities)
+            digest = self._extra_digest(path, identities)
             if digest is not None:
                 files[str(path)] = digest
         return files
@@ -546,84 +780,158 @@ class TaskAcceptance:
         if self.deadline is not None and time.monotonic() >= self.deadline:
             raise TimeoutError("Task deadline reached while tracking file changes")
 
-    def _refresh_files(self):
-        if self._files is None:
+    def _invalidate_verification(self):
+        self.verified_revision = -1
+        self.last_passed_check = -1
+
+    def _tracking_failed(self, error):
+        self._tracking_error = self._tracking_error or str(error) or type(error).__name__
+        self._invalidate_verification()
+
+    def _refresh_files(self, *, own=False, start=False, watch_directories=False):
+        if not self._roots or (self._files is None and not start):
             return []
         try:
-            current = self._snapshot()
+            identities = {}
+            directories = {} if watch_directories else None
+            current = self._snapshot(identities, directories)
+        except (TimeoutError, KeyboardInterrupt) as exc:
+            self._tracking_failed(exc)
+            raise
         except OSError as exc:
-            self._tracking_error = str(exc)
+            self._tracking_failed(exc)
             return []
-        self._tracking_error = None
+        self._identities = identities
+        self._directory_identities = directories
+        if self._files is None:
+            self._files = current
+            return []
         changed = sorted(
             path
             for path in self._files.keys() | current.keys()
             if self._files.get(path) != current.get(path)
         )
-        verified = self.verified_revision == self.code_revision
-        if changed and not (verified and self._scratch_removed(changed, current)):
+        self._files = current
+        if own:
+            self._own_paths.update(changed)
+        elif (
+            self.kind != "change" and not self._own_paths and not self._integrating_team
+            and not self.contract.verification_required and not self._has_prior_source
+        ):
+            changed = []
+        if changed:
             self.code_revision += 1
             self.last_code_change = len(self.evidence)
             self._changed(changed)
-        self._files = current
+            if own or any(path in self._own_paths for path in changed):
+                self.last_own_edit = len(self.evidence)
         return changed
 
-    def _scratch_removed(self, changed, current):
-        """True when the change only deletes files this task created and nothing uses.
-
-        A check script written, run and deleted again after a passing check leaves the
-        checked code as it was, so the check still holds.
-        Code that used such a file must have been written during this task too, so only
-        files changed since the task began are searched for its name.
-        """
-        if self._initial_files is None or any(
-            path in current or path in self._initial_files for path in changed
-        ):
-            return False
-        names = re.compile(
-            r"\b(?:" + "|".join(re.escape(Path(path).stem) for path in changed) + r")\b"
-        )
-        for path, digest in current.items():
-            if self._initial_files.get(path) == digest:
-                continue
-            try:
-                if Path(path).stat().st_size > 2_000_000 or names.search(
-                    Path(path).read_text(encoding="utf-8", errors="replace")
-                ):
-                    return False
-            except OSError:
-                return False
-        return True
-
-    def before_tool(self, call):
+    @staticmethod
+    def _arguments(call):
         function = call.get("function", {})
-        if function.get("name") not in self.passive_tools:
-            self._refresh_files()
         try:
             arguments = json.loads(function.get("arguments") or "{}")
         except (TypeError, ValueError):
-            arguments = {}
-        if self._files is not None and isinstance(arguments, dict):
-            if function.get("name") == "exec" and isinstance(arguments.get("cwd"), str):
-                root = (self.workspace / Path(arguments["cwd"]).expanduser()).resolve()
-                if not any(root.is_relative_to(existing) for existing in self._roots):
-                    files = source_snapshot(
-                        (root,), deadline=self.deadline, cache=self._snapshot_cache
-                    )
-                    self._files.update(files)
-                    for path, digest in files.items():
-                        self._initial_files.setdefault(path, digest)
-                    self._roots.add(root)
-            if function.get("name") in {"write", "edit"} and isinstance(arguments.get("path"), str):
+            return {}
+        if not isinstance(arguments, dict):
+            return {}
+        return {
+            key: value for key, value in arguments.items()
+            if key not in {"command", "cwd", "path"} or isinstance(value, str)
+        }
+
+    def _tracks_tool(self, name, arguments):
+        if name in self.passive_tools | {"read", "grep", "find", "ls", "update_plan", "ask_user"}:
+            return False
+        if name == "mcp" and arguments.get("action") == "status":
+            return False
+        if name == "monitor" and arguments.get("action") in ("watch", "list"):
+            return False
+        if name == "monitor" and arguments.get("action") in ("status", "wait"):
+            session = arguments.get("session_id")
+            return isinstance(session, str) and session in self._background_exec
+        if name == "team" and self._files is None and self.kind != "change":
+            return self._team_integration_call(arguments)
+        return True
+
+    def _team_integration_call(self, arguments):
+        return (
+            (self.contract.kind != "answer" or self.contract.integrate_team)
+            and arguments.get("action") in (
+                "send_message", "create_task", "update_task", "request_review", "start_protocol",
+                "contribute", "conclude", "spawn_agent", "cancel", "wait",
+            )
+        )
+
+    def _extend_root(self, root):
+        if any(root.is_relative_to(existing) for existing in self._roots):
+            return
+        identities = {}
+        files = source_snapshot(
+            (root,), ignored=self.ignored_paths, deadline=self.deadline,
+            cache=self._snapshot_cache, relevant=self._relevant, identities=identities,
+            directory_identities=self._directory_identities,
+        )
+        for path, digest in files.items():
+            if Path(path) not in self._extra_files and not any(
+                Path(path).is_relative_to(existing) for existing in self._roots
+            ):
+                self._files[path] = digest
+                if path in identities:
+                    self._identities[path] = identities[path]
+        self._roots = {existing for existing in self._roots if not existing.is_relative_to(root)}
+        self._roots.add(root)
+
+    def _extend_scope(self, name, arguments, process_cwd):
+        if self.workspace is None:
+            return
+        try:
+            if process_cwd is not None:
+                self._extend_root(process_cwd)
+            if name == "exec":
+                directory = self._command_cwd(arguments)
+                self._extend_root(directory)
+                for step in shell_steps(arguments.get("command", ""), directory):
+                    if step.target is not None:
+                        self._extend_root(step.target.resolve())
+                    elif step.changes_directory:
+                        self._tracking_failed("Shell working directory could not be resolved before execution")
+            if name in {"write", "edit"} and "path" in arguments:
                 path = (self.workspace / Path(arguments["path"]).expanduser()).resolve()
-                if path.suffix.lower() in SOURCE_SUFFIXES or path.name in SOURCE_NAMES:
-                    if str(path) not in self._files:
-                        digest = file_digest(path, self._check_deadline)
-                        if digest is not None:
-                            self._files[str(path)] = digest
-                            self._initial_files.setdefault(str(path), digest)
+                if self._relevant(path) and str(path) not in self._files and path not in self._extra_files:
+                    digest = self._extra_digest(path, self._identities)
+                    if digest is not None:
+                        self._files[str(path)] = digest
                     self._extra_files.add(path)
+        except (TimeoutError, KeyboardInterrupt) as exc:
+            self._tracking_failed(exc)
+            raise
+        except OSError as exc:
+            self._tracking_failed(exc)
+
+    def before_tool(self, call, *, process_cwd=None):
+        name = call.get("function", {}).get("name")
+        arguments = self._arguments(call)
+        if name == "team" and self._team_integration_call(arguments):
+            self._integrating_team = True
+        if self._tracks_tool(name, arguments):
+            if name == "exec" and self.prepare_exec is not None:
+                self.prepare_exec()
+            self._refresh_files(
+                own=bool(self._background_exec), start=True, watch_directories=name == "exec",
+            )
+            if self._files is not None:
+                self._extend_scope(name, arguments, process_cwd)
         self._verification_start = self.code_revision
+        events = None
+        if name == "exec" and self._directory_identities and not self._tracking_error:
+            command, cwd = arguments.get("command", ""), self._command_cwd(arguments)
+            if self.shell_checks(command, cwd)[1]:
+                events = SourceEvents(self._directory_identities, deadline=self.deadline)
+        self._verification_files = (
+            (dict(self._identities), self._directory_identities, events) if name == "exec" else ({}, None, None)
+        )
 
     def instructions(self):
         parts = []
@@ -634,7 +942,67 @@ class TaskAcceptance:
             )
         if self.contract.description:
             parts.append("Acceptance criteria: " + self.contract.description)
+        if self.contract.verification_required or self.code_revision:
+            parts.append(
+                "Earlier source changes still require verification. Inspect them and run a relevant "
+                "check before claiming completion."
+            )
         return "\n".join(parts)
+
+    def background_sessions(self) -> tuple[str, ...]:
+        return tuple(sorted(self._background_exec))
+
+    def source_checkpoint(self):
+        digest = self._revision_digest(self._files) if self._files is not None else None
+        return {**self.source_scope(), "digest": None if self._tracking_error else digest}
+
+    def resume_process(self, session_id, checkpoint):
+        if session_id in self.observed_processes:
+            return
+        self.observed_processes.add(session_id)
+        if session_id in self._background_exec:
+            return
+        self._background_exec.add(session_id)
+        self.include_source_scope(checkpoint)
+        self._refresh_files(own=True, start=True)
+        digest = self.source_checkpoint()["digest"]
+        unchanged = digest is not None and digest == checkpoint["digest"]
+        if not unchanged:
+            self.code_revision += 1
+            self._invalidate_verification()
+            self.last_own_edit = len(self.evidence)
+            self.reruns = []
+
+    @staticmethod
+    def _revision_digest(files):
+        return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+    def verified_source(self):
+        if self.status != "completed" or not self.code_revision or self._files is None:
+            return None
+        return {
+            "digest": self._revision_digest(self._files),
+            **self.source_scope(),
+        }
+
+    def source_scope(self):
+        return {
+            "roots": sorted(map(str, self._roots)),
+            "paths": sorted(map(str, self._extra_files)),
+        }
+
+    def include_source_scope(self, scope):
+        self._roots.update(Path(path) for path in scope["roots"])
+        self._extra_files.update(Path(path) for path in scope["paths"])
+        self._has_prior_source = True
+
+    def source_matches(self, revision):
+        self.include_source_scope(revision)
+        return self._revision_digest(self._snapshot()) == revision["digest"]
+
+    @property
+    def integrates_team(self):
+        return self._integrating_team or self.kind == "change" or self.contract.integrate_team
 
     @staticmethod
     def verification_command(command, cwd=None):
@@ -646,63 +1014,103 @@ class TaskAcceptance:
             return False
         return check_words(command_words(words), None, cwd)
 
+    def _source_touched_by_check(self, verification_files):
+        files, directories, events = verification_files
+        if files != self._identities:
+            return True
+        current = self._directory_identities
+        if directories == current:
+            return False
+        if events is None or not directories or not current or directories.keys() != current.keys():
+            return True
+        dirty = {path for path in directories if directories[path] != current[path]}
+        if any(directories[path][:2] != current[path][:2] for path in dirty):
+            return True
+        paths, complete = events.finish()
+        self._check_deadline()
+        if not complete:
+            return True
+        ignored = {path.resolve() for path in self.ignored_paths}
+        explained = set()
+        for path, is_directory, entry in paths:
+            if path in self._extra_files:
+                return True
+            for directory in (path, *path.parents):
+                if directory in directories:
+                    if is_directory:
+                        if entry:
+                            return True
+                    elif self._relevant(path) or not (path.suffix or path.name.startswith(".")):
+                        return True
+                    elif entry:
+                        explained.add(path.parent)
+                    break
+                if directory in ignored or (
+                    directory.name in GENERATED_DIRECTORIES and (directory != path or is_directory)
+                ):
+                    if directory == path and entry:
+                        explained.add(directory.parent)
+                    break
+        return not dirty <= explained
+
     def observe(self, call, result):
         self.status = "in_progress"
         function = call.get("function", {})
-        try:
-            arguments = json.loads(function.get("arguments") or "{}")
-        except (ValueError, TypeError):
-            arguments = {}
-        if not isinstance(arguments, dict):
-            arguments = {}
-        # A malformed call (e.g. a command given as a list) is no edit and no check.
-        arguments = {
-            key: value
-            for key, value in arguments.items()
-            if key not in {"command", "path", "cwd"} or isinstance(value, str)
-        }
+        arguments = self._arguments(call)
+        name = function.get("name")
+        data = result.get("data") or {}
+        advances_process = name == "exec" or (name == "monitor" and arguments.get("action") == "input")
+        if advances_process and data.get("state") == "running" and data.get("session_id"):
+            self._background_exec.add(data["session_id"])
         record = {
             "tool_call_id": call.get("id"),
-            "tool": function.get("name"),
+            "tool": name,
             "status": result.get("status"),
             "artifact_path": result.get("artifact_path"),
         }
-        self.evidence.append(record)
-        index = len(self.evidence) - 1
-        own_source_edit = (
-            result.get("status") == "ok"
-            and function.get("name") in {"write", "edit"}
-            and (
-                Path(arguments.get("path", "")).suffix.lower() in self.suffixes
-                or Path(arguments.get("path", "")).name in SOURCE_NAMES
+        index = len(self.evidence)
+        pending_check = name == "monitor" and data.get("session_id") in self.pending_verifications
+        changed = (
+            self._refresh_files(
+                own=name != "team" or bool(self._background_exec),
+                watch_directories=name == "exec" or pending_check,
             )
+            if self._tracks_tool(name, arguments) else []
         )
-        if own_source_edit:
-            self.last_own_edit = index
-        changed = [] if function.get("name") in self.passive_tools else self._refresh_files()
         if changed:
             record["changed_files"] = changed
-        if self._files is None and own_source_edit:
+        if self._tracking_error:
+            record["tracking_error"] = self._tracking_error
+        self.evidence.append(record)
+        if (
+            self.workspace is None and result.get("status") == "ok"
+            and name in {"write", "edit"} and self._relevant(Path(arguments.get("path", "")))
+        ):
             self.code_revision += 1
             self.last_code_change = index
+            self.last_own_edit = index
             self._changed([arguments.get("path", "")])
         record["code_revision"] = self.code_revision
         verification_start = self._verification_start
+        verification_files = self._verification_files
+        self._verification_files = ({}, None, None)
         started_at = index
         verification_result = result
-        data = result.get("data") or {}
-        if function.get("name") == "monitor":
+        if name == "monitor":
             pending = self.pending_verifications.get(data.get("session_id"))
-            if pending and data.get("state") in {"completed", "failed", "timed_out", "stopped"}:
-                arguments, verification_start, started_at = self.pending_verifications.pop(
-                    data["session_id"]
+            finished = data.get("state") in {"completed", "failed", "timed_out", "stopped"}
+            if finished:
+                self._background_exec.discard(data.get("session_id"))
+            if pending and finished:
+                arguments, verification_start, started_at, verification_files = (
+                    self.pending_verifications.pop(data["session_id"])
                 )
                 record["verification_session_id"] = data["session_id"]
                 verification_result = {"status": "ok" if data["state"] == "completed" else "error"}
         command = arguments.get("command", "")
         checks, proven, attributable, leading = (
             self.shell_checks(command, self._command_cwd(arguments))
-            if function.get("name") == "exec" or "verification_session_id" in record
+            if name == "exec" or "verification_session_id" in record
             else ([], False, False, False)
         )
         if checks and data.get("state") == "running" and data.get("session_id"):
@@ -710,17 +1118,32 @@ class TaskAcceptance:
                 dict(arguments),
                 verification_start,
                 index,
+                verification_files,
             )
             record["verification_pending"] = True
         elif checks:
             record["verification"] = True
             if verification_result.get("status") == "ok" and proven:
-                for identity, _words, inline in checks:
-                    self.failed_verifications.pop(identity, None)
-                    if inline is not None:
-                        self._settle_revisions(*inline)
-                self.last_passed_check = started_at
-                if self._files is None or verification_start == self.code_revision:
+                if (
+                    verification_start == self.code_revision
+                    and self._source_touched_by_check(verification_files)
+                ):
+                    record["verification_source_touched"] = True
+                    self.code_revision += 1
+                    record["code_revision"] = self.code_revision
+                    self.last_code_change = index
+                    self.last_own_edit = index
+                    self._changed(())
+                    self._invalidate_verification()
+                elif (
+                    not changed and not self._tracking_error and not self._background_exec
+                    and verification_start == self.code_revision
+                ):
+                    for identity, _, inline in checks:
+                        self.failed_verifications.pop(identity, None)
+                        if inline is not None:
+                            self._settle_revisions(*inline)
+                    self.last_passed_check = started_at
                     self.last_verification = index
                     self.verified_revision = self.code_revision
                     self.unverified_changes = []
@@ -729,7 +1152,7 @@ class TaskAcceptance:
                 # Composition may hide a failure ("pytest | tail", "pytest || true").
                 record["verification_untrusted"] = UNTRUSTED_CHECK
                 if leading:
-                    self.verified_revision = -1
+                    self._invalidate_verification()
                 self._offer_rerun(command, arguments, verification_start)
             elif attributable and (unavailable := check_unavailable(checks[0][1], data)):
                 # The runner is missing: no check ran, so nothing failed or passed.
@@ -739,11 +1162,11 @@ class TaskAcceptance:
                 if checks[0][2] is not None:
                     record["runner"], record["program"] = checks[0][2]
                 self.failed_verifications[checks[0][0]] = record
-                self.verified_revision = -1
+                self._invalidate_verification()
             else:
                 # Some command of the line failed, perhaps the check: it verifies nothing.
                 record["verification_untrusted"] = UNTRUSTED_CHECK
-                self.verified_revision = -1
+                self._invalidate_verification()
                 self._offer_rerun(command, arguments, verification_start)
 
     def _settle_revisions(self, runner, program):
@@ -782,7 +1205,8 @@ class TaskAcceptance:
         pending check, and the model itself ran these checks after its last change.
         """
         if (
-            self.kind != "change"
+            not self.code_revision
+            or self._tracking_error
             or self.failed_verifications
             or self.pending_verifications
             or self.verified_revision == self.code_revision
@@ -809,22 +1233,22 @@ class TaskAcceptance:
         most behind "cd" into existing directories. ``leading``: the line starts with a
         check.
         """
-        commands = parse_shell(command)
-        if commands is None:
+        steps = shell_steps(command, cwd)
+        if not steps:
             return [], False, False, False
-        directory = cwd
         checks = []
-        proven = attributable = all(item.operator in {None, "&&", "|"} for item in commands)
-        for position, item in enumerate(commands):
-            words = command_words(item.words)
-            following = commands[position + 1].operator if position + 1 < len(commands) else None
-            if words[:1] == ["cd"] and not checks and following in {None, "&&"}:
-                target = Path(directory) / Path(words[1]).expanduser() if len(words) == 2 else None
-                if target is not None and target.is_dir():
-                    directory = target.resolve()
-                else:
+        proven = attributable = all(step.command.operator in {None, "&&", "|"} for step in steps)
+        for position, step in enumerate(steps):
+            item, words, directory = step.command, step.words, step.directory
+            following = steps[position + 1].command.operator if position + 1 < len(steps) else None
+            if step.changes_directory:
+                if step.target is None:
+                    proven = False
+                if step.target is None or checks or not step.target.is_dir() or following not in {None, "&&"}:
                     attributable = False
             elif check_words(words, item.stdin, directory):
+                if directory is None:
+                    proven = attributable = False
                 if following in {"|", "|&"}:
                     proven = False  # Only a pipeline's last command sets its status.
                 if {following, item.operator} & {"|", "|&"}:
@@ -839,9 +1263,7 @@ class TaskAcceptance:
                 )
             else:
                 attributable = False  # Another command may be what failed.
-        leading = bool(checks) and check_words(
-            command_words(commands[0].words), commands[0].stdin, cwd
-        )
+        leading = bool(checks) and check_words(steps[0].words, steps[0].command.stdin, cwd)
         return checks, proven and bool(checks), attributable and len(checks) == 1, leading
 
     @staticmethod
@@ -915,6 +1337,14 @@ class TaskAcceptance:
         not final yet, so they are not required to be verified now.
         """
         self.status = "in_progress"
+        self._refresh_files(own=bool(self._background_exec))
+        if self._tracking_error:
+            self.status = "incomplete"
+            return (
+                "Cannot verify the final code revision because file tracking failed: "
+                + self._tracking_error
+                + ". Inspect the actual workspace before retrying."
+            )
         text = content.strip()
         blocked = self.reports_blocker(text)
         work_task = (
@@ -942,9 +1372,18 @@ class TaskAcceptance:
             e["status"] == "ok" for e in self.evidence
         ):
             return "No successful tool evidence supports completion of this task. Inspect and perform the requested work, or state the concrete blocker."
-        if background:
+        if self._background_exec and not (self.handoff_allowed and self.last_own_edit < 0):
+            return (
+                "A background command is still running and can change the workspace. Use monitor "
+                "to observe its terminal result before reporting completion, or stop it if no longer needed."
+            )
+        if background or self._background_exec:
             # Teammates' unfinished edits are not final yet, but this agent's own are.
-            if self.kind == "change" and self.last_passed_check < self.last_own_edit:
+            if self.contract.verification_required and self.verified_revision != self.code_revision:
+                return "Verify the unverified source changes from earlier rounds before handing off."
+            if self.last_own_edit >= 0 and (
+                self.last_passed_check < self.last_own_edit or self.failed_verifications
+            ):
                 return (
                     "You changed files yourself: verify your own change with a relevant "
                     "standalone test/build/assertion before answering, even though members "
@@ -953,22 +1392,28 @@ class TaskAcceptance:
             # Contract checks judge finished work; this turn hands work off instead.
             self.status = "background"
             return None
-        self._refresh_files()
-        if self.kind == "change" and self._tracking_error:
-            return (
-                "Cannot verify the final code revision because file tracking failed: "
-                + self._tracking_error
-            )
-        if self.kind == "change":
+        if self.kind == "change" or self.code_revision:
             problem = self.verification_problem()
             if problem:
                 return problem
         self.check_results = []
+        if self.contract.checks:
+            revision = self.code_revision
+            self._refresh_files(start=True, watch_directories=True)
+            if self.code_revision != revision:
+                return "The source revision changed before acceptance; rerun checks on the final revision."
+        contract_identities = (self._identities, self._directory_identities)
         for check in self.contract.checks:
             try:
-                problem = check()
+                problem = self.validate_callback(check)
+            except TimeoutError:
+                raise
             except Exception as exc:
                 problem = f"{type(exc).__name__}: {exc}"
+            if problem is None and (self._identities, self._directory_identities) != contract_identities:
+                self._invalidate_verification()
+                self.check_results = []
+                return "The source revision changed during acceptance; rerun all checks on the final revision."
             self.check_results.append(
                 {
                     "name": getattr(check, "__name__", "acceptance"),
@@ -980,6 +1425,21 @@ class TaskAcceptance:
                 return "Task acceptance failed: " + problem
         self.status = "completed"
         return None
+
+    def validate_callback(self, callback):
+        self._refresh_files(start=True, watch_directories=True)
+        before = (self._identities, self._directory_identities)
+        try:
+            problem = callback()
+        finally:
+            changed = self._refresh_files(own=True, watch_directories=True)
+        if self._tracking_error:
+            self.status = "incomplete"
+            return "Cannot verify the final code revision: " + self._tracking_error
+        if changed or before != (self._identities, self._directory_identities):
+            self._invalidate_verification()
+            return "Acceptance checks changed source files; they did not verify the resulting revision."
+        return problem
 
     def verification_problem(self, *, monitored=True):
         """What leaves the latest code revision unverified, or None.
@@ -1013,6 +1473,13 @@ class TaskAcceptance:
             and self.verified_revision != self.code_revision
             and not self.contract.checks
         ):
+            if any(record.get("verification_source_touched") for record in self.evidence):
+                return (
+                    "Code has no successful verification: source files were touched while the check ran. "
+                    "Run a check that leaves the source unchanged, including files it temporarily "
+                    "creates, replaces or restores. Put temporary output outside tracked source directories."
+                    + self._changes_note()
+                )
             if any(
                 record.get("verification_untrusted")
                 for record in self.evidence[max(self.last_code_change, 0) :]
@@ -1047,8 +1514,18 @@ class TaskAcceptance:
         return {
             "kind": self.kind,
             "status": self.status,
+            **({"handoff_source": self.source_checkpoint()} if self.status == "background" else {}),
             "evidence": self.evidence,
             "checks": self.check_results,
             "code_revision": self.code_revision,
             "verified_revision": self.verified_revision,
+            "verification_required": bool(
+                self._tracking_error or self.failed_verifications or self.pending_verifications
+                or self._background_exec
+                or (
+                    self.code_revision and self.verified_revision != self.code_revision
+                    and not (self.status == "completed" and self.check_results)
+                )
+            ),
+            **({"tracking_error": self._tracking_error} if self._tracking_error else {}),
         }

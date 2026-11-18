@@ -51,9 +51,17 @@ class GoalState:
     last_fingerprint: str = ""
     repeated_rounds: int = 0
     reason: str = ""
+    verification_required: bool = False
+    verified_source: dict | None = None
+    source_scope: dict | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        if self.verified_source is None:
+            del data["verified_source"]
+        if self.source_scope is None:
+            del data["source_scope"]
+        return data
 
     @classmethod
     def from_dict(cls, data: dict, *, restoring=False) -> "GoalState":
@@ -79,13 +87,36 @@ class GoalState:
             "last_fingerprint": text,
             "repeated_rounds": integer,
             "reason": text,
+            "verification_required": {"type": "boolean"},
+            "source_scope": {
+                "type": "object",
+                "properties": {
+                    "roots": {"type": "array", "items": text},
+                    "paths": {"type": "array", "items": text},
+                },
+                "required": ["roots", "paths"],
+                "additionalProperties": False,
+            },
+            "verified_source": {
+                "type": "object",
+                "properties": {
+                    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "roots": {"type": "array", "items": text},
+                    "paths": {"type": "array", "items": text},
+                },
+                "required": ["digest", "roots", "paths"],
+                "additionalProperties": False,
+            },
         }
         validate(
             data,
             {
                 "type": "object",
                 "properties": properties,
-                "required": list(properties),
+                "required": [
+                    name for name in properties
+                    if name not in {"verification_required", "verified_source", "source_scope"}
+                ],
                 "additionalProperties": False,
             },
             "goal",

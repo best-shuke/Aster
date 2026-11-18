@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import nullcontext
@@ -13,12 +14,14 @@ from deepseek_client import CompletionError
 from goal_runtime import GoalRuntime, prepare_goal
 from goals import GoalCommand, GoalState, parse_goal
 from main import handle_command
+from task_acceptance import TaskContract
 from tests.support import make_settings
 from tests.team_support import Steps, TeamScript, say, team, use
 from tests.test_conversation import FakeClient
 from tests.test_environments import EnvironmentTestCase
 from tests.test_team_runtime import TeamTestCase
 from tests.test_tools import python_command
+from tool_runtime import ExecutionContext
 from tools import CodingTools
 from ui import Console
 
@@ -183,6 +186,130 @@ class GoalRuntimeTests(unittest.TestCase):
         self.assertEqual(GoalRuntime(conversation).run().status, "completed")
         self.assertIn("42", (self.workspace / "feature.py").read_text())
         self.assertEqual(len(conversation.client.requests), 7)
+
+    def test_analysis_goal_round_cannot_accept_an_unverified_source_change(self):
+        conversation = self.conversation(
+            use("write", path="feature.py", content="answer = 42\n"),
+            say("已完成。"),
+            use("exec", command=python_command("from feature import answer; assert answer == 42")),
+            say("已修复并通过验证。"),
+            assessment(),
+            tools=True,
+        )
+        self.start(conversation, "先分析问题再修复 feature.py")
+        self.assertEqual(GoalRuntime(conversation).run().status, "completed")
+        self.assertEqual(conversation.last_outcome["kind"], "answer")
+        self.assertEqual(len(conversation.client.requests), 5)
+
+    def test_later_goal_round_preserves_source_outside_the_workspace(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        external = Path(temporary.name).resolve() / "feature.py"
+        conversation = self.conversation(
+            use("write", path=str(external), content="answer = 42\n"),
+            use("exec", cwd=str(external.parent), command=python_command(
+                "from feature import answer; assert answer == 42"
+            )),
+            say("外部模块已验证。"),
+            assessment("continue", next_step="补全本地模块"),
+            use("write", path="local.py", content="answer = 42\n"),
+            use("exec", command=python_command("from local import answer; assert answer == 42")),
+            say("本地模块已验证。"),
+            assessment(),
+            tools=True,
+        )
+        self.start(conversation, "实现两个模块", max_rounds=2)
+
+        def regress_after_second_check(goal):
+            if goal.rounds == 2:
+                external.write_text("answer = 0\n")
+
+        goal = GoalRuntime(conversation, on_review=regress_after_second_check).run()
+        self.assertEqual(goal.status, "budget_exhausted")
+        self.assertTrue(goal.verification_required)
+        self.assertIn(str(external), goal.source_scope["paths"])
+        self.assertIn("源码在验证后发生变化", goal.next_step)
+
+    def test_resumed_goal_requires_check_for_code_written_in_interrupted_round(self):
+        conversation = self.conversation(use("write", path="feature.py", content="answer = 42\n"), tools=True)
+
+        def interrupt(*_arguments):
+            raise KeyboardInterrupt
+
+        def ask_and_interrupt(prompt, **kwargs):
+            return conversation.ask(prompt, on_tool_result=interrupt, **kwargs)
+
+        self.start(conversation, "先分析再修复 feature.py")
+        with self.assertRaises(KeyboardInterrupt):
+            GoalRuntime(conversation, ask_turn=ask_and_interrupt).run()
+        self.assertTrue(conversation.sessions.read()["goal"]["verification_required"])
+        restored = self.conversation(
+            say("已完成。"),
+            use("exec", command=python_command("from feature import answer; assert answer == 42")),
+            say("已验证。"),
+            assessment(),
+            tools=True,
+        )
+        self.assertEqual(GoalRuntime(restored).run().status, "completed")
+        self.assertEqual(len(restored.client.requests), 4)
+        self.assertFalse(restored.goal.verification_required)
+
+    def test_resumed_review_does_not_accept_a_changed_source_revision(self):
+        def interrupt(_goal):
+            raise KeyboardInterrupt
+
+        conversation = self.conversation(
+            use("write", path="feature.py", content="answer = 42\n"),
+            use("exec", command=python_command("from feature import answer; assert answer == 42")),
+            say("已验证。"),
+            tools=True,
+        )
+        self.start(conversation, "分析并修复 feature.py")
+        with self.assertRaises(KeyboardInterrupt):
+            GoalRuntime(conversation, on_review=interrupt).run()
+        self.assertEqual(conversation.goal.phase, "review")
+        self.assertIsNotNone(conversation.sessions.read()["goal"]["verified_source"])
+        (self.workspace / "feature.py").write_text("answer = 43\n")
+        restored = self.conversation(
+            say("已完成。"),
+            use("exec", command=python_command("from feature import answer; assert answer == 43")),
+            say("已验证新版本。"),
+            assessment(),
+            tools=True,
+        )
+        self.assertEqual(GoalRuntime(restored).run().status, "completed")
+        self.assertEqual(restored.goal.rounds, 2)
+        self.assertEqual(len(restored.client.requests), 4)
+
+    def test_interrupted_goal_stops_only_its_owned_background_process(self):
+        feature = self.workspace / "feature.py"
+        feature.write_text("answer = 42\n")
+        command = python_command(
+            "input(); from pathlib import Path; Path('feature.py').write_text('answer = 0\\n')"
+        )
+        conversation = self.conversation(use("exec", command=command, background=True), tools=True)
+        other = conversation.tools.processes.start(command, self.workspace, 60)
+        sessions = []
+
+        def interrupt(_name, result):
+            sessions.append(result["data"]["session_id"])
+            raise KeyboardInterrupt
+
+        def ask_and_interrupt(prompt, **kwargs):
+            return conversation.ask(prompt, on_tool_result=interrupt, **kwargs)
+
+        self.start(conversation, "先分析再修复 feature.py")
+        with self.assertRaises(KeyboardInterrupt):
+            GoalRuntime(conversation, ask_turn=ask_and_interrupt).run()
+        self.assertTrue(conversation.goal.verification_required)
+        self.assertTrue(conversation.tools.processes.lookup(sessions[0]).done.is_set())
+        self.assertFalse(conversation.tools.processes.lookup(other.data["session_id"]).done.is_set())
+        conversation.client.responses.extend([
+            use("exec", command=python_command("from feature import answer; assert answer == 42")),
+            say("已验证。"),
+            assessment(),
+        ])
+        self.assertEqual(GoalRuntime(conversation).run().status, "completed")
 
     def test_round_budget_exhaustion_and_explicit_extension(self):
         conversation = self.conversation(
@@ -534,6 +661,149 @@ class GoalEnvironmentTests(EnvironmentTestCase):
 
 
 class GoalTeamTests(TeamTestCase):
+    def test_idle_team_preserves_an_owned_process_handoff(self):
+        script = TeamScript(main=Steps(
+            use("exec", command=python_command("import time; time.sleep(30)"), background=True),
+            say("The command is still running in the background."),
+        ))
+        conversation = self.team_conversation(script)
+        answer = conversation.ask("Start the command and do not wait for it.")
+        self.assertIn("still running", answer)
+        self.assertFalse(conversation.team.went_background)
+        self.assertEqual(conversation.last_outcome["status"], "background")
+        self.assertIsNotNone(conversation.last_outcome["handoff_source"])
+
+    def test_finished_background_member_still_requires_integration_check(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def write_after_handoff(_messages, _tools):
+            self.assertTrue(release.wait(5))
+            return use("write", path="feature.py", content="answer = 42\n")
+
+        check = python_command("from feature import answer; assert answer == 42")
+        script = TeamScript(
+            main=Steps(say("后台成员已完成。"), team("wait", timeout=5), say("已完成。"), use("exec", command=check), say("已验证。")),
+            engineer=Steps(write_after_handoff, use("exec", command=check), say("已验证。")),
+        )
+        conversation = self.team_conversation(script)
+        conversation.team.begin_turn(time.monotonic() + 60, background=True)
+        conversation.team.act_send_message(
+            "main", None, to=["engineer"], kind="request", content="生成 feature.py",
+            _context=ExecutionContext(time.monotonic() + 10),
+        )
+        conversation.team.end_turn()
+        release.set()
+        with conversation.team.changed:
+            self.assertTrue(conversation.team.changed.wait_for(
+                lambda: not conversation.team.activations, timeout=5,
+            ))
+        self.assertEqual(
+            conversation.ask("汇报后台动态", task_contract=TaskContract(kind="answer")),
+            "后台成员已完成。",
+        )
+        answer = conversation.ask("修复 feature.py", task_contract=TaskContract(kind="change"))
+        self.assertEqual(answer, "已验证。")
+        self.assertEqual(len(script.requests["main"]), 5)
+
+    def test_member_write_before_inherited_baseline_needs_verification(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def write_when_resumed(_messages, _tools):
+            self.assertTrue(release.wait(5))
+            return use("write", path="feature.py", content="answer = 42\n")
+
+        check = python_command("from feature import answer; assert answer == 42")
+        script = TeamScript(
+            main=Steps(say("已完成。"), use("exec", command=check), say("已验证。"), assessment()),
+            engineer=Steps(write_when_resumed, use("exec", command=check), say("已验证。")),
+        )
+        conversation = self.team_conversation(script)
+        conversation.team.begin_turn(time.monotonic() + 60, background=True)
+        conversation.team.act_send_message(
+            "main", None, to=["engineer"], kind="request", content="生成 feature.py",
+            _context=ExecutionContext(time.monotonic() + 10),
+        )
+        conversation.team.end_turn()
+        self.assertTrue(conversation.team.in_background)
+        from task_acceptance import source_snapshot
+
+        def snapshot_after_write(*args, **kwargs):
+            release.set()
+            with conversation.team.changed:
+                self.assertTrue(conversation.team.changed.wait_for(
+                    lambda: not conversation.team.activations, timeout=5,
+                ))
+            return source_snapshot(*args, **kwargs)
+
+        prepare_goal(conversation, GoalCommand("start", "先分析再修复 feature.py"))
+        with patch("task_acceptance.source_snapshot", side_effect=snapshot_after_write):
+            self.assertEqual(GoalRuntime(conversation).run().status, "completed")
+        self.assertEqual(len(script.requests["main"]), 4)
+        self.assertGreater(conversation.last_outcome["code_revision"], 0)
+
+    def test_inherited_member_cannot_outlive_an_integrated_answer_after_one_nudge(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def engine(_messages, _tools):
+            self.assertTrue(release.wait(5))
+            return use("write", path="member.py", content="answer = 42\n")
+
+        def verify_after_member(_messages, _tools):
+            release.set()
+            with conversation.team.changed:
+                self.assertTrue(conversation.team.changed.wait_for(
+                    lambda: not conversation.team.activations, timeout=5,
+                ))
+            return use("exec", command=python_command("from member import answer; assert answer == 42"))
+
+        script = TeamScript(
+            main=Steps(say("已完成。"), say("已完成。"), verify_after_member, say("已验证。"), assessment()),
+            engineer=Steps(engine, say("已写入。")),
+        )
+        conversation = self.team_conversation(script)
+        conversation.team.act_send_message(
+            "main", None, to=["engineer"], kind="request", content="生成 member.py",
+            _context=ExecutionContext(time.monotonic() + 10),
+        )
+        prepare_goal(conversation, GoalCommand("start", "先分析再修复 member.py"))
+        self.assertEqual(GoalRuntime(conversation).run().status, "completed")
+        self.assertEqual(len(script.requests["main"]), 5)
+        self.assertGreater(conversation.last_outcome["code_revision"], 0)
+
+    def test_inherited_member_edits_require_goal_verification(self):
+        def wait_for_member(_messages, _tools):
+            with conversation.team.changed:
+                self.assertTrue(conversation.team.changed.wait_for(
+                    lambda: not conversation.team.activations, timeout=10,
+                ))
+            return say("已收到结果。")
+
+        script = TeamScript(
+            main=Steps(
+                wait_for_member,
+                use("exec", command=python_command("from feature import answer; assert answer == 42")),
+                say("已验证成员的改动。"),
+                assessment(),
+            ),
+            engineer=Steps(
+                use("write", path="feature.py", content="answer = 42\n"),
+                use("exec", command=python_command("from feature import answer; assert answer == 42")),
+                say("已完成。"),
+            ),
+        )
+        conversation = self.team_conversation(script)
+        conversation.team.act_send_message(
+            "main", None, to=["engineer"], kind="request", content="修复 feature.py",
+            _context=ExecutionContext(time.monotonic() + 10),
+        )
+        prepare_goal(conversation, GoalCommand("start", "先分析再修复 feature.py"))
+        self.assertEqual(GoalRuntime(conversation).run().status, "completed")
+        self.assertEqual(len(script.requests["main"]), 4)
+        self.assertGreater(conversation.last_outcome["code_revision"], 0)
+
     def test_goal_collects_team_results_and_restores_interactive_background_setting(self):
         script = TeamScript(
             main=Steps(

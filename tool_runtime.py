@@ -116,8 +116,11 @@ class ArtifactStore:
     def __init__(self, workspace: Path) -> None:
         self.directory = workspace / ".agent-artifacts"
 
-    def new_path(self, suffix: str = ".txt") -> Path:
+    def prepare(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
+
+    def new_path(self, suffix: str = ".txt") -> Path:
+        self.prepare()
         # Command output and checkpoints may hold private task text: keep them out of
         # `git status` and `git add -A` in the user's repository without editing its ignores.
         ignore = self.directory / ".gitignore"

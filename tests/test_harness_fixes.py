@@ -289,10 +289,11 @@ except SessionConflictError:
         )
         conversation = Conversation(self.settings, client, self.tools)
         published = []
-        answer = conversation.ask("修复代码", on_content=published.append)
+        answer = conversation.ask("先分析问题，再修复 app.py", on_content=published.append)
         self.assertEqual(answer, "已修改并验证。")
         self.assertEqual(published, [answer])
         self.assertEqual(len(client.requests), 4)
+        self.assertEqual(conversation.last_outcome["kind"], "answer")
         self.assertGreater(conversation.last_outcome["code_revision"], 0)
         self.assertEqual(
             conversation.last_outcome["code_revision"],
@@ -308,13 +309,52 @@ except SessionConflictError:
             {"role": "assistant", "content": "已修改并验证。"},
         )
         conversation = Conversation(self.settings, client, self.tools)
-        answer = conversation.ask("修复代码")
+        answer = conversation.ask("先分析问题，再修复 app.py")
         self.assertEqual(answer, "已修改并验证。")
         self.assertEqual(len(client.requests), 3)
         self.assertEqual(conversation.last_outcome["status"], "completed")
         reruns = [m for m in conversation.messages if "Runtime reran" in (m.get("content") or "")]
         self.assertEqual(len(reruns), 1)
         self.assertIn(f"`{check} 2>&1` (cwd .): passed", reruns[0]["content"])
+
+    def test_unreadable_revision_preserves_partial_answer_without_retrying(self):
+        client = FakeClient(
+            {"role": "assistant", "tool_calls": [call("write", {"path": "app.py", "content": "answer = 42\n"})]},
+            {"role": "assistant", "content": "已修复并验证。"},
+        )
+        conversation = Conversation(self.settings, client, self.tools)
+        published = []
+        with patch("task_acceptance.source_snapshot", side_effect=PermissionError("unreadable")):
+            with self.assertRaisesRegex(CompletionError, "tracking failed") as error:
+                conversation.ask("先分析问题，再修复 app.py", on_content=published.append)
+        self.assertEqual(error.exception.code, "verification_unknown")
+        self.assertEqual((self.root / "app.py").read_text(), "answer = 42\n")
+        self.assertEqual(conversation.last_outcome["status"], "incomplete")
+        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(published, [])
+        checkpoint, = (self.root / ".agent-artifacts").rglob("*.unfinished.json")
+        self.assertEqual(json.loads(checkpoint.read_text())["content"], "已修复并验证。")
+
+    def test_initial_snapshot_timeout_replaces_the_previous_completed_outcome(self):
+        conversation = Conversation(self.settings, FakeClient(), self.tools)
+        conversation.last_outcome = {"status": "completed"}
+        with patch("task_acceptance.source_snapshot", side_effect=TimeoutError("tracking deadline")):
+            with self.assertRaisesRegex(TimeoutError, "tracking deadline"):
+                conversation.ask("修复 app.py")
+        self.assertEqual(conversation.last_outcome["status"], "incomplete")
+        self.assertTrue(conversation.sessions.read()["last_outcome"]["verification_required"])
+
+    def test_configured_mcp_manifest_change_requires_a_check(self):
+        settings = replace(self.settings, mcp_config_file=self.root / "servers.json")
+        client = FakeClient(
+            {"role": "assistant", "tool_calls": [call("write", {"path": "servers.json", "content": "{}\n"})]},
+            {"role": "assistant", "content": "已保存。"},
+            {"role": "assistant", "tool_calls": [call("exec", {"command": f'{shlex.quote(sys.executable)} -c "from pathlib import Path; assert Path(\'servers.json\').is_file()"'}, "check")]},
+            {"role": "assistant", "content": "已验证。"},
+        )
+        conversation = Conversation(settings, client, self.tools)
+        self.assertEqual(conversation.ask("更新 MCP 配置"), "已验证。")
+        self.assertEqual(len(client.requests), 4)
 
     def test_a_rerun_that_fails_rejects_the_answer_with_its_output(self):
         verification = "from app import answer; assert answer == 42, answer"

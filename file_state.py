@@ -58,6 +58,18 @@ GENERATED_DIRECTORIES = frozenset(
     }
 )
 CODE_SUFFIXES = (SOURCE_SUFFIXES - {".json", ".toml", ".yaml", ".yml"}) | {".mjs", ".cjs"}
+CONFIG_NAMES = frozenset({
+    "package.json", "package-lock.json", "tsconfig.json", "jsconfig.json",
+    "babel.config.json", ".babelrc", ".babelrc.json", ".eslintrc",
+    ".eslintrc.json", ".eslintrc.yaml", ".eslintrc.yml",
+    "pyproject.toml", "uv.lock", "poetry.lock", "Cargo.toml", "Cargo.lock",
+    "go.mod", "go.sum", "setup.cfg", "tox.ini", "pytest.ini", "ruff.toml", ".ruff.toml",
+    ".gitlab-ci.yml", "bitbucket-pipelines.yml", "azure-pipelines.yml", "Jenkinsfile",
+    "compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml",
+    "pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock", ".yarnrc.yml", "deno.json",
+    "CMakeLists.txt", "meson.build", "Gemfile", "Gemfile.lock", "composer.json", "pom.xml",
+    "mcp.json", ".mcp.json",
+})
 _UNSPECIFIED = object()
 _FILE_LOCKS = {}
 _FILE_LOCKS_GUARD = threading.Lock()
@@ -192,7 +204,17 @@ def _digest_identity_is_settled(info) -> bool:
     return time.time_ns() - newest > _DIGEST_CACHE_SKEW_NS
 
 
-def cached_file_digest(path: Path, cache: dict, check=None) -> str | None:
+def _file_identity(info):
+    return (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+        info.st_mode & 0o111,
+    )
+
+
+def cached_file_digest(
+    path: Path, cache: dict, check=None, *, mode_aware=False, identities=None,
+) -> str | None:
+    cache_key = (str(path), True) if mode_aware else str(path)
     for _attempt in range(3):
         if check:
             check()
@@ -200,15 +222,13 @@ def cached_file_digest(path: Path, cache: dict, check=None) -> str | None:
             before = path.stat()
         except FileNotFoundError:
             return None
-        identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        previous = cache.get(str(path))
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError(f"Cannot track a non-regular source file: {path}")
+        identity = _file_identity(before)
+        previous = cache.get(cache_key)
         if previous is not None and previous[0] == identity:
+            if identities is not None:
+                identities[str(path)] = identity
             return previous[1]
         digest = file_digest(path, check)
         if digest is None:
@@ -217,22 +237,69 @@ def cached_file_digest(path: Path, cache: dict, check=None) -> str | None:
             after = path.stat()
         except FileNotFoundError:
             return None
-        if identity == (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
+        if identity == _file_identity(after):
+            if identities is not None:
+                identities[str(path)] = identity
+            if mode_aware:
+                digest = f"{digest}:{after.st_mode & 0o111:o}"
             # Only cache the identity once its timestamps can no longer collide with a
             # future same-size write; otherwise recompute next time to avoid a stale digest.
             if _digest_identity_is_settled(after):
-                cache[str(path)] = (identity, digest)
+                cache[cache_key] = (identity, digest)
             return digest
     raise OSError(f"File kept changing while tracking its version: {path}")
 
 
-def source_snapshot(roots, *, ignored=(), deadline=None, cache=None) -> dict[str, str]:
+def verification_file(path: Path, suffixes=CODE_SUFFIXES) -> bool:
+    parts = path.parts
+    directories = tuple(zip(parts, parts[1:]))
+    declared = (
+        path.suffix.lower() in suffixes
+        or path.name in SOURCE_NAMES | CONFIG_NAMES
+        or path.match("tsconfig.*.json")
+        or path.match("requirements*.txt")
+        or path.match("Dockerfile.*")
+        or (
+            path.suffix.lower() in {".yaml", ".yml"}
+            and (
+                ".circleci" in parts or ".buildkite" in parts
+                or (".github", "workflows") in directories
+                or (".github", "actions") in directories
+            )
+        )
+        or (path.suffix.lower() == ".json" and ("builtin", "environment-templates") in directories)
+        or (path.suffix.lower() == ".json" and (".agent", "environments") in directories)
+    )
+    if declared or path.suffix or path.name.startswith("."):
+        return declared
+    if path.parent.name == "bin":
+        return True
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(mode) and bool(mode & 0o111)
+
+
+def directory_identity(path, identities):
+    """Capture entry churn, including creation and removal of the same name."""
+    while True:
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            if path.parent == path:
+                raise
+            path = path.parent
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            identities[path] = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+        return
+
+
+def source_snapshot(
+    roots, *, ignored=(), deadline=None, cache=None, relevant=verification_file, identities=None,
+    directory_identities=None,
+) -> dict[str, str]:
     ignored = {path.resolve() for path in ignored}
     cache = cache if cache is not None else {}
     result = {}
@@ -241,11 +308,31 @@ def source_snapshot(roots, *, ignored=(), deadline=None, cache=None) -> dict[str
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("Task deadline reached while tracking file changes")
 
+    def walk_error(error):
+        raise error
+
     for root in roots:
         root = root.resolve()
-        for directory, directories, filenames in os.walk(root):
+        check()
+        try:
+            mode = root.stat().st_mode
+        except FileNotFoundError:
+            if directory_identities is not None:
+                directory_identity(root, directory_identities)
+            continue
+        if not stat.S_ISDIR(mode):
+            if directory_identities is not None:
+                directory_identity(root.parent, directory_identities)
+            if root not in ignored and relevant(root):
+                digest = cached_file_digest(root, cache, check, mode_aware=True, identities=identities)
+                if digest is not None:
+                    result[str(root)] = digest
+            continue
+        for directory, directories, filenames in os.walk(root, onerror=walk_error):
             check()
             parent = Path(directory)
+            if directory_identities is not None:
+                directory_identity(parent, directory_identities)
             directories[:] = [
                 name
                 for name in directories
@@ -253,11 +340,9 @@ def source_snapshot(roots, *, ignored=(), deadline=None, cache=None) -> dict[str
             ]
             for name in filenames:
                 path = parent / name
-                if path in ignored or (
-                    path.suffix.lower() not in SOURCE_SUFFIXES and name not in SOURCE_NAMES
-                ):
+                if path in ignored or not relevant(path):
                     continue
-                digest = cached_file_digest(path, cache, check)
+                digest = cached_file_digest(path, cache, check, mode_aware=True, identities=identities)
                 if digest is not None:
                     result[str(path)] = digest
     return result

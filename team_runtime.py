@@ -80,6 +80,7 @@ class Activation:
         # Set when the turn's deadline, not the activation timeout, bounds this activation.
         self.turn_bound = False
         self.turn_number = 0
+        self.was_backgrounded = False
 
 
 @dataclass
@@ -292,6 +293,38 @@ class TeamRuntime:
             self.inherited_queue = set(self._summary()["queued"])
             self._persist()
 
+    def has_pending_work(self) -> bool:
+        with self.lock:
+            return self.state is not None and (
+                bool(self.activations) or any(
+                    name != MAIN and record["status"] not in {"disabled", "removed"}
+                    and self._wakeable(name)
+                    for name, record in self.state.agents.items()
+                )
+            )
+
+    def _can_change_source(self, name) -> bool:
+        sources = {"write", "edit", "exec", "mcp", "delegate"}
+        if name in self.members:
+            return bool(self.members[name].tools.registry.keys() & sources)
+        spec = self.member_spec(name)
+        return spec is not None and bool(self.member_tool_names(spec) & sources)
+
+    def source_workers_at_takeover(self) -> tuple[bool, int]:
+        with self.lock:
+            if self.state is None:
+                return False, 0
+            return (
+                any(map(self._can_change_source, self.activations)),
+                self.state.data.get("unverified_background_source", 0),
+            )
+
+    def acknowledge_background_source(self, generation):
+        with self.lock:
+            if self.state is not None and self.state.data.get("unverified_background_source") == generation:
+                del self.state.data["unverified_background_source"]
+                self._persist()
+
     def end_turn(self, *, interrupted: bool = False) -> int:
         with self.lock:
             if self.state is None:
@@ -323,6 +356,8 @@ class TeamRuntime:
         # Activations get their own timeouts; the timer bounds the whole period.
         self.turn_deadline = float("inf")
         token = self._background = object()
+        for activation in self.activations.values():
+            activation.was_backgrounded = True
         timer = None
         if seconds is not None:
             timer = threading.Timer(seconds, self._background_expired, args=(token,))
@@ -580,6 +615,7 @@ class TeamRuntime:
         activation = Activation(name, items, min(turn, own), self.session_id)
         activation.turn_bound = turn < own
         activation.turn_number = self.state.data["turn"]["number"]
+        activation.was_backgrounded = self._background is not None
         record = self.state.agents[name]
         record["status"] = "running"
         record["inflight"] = items
@@ -624,6 +660,9 @@ class TeamRuntime:
         if self.state is None:
             return
         name = activation.agent
+        if activation.was_backgrounded and self._can_change_source(name):
+            data = self.state.data
+            data["unverified_background_source"] = data.get("unverified_background_source", 0) + 1
         record = self.state.agents[name]
         record["inflight"] = []
         title = activation_title(self, activation.items)
@@ -1567,7 +1606,7 @@ class TeamRuntime:
 
     # Main-agent integration --------------------------------------------------------
 
-    def final_answer_problem(self, *, handoff: bool = True) -> str | None:
+    def final_answer_problem(self, *, handoff: bool = True, require_settled: bool = False) -> str | None:
         """Why main may not give its final answer yet, or None.
 
         Without ``handoff`` (the user did not ask main to leave work running) main waits
@@ -1582,9 +1621,12 @@ class TeamRuntime:
             if not summary["working"] and not summary["queued"]:
                 return None
             hold = (
-                not handoff
-                and self.turn_deadline - time.monotonic() > self.turn_reserve
-                and self._fresh_work(summary)
+                (require_settled and not self._may_continue())
+                or (
+                    not handoff
+                    and self.turn_deadline - time.monotonic() > self.turn_reserve
+                    and self._fresh_work(summary)
+                )
             )
             if self.nudges >= 1 and not hold:
                 return None
@@ -1592,7 +1634,7 @@ class TeamRuntime:
             working = ", ".join(summary["working"] + summary["queued"])
             if hold:
                 return (
-                    f"Team members are still working ({working}) on work started this turn, "
+                    f"Team members are still working ({working}), "
                     "and the user did not ask you to leave it running. Call team action=wait "
                     "until they finish, check the integrated result, then answer. "
                     "update_task status=cancelled drops a task you no longer need; team "

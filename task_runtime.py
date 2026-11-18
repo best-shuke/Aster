@@ -711,7 +711,12 @@ class TaskRuntime:
                         "Task deadline reached before accepting the response",
                         partial_message=response,
                     )
-                problem = self._response_problem(response, definitions)
+                try:
+                    problem = self._response_problem(response, definitions)
+                except CompletionError as exc:
+                    if exc.code == "verification_unknown":
+                        exc.partial_message = response
+                    raise
                 if problem:
                     with trace_scope(self.last_request_trace):
                         repair = self._repair_instruction(response, problem, definitions)
@@ -731,7 +736,7 @@ class TaskRuntime:
                     on_content(content)
                 return response
             except CompletionError as exc:
-                if exc.code in {"task_deadline", "cancelled"}:
+                if exc.code in {"task_deadline", "cancelled", "verification_unknown"}:
                     self.recovery.preserve_terminal(exc.partial_message, messages, exc.code)
                 raise
             finally:

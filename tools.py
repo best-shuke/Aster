@@ -985,7 +985,7 @@ class CodingTools:
 
     def execute_in(self, tool_call: ToolCall, context: ExecutionContext) -> str:
         """Run as a full agent under the caller's deadline and cancellation (team members)."""
-        return self._execute(tool_call, context, worker=False)
+        return self._execute(tool_call, context, worker=False, allow_background=False)
 
     def execute_workspace(self, tool_call: ToolCall, context: ExecutionContext) -> str:
         previous = getattr(self._file_versions, "worker", False)
@@ -995,7 +995,10 @@ class CodingTools:
         finally:
             self._file_versions.worker = previous
 
-    def _execute(self, tool_call: ToolCall, context: ExecutionContext, worker: bool) -> str:
+    def _execute(
+        self, tool_call: ToolCall, context: ExecutionContext, worker: bool, *,
+        allow_background: bool = True,
+    ) -> str:
         call_id = tool_call.get("id", "")
         trace = context.trace
         if trace.tool_call_id != call_id or trace.execution_id is None:
@@ -1007,7 +1010,9 @@ class CodingTools:
             self._execution_update("started", tool_call, context)
             emit_event("tool_started", tool=name, worker=worker)
             try:
-                output = self._execute_registered(tool_call, context, worker)
+                output = self._execute_registered(
+                    tool_call, context, worker, allow_background=allow_background,
+                )
             except BaseException as exc:
                 self._execution_update(
                     "interrupted", tool_call, context, duration_seconds=time.monotonic() - started
@@ -1040,7 +1045,7 @@ class CodingTools:
                 )
 
     def _execute_registered(
-        self, tool_call: ToolCall, context: ExecutionContext, worker: bool
+        self, tool_call: ToolCall, context: ExecutionContext, worker: bool, *, allow_background: bool,
     ) -> str:
         spec = None
         try:
@@ -1094,7 +1099,7 @@ class CodingTools:
                         },
                     )
                 )
-            if worker and name == "exec" and arguments.get("background"):
+            if (worker or not allow_background) and name == "exec" and arguments.get("background"):
                 return self.artifacts.render(
                     ToolResult.failure(
                         "unavailable_tool",
@@ -1468,19 +1473,36 @@ class CodingTools:
                 "unknown_session",
                 "Session not found in this application instance; do not rerun the command without checking its effects",
             )
-        if offset > session.path.stat().st_size:
-            return ToolResult.failure("invalid_arguments", "offset exceeds the current output size")
-        if action == "wait":
-            return self.processes.wait(session, offset, wait_seconds, wait_for, _context)
-        if action == "input":
-            if not input:
-                return ToolResult.failure(
-                    "invalid_arguments", "input must not be empty; send \\n for Enter"
-                )
-            return self.processes.send_input(session, input, offset)
-        if action == "stop":
-            session.stop()
-        return self.processes.result(session, offset)
+        try:
+            try:
+                size = session.path.stat().st_size
+            except OSError as exc:
+                size = None
+                unavailable = exc
+            if size is not None and offset > size:
+                return ToolResult.failure("invalid_arguments", "offset exceeds the current output size")
+            if action == "stop":
+                session.stop()
+                return self.processes.result(session, offset)
+            if action == "wait":
+                if size is None:
+                    until = time.monotonic() + wait_seconds
+                    while not session.done.is_set() and time.monotonic() < until:
+                        session.done.wait(min(0.1, max(0, until - time.monotonic()), _context.remaining()))
+                    _context.remaining()
+                    return self.processes.output_unavailable(session, unavailable)
+                return self.processes.wait(session, offset, wait_seconds, wait_for, _context)
+            if action == "input":
+                if not input:
+                    return ToolResult.failure(
+                        "invalid_arguments", "input must not be empty; send \\n for Enter"
+                    )
+                return self.processes.send_input(session, input, offset)
+            return self.processes.result(session, offset)
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            return self.processes.output_unavailable(session, exc)
 
     def close(self) -> None:
         self.processes.close()

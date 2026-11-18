@@ -28,6 +28,7 @@ from contracts import (
     ToolResultPayload,
     ToolRun,
 )
+from deepseek_client import CompletionError
 from environment_transition import EnvironmentTransition
 from environments import EnvironmentStore, ResolvedEnvironment
 from execution_trace import (
@@ -638,7 +639,44 @@ class Conversation:
 
     def _save_outcome(self, acceptance: TaskAcceptance) -> None:
         self.last_outcome = acceptance.outcome()
+        if self.tools is not None and acceptance.status == "completed":
+            for session_id in acceptance.observed_processes:
+                session = self.tools.processes.lookup(session_id)
+                if session is not None and session.done.is_set():
+                    session.source_checkpoint = None
+        if self.goal is not None and self.goal.status == "active" and self.goal.phase == "work":
+            self.goal.verification_required = self.last_outcome["verification_required"]
+            if self.goal.verification_required or self.goal.source_scope:
+                self.goal.source_scope = acceptance.source_scope()
+            revision = acceptance.verified_source()
+            if revision is not None:
+                self.goal.verified_source = revision
+                self.goal.source_scope = acceptance.source_scope()
         self.save()
+
+    def _acceptance_scope(self) -> dict:
+        configuration = [self.settings.mcp_config_source or self.settings.mcp_config_file]
+        if self.active_environment is not None:
+            configuration.append(self.active_environment.entry.path)
+            configuration.append(
+                self._baseline_settings.mcp_config_source or self._baseline_settings.mcp_config_file
+            )
+        return {
+            "workspace": self.settings.workspace,
+            "ignored_paths": (self.settings.session_file, self.sessions.directory),
+            "configuration_paths": tuple(configuration),
+            "digest_cache": self._digest_cache,
+            "prepare_exec": getattr(getattr(self.tools, "artifacts", None), "prepare", None),
+        }
+
+    def goal_source_matches(self, revision, deadline) -> bool:
+        acceptance = TaskAcceptance("", deadline=deadline, **self._acceptance_scope())
+        try:
+            return acceptance.source_matches(revision)
+        except TimeoutError:
+            raise
+        except OSError:
+            return False
 
     def _record_tool_calls(self, tool_calls: list[ToolCall], runtime: TaskRuntime) -> list[ToolRun]:
         runs: list[ToolRun] = []
@@ -725,10 +763,22 @@ class Conversation:
         try:
             run["state"] = "running"
             self.save()
-            acceptance.before_tool(tool_call)
             tool_trace = runtime.last_request_trace.tool(tool_call["id"], run["execution_id"])
             run["trace"] = tool_trace.as_dict()
             with trace_scope(tool_trace):
+                process_cwd = None
+                if tool_call["function"]["name"] == "monitor":
+                    arguments = acceptance._arguments(tool_call)
+                    session_id = arguments.get("session_id")
+                    action = arguments.get("action")
+                    if action in {"input", "stop", "status", "wait"} and isinstance(session_id, str):
+                        session = self.tools.processes.lookup(session_id)
+                        if session is not None:
+                            if session.source_checkpoint is not None:
+                                acceptance.resume_process(session_id, session.source_checkpoint)
+                            if action in {"input", "stop"}:
+                                process_cwd = session.cwd
+                acceptance.before_tool(tool_call, process_cwd=process_cwd)
                 options = {"deadline": runtime.tool_deadline()}
                 if on_progress is not None:
                     options["on_progress"] = traced_progress(on_progress)
@@ -741,6 +791,8 @@ class Conversation:
                 "Inspect actual state before repeating this operation.",
                 "unknown",
             ), True
+        except TimeoutError:
+            raise
         except Exception as exc:
             return self._tool_error(type(exc).__name__, str(exc)), False
 
@@ -766,6 +818,13 @@ class Conversation:
                 "content": result,
             }
         )
+        data = parsed_result.get("data") or {}
+        if data.get("state") == "running" and data.get("session_id"):
+            name = tool_call["function"]["name"]
+            if name == "exec" or (name == "monitor" and acceptance._arguments(tool_call).get("action") == "input"):
+                session = self.tools.processes.lookup(data["session_id"])
+                if session is not None and session.source_checkpoint is None:
+                    session.source_checkpoint = acceptance.source_checkpoint()
         acceptance.observe(tool_call, parsed_result)
         self._save_outcome(acceptance)
         with trace_scope(TraceContext(**run["trace"])):
@@ -807,41 +866,67 @@ class Conversation:
             prompt,
             task_contract or TaskContract(kind="answer" if final_validator else "auto"),
             has_tools=bool(self.definitions),
-            workspace=self.settings.workspace,
-            ignored_paths=(self.settings.session_file, self.sessions.directory),
             deadline=deadline,
+            defer_baseline=True,
             others=self.team.member_names() if self.team is not None else (),
             passive_tools=frozenset(
                 name for name, spec in self.tools.registry.items() if spec.read_only
             )
             if self.tools is not None
             else frozenset(),
-            digest_cache=self._digest_cache,
+            **self._acceptance_scope(),
         )
-        note = acceptance.instructions()
+        prior_revision = None
+        if self.goal is not None and self.goal.status == "active" and self.goal.phase == "work":
+            scope = self.goal.source_scope or self.goal.verified_source
+            if scope:
+                acceptance.include_source_scope(scope)
+            prior_revision = self.goal.verified_source
+        handoff_source = (self.last_outcome or {}).get("handoff_source")
         self.last_outcome = acceptance.outcome()
+        try:
+            active_members, reported_work = self.team.source_workers_at_takeover() if self.team is not None else (False, False)
+            integrating = acceptance.integrates_team or acceptance.contract.kind != "answer"
+            if integrating and reported_work and handoff_source and prior_revision is None:
+                acceptance.include_source_scope(handoff_source)
+                prior_revision = handoff_source
+            acceptance.begin(
+                team_pending=active_members or reported_work or (self.team is not None and self.team.has_pending_work()),
+                team_active=active_members or (reported_work and prior_revision is None),
+                prior_revision=prior_revision,
+            )
+        except BaseException:
+            acceptance.status = "incomplete"
+            self._save_outcome(acceptance)
+            raise
+        note = acceptance.instructions()
 
         def validate_final(content):
             if final_validator:
-                problem = final_validator(content)
+                problem = acceptance.validate_callback(lambda: final_validator(content))
                 if problem:
+                    if acceptance.status == "incomplete":
+                        raise CompletionError("verification_unknown", problem)
                     return problem
             background = False
             if self.team is not None:
                 # Hold at most once per run of rejected answers: TaskRuntime fails the turn
                 # after a few in a row. A tool call in between ends the run.
                 problem = self.team.final_answer_problem(
-                    handoff=acceptance.handoff_allowed or runtime.protocol_repairs > 0
+                    handoff=acceptance.handoff_allowed or runtime.protocol_repairs > 0,
+                    require_settled=acceptance.integrates_team,
                 )
                 if problem:
                     return problem
                 # Members' unfinished edits are verified when their work is done, not now.
                 background = self.team.continues_in_background()
             problem = acceptance.validate(content, background=background)
-            if problem and not background:
+            if problem and not background and acceptance.status != "incomplete":
                 problem = self._rerun_checks(
                     acceptance, runtime, content, problem, on_tool_result
                 )
+            if problem and acceptance.status == "incomplete":
+                raise CompletionError("verification_unknown", problem)
             return problem
 
         # Members work during the turn; afterwards they pause or, interactively, continue
@@ -849,7 +934,9 @@ class Conversation:
         # the turn note so that it takes over background work first: nothing finishes in
         # the background after the note reports it.
         with (
-            self.team.turn(deadline, background=self.team_background)
+            self.team.turn(
+                deadline, background=self.team_background and acceptance.contract.background_handoff,
+            )
             if self.team is not None
             else nullcontext()
         ):
@@ -878,25 +965,42 @@ class Conversation:
             runtime = TaskRuntime(
                 self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache
             )
-            answer = self._run_turn(
-                runtime,
-                acceptance,
-                deadline,
-                on_content,
-                on_response_start,
-                on_response_end,
-                on_progress,
-                on_reasoning,
-                on_tool_result,
-            )
+            try:
+                answer = self._run_turn(
+                    runtime,
+                    acceptance,
+                    deadline,
+                    on_content,
+                    on_response_start,
+                    on_response_end,
+                    on_progress,
+                    on_reasoning,
+                    on_tool_result,
+                )
+            except BaseException:
+                acceptance.status = "incomplete"
+                self._save_outcome(acceptance)
+                raise
+            finally:
+                if not acceptance.contract.background_handoff and self.tools is not None:
+                    for session_id in acceptance.background_sessions():
+                        session = self.tools.processes.lookup(session_id)
+                        if session is not None:
+                            session.stop()
         if (
             self.team is not None
             and acceptance.status == "background"
             and not self.team.went_background
+            and not acceptance.background_sessions()
         ):
             # The members finished before the turn ended: nothing continues, nothing verified.
             acceptance.status = "incomplete"
             self._save_outcome(acceptance)
+        if (
+            reported_work and self.team is not None and acceptance.integrates_team
+            and acceptance.verified_source() is not None
+        ):
+            self.team.acknowledge_background_source(reported_work)
         return answer
 
     def _rerun_checks(self, acceptance, runtime, content, problem, on_tool_result=None):
@@ -966,26 +1070,23 @@ class Conversation:
         on_tool_result,
     ) -> str:
         while True:
-            try:
-                message = runtime.generate(
-                    self.messages,
-                    self.system_message,
-                    self.definitions,
-                    on_content,
-                    on_response_start,
-                    on_response_end,
-                    on_progress,
-                    on_reasoning,
-                )
-            except BaseException:
-                acceptance.status = "incomplete"
-                self._save_outcome(acceptance)
-                raise
-            # Saved together with the accepted response just below.
-            self.last_outcome = acceptance.outcome()
+            message = runtime.generate(
+                self.messages,
+                self.system_message,
+                self.definitions,
+                on_content,
+                on_response_start,
+                on_response_end,
+                on_progress,
+                on_reasoning,
+            )
             self.messages.append(message)
             tool_calls = message.get("tool_calls") or []
-            runs = self._record_tool_calls(tool_calls, runtime)
+            if tool_calls:
+                self.last_outcome = acceptance.outcome()
+                runs = self._record_tool_calls(tool_calls, runtime)
+            else:
+                self._save_outcome(acceptance)
             if on_progress:
                 on_progress({"phase": "context", **self.context_status()})
             if not tool_calls:
@@ -1008,6 +1109,4 @@ class Conversation:
                     tool_call, run, result, runtime, acceptance, on_progress, on_tool_result
                 )
             if interrupted:
-                acceptance.status = "incomplete"
-                self._save_outcome(acceptance)
                 raise KeyboardInterrupt

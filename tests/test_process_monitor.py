@@ -38,6 +38,19 @@ class ProcessMonitorTests(unittest.TestCase):
     def monitor(self, session_id, action="status", **kwargs):
         return self.execute("monitor", {"session_id": session_id, "action": action, **kwargs})
 
+    def test_failed_initial_result_does_not_leave_an_unowned_process(self):
+        observed = []
+
+        def fail(session, *_args, **_kwargs):
+            observed.append(session)
+            raise OSError("cannot read process output")
+
+        with patch.object(self.tools.processes, "result", side_effect=fail):
+            with self.assertRaisesRegex(OSError, "cannot read"):
+                self.tools.processes.start(python_command("input()"), self.workspace, 60)
+        self.assertTrue(observed[0].done.is_set())
+        self.assertIsNone(self.tools.processes.lookup(observed[0].session_id))
+
     def test_scan_completion_continues_the_same_process(self):
         session_id = self.start(
             "import os, time\nfrom pathlib import Path\n"
@@ -328,6 +341,117 @@ class ProcessMonitorTests(unittest.TestCase):
         self.assertIn("correct", result["data"]["output"])
         self.assertNotIn("wrong", result["data"]["output"])
 
+    def test_input_result_retains_session_when_output_read_fails(self):
+        session_id = self.start("print('READY'); print(input()); input()")
+        self.monitor(session_id, "wait", wait_for="READY", wait_seconds=2)
+        with patch.object(self.tools.processes, "read_output", side_effect=OSError("unreadable")):
+            result = self.monitor(session_id, "input", input="sent\n")
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["data"]["session_id"], session_id)
+        self.assertEqual(result["data"]["bytes_written"], 5)
+        self.assertEqual(result["data"]["state"], "running")
+        self.assertIn("sent", self.monitor(session_id, "wait", wait_for="sent")["data"]["output"])
+
+    def test_missing_log_does_not_hide_process_state_or_prevent_stop(self):
+        session_id = self.start("input()")
+        session = self.tools.processes.lookup(session_id)
+        session.path.unlink()
+        for action in ("status", "wait", "stop"):
+            with self.subTest(action=action):
+                result = self.monitor(session_id, action, wait_seconds=0)
+                self.assertEqual(result["error"]["code"], "output_unavailable")
+                self.assertEqual(result["data"]["session_id"], session_id)
+                self.assertEqual(result["data"]["state"], "stopped" if action == "stop" else "running")
+
+    def test_log_stat_denied_does_not_prevent_stop(self):
+        session_id = self.start("input()")
+        path = self.tools.processes.lookup(session_id).path
+        stat = Path.stat
+
+        def deny_log(target, *args, **kwargs):
+            if target == path:
+                raise PermissionError("unreadable log")
+            return stat(target, *args, **kwargs)
+
+        with patch.object(Path, "stat", deny_log):
+            result = self.monitor(session_id, "stop")
+        self.assertEqual(result["data"]["state"], "stopped")
+
+    def test_wait_with_missing_log_still_checks_the_execution_deadline(self):
+        session_id = self.start("input()")
+        self.tools.processes.lookup(session_id).path.unlink()
+        result = self.execute(
+            "monitor", {"action": "wait", "session_id": session_id, "wait_seconds": 10},
+            deadline=time.monotonic() + 0.05,
+        )
+        self.assertEqual(result["status"], "timeout", result)
+
+    def test_finishing_a_handed_off_process_requires_checking_its_source_change(self):
+        background = call("exec", {"background": True, "command": python_command(
+            "from pathlib import Path; input(); Path('feature.py').write_text('answer = 42\\n')"
+        )})
+        settings = make_settings(
+            workspace=self.workspace, session_file=self.workspace / "session.json",
+            api_key="test", base_url="https://example.invalid", model="test",
+            max_context_chars=120000, keep_recent_turns=6, max_task_seconds=15, max_subagents=1,
+        )
+        client = FakeClient(
+            {"role": "assistant", "tool_calls": [background]},
+            {"role": "assistant", "content": "Command running in the background."},
+        )
+        conversation = Conversation(settings, client, self.tools)
+        self.addCleanup(conversation.close)
+        conversation.ask("Start the command; don't wait for it")
+        self.assertEqual(conversation.last_outcome["status"], "background")
+        session_id = next(iter(self.tools.processes.sessions))
+        self.monitor(session_id, "input", input="go\n")
+        self.assertTrue(self.tools.processes.lookup(session_id).done.wait(5))
+        resumed = FakeClient(
+            {"role": "assistant", "tool_calls": [call("monitor", {
+                "action": "wait", "session_id": session_id, "wait_seconds": 5,
+            })]},
+            {"role": "assistant", "content": "Changed."},
+            {"role": "assistant", "tool_calls": [call("exec", {"command": python_command(
+                "from feature import answer; assert answer == 42"
+            )})]},
+            {"role": "assistant", "content": "Checked."},
+        )
+        conversation.client = resumed
+        self.assertEqual(conversation.ask("Summarize the command result"), "Checked.")
+        self.assertEqual(len(resumed.requests), 4)
+
+    def test_input_to_an_external_process_tracks_source_in_its_cwd(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        external = Path(temporary.name).resolve()
+        session_id = self.start(
+            "from pathlib import Path; input(); Path('feature.py').write_text('answer = 42\\n')",
+            cwd=str(external),
+        )
+        client = FakeClient(
+            {"role": "assistant", "tool_calls": [call("monitor", {
+                "action": "input", "session_id": session_id, "input": "go\n",
+            })]},
+            {"role": "assistant", "tool_calls": [call("monitor", {
+                "action": "wait", "session_id": session_id, "wait_seconds": 5,
+            })]},
+            {"role": "assistant", "content": "Changed."},
+            {"role": "assistant", "tool_calls": [call("exec", {
+                "cwd": str(external), "command": python_command("from feature import answer; assert answer == 42"),
+            })]},
+            {"role": "assistant", "content": "Checked."},
+        )
+        settings = make_settings(
+            workspace=self.workspace, session_file=self.workspace / "session.json",
+            api_key="test", base_url="https://example.invalid", model="test",
+            max_context_chars=120000, keep_recent_turns=6, max_task_seconds=10, max_subagents=1,
+        )
+        conversation = Conversation(settings, client, self.tools)
+        self.addCleanup(conversation.close)
+        self.assertEqual(conversation.ask("Analyze and fix the feature"), "Checked.")
+        self.assertGreater(conversation.last_outcome["code_revision"], 0)
+        self.assertEqual(len(client.requests), 5)
+
     def test_listing_fork_and_unknown_sessions(self):
         session_id = self.start("input()")
         snapshot = self.tools.fork()
@@ -353,6 +477,12 @@ class ProcessMonitorTests(unittest.TestCase):
         )
         self.assertEqual(result["error"]["code"], "unavailable_tool")
         self.assertFalse((self.workspace / "unexpected").exists())
+        result = json.loads(self.tools.execute_in(
+            call("exec", {"command": "touch unexpected", "background": True}),
+            ExecutionContext(time.monotonic() + 2),
+        ))
+        self.assertEqual(result["error"]["code"], "unavailable_tool")
+        self.assertFalse(self.tools.processes.sessions)
 
     def test_conversation_continues_after_scan_without_restarting_the_command(self):
         responses = [

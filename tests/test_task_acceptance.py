@@ -33,6 +33,8 @@ class TaskAcceptanceTests(unittest.TestCase):
 
     def execute(self, name, arguments):
         invocation = call(name, arguments)
+        if name == "exec":
+            self.tools.artifacts.prepare()
         self.acceptance.before_tool(invocation)
         result = json.loads(self.tools.execute(invocation))
         self.acceptance.observe(invocation, result)
@@ -40,6 +42,594 @@ class TaskAcceptanceTests(unittest.TestCase):
 
     def command(self, program):
         return {"command": f"{shlex.quote(sys.executable)} -c {shlex.quote(program)}"}
+
+    def test_source_edits_require_verification_regardless_of_initial_intent(self):
+        cases = (
+            ("请先分析问题，然后修复 app.py 中的 bug", TaskContract()),
+            ("Explain the bug and fix app.py", TaskContract()),
+            ("帮我处理一下这个问题", TaskContract()),
+            ("检查实现", TaskContract("inspect")),
+            ("说明结果", TaskContract("answer")),
+        )
+        for index, (prompt, contract) in enumerate(cases):
+            with self.subTest(prompt=prompt, contract=contract.kind):
+                self.acceptance = TaskAcceptance(prompt, contract, workspace=self.workspace)
+                name = f"module_{index}"
+                self.assertEqual(
+                    self.execute("write", {"path": f"{name}.py", "content": "answer = 42\n"})[
+                        "status"
+                    ],
+                    "ok",
+                )
+                self.assertIn(
+                    "no successful verification", self.acceptance.validate("已完成修改。")
+                )
+                self.assertNotEqual(self.acceptance.status, "completed")
+                self.execute("exec", self.command(f"from {name} import answer; assert answer == 42"))
+                self.assertIsNone(self.acceptance.validate("已完成修改并验证。"))
+                self.assertEqual(self.acceptance.status, "completed")
+
+    def test_initial_answer_tracks_shell_changes_even_when_the_command_fails(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                (self.workspace / "app.py").write_text("answer = 41\n")
+                self.acceptance = TaskAcceptance("先分析问题再修复", workspace=self.workspace)
+                self.execute("read", {"path": "app.py"})
+                result = self.execute(
+                    "exec",
+                    self.command(
+                        "from pathlib import Path; Path('app.py').write_text('answer = 42\\n')"
+                        + ("; raise SystemExit(1)" if fail else "")
+                    ),
+                )
+                self.assertEqual(result["status"], "error" if fail else "ok")
+                problem = self.acceptance.validate("已完成修改。")
+                self.assertIn("no successful verification", problem)
+                self.assertIn("app.py", problem)
+                self.execute("exec", self.command("from app import answer; assert answer == 42"))
+                self.assertIsNone(self.acceptance.validate("已完成修改并验证。"))
+
+    def test_initial_answer_tracks_source_deletions_by_external_tools(self):
+        (self.workspace / "legacy.py").write_text("old = True\n")
+        self.acceptance = TaskAcceptance("分析并处理旧模块", workspace=self.workspace)
+        invocation = call("mcp", {"action": "call"})
+        self.acceptance.before_tool(invocation)
+        (self.workspace / "legacy.py").unlink()
+        self.acceptance.observe(invocation, {"status": "ok", "data": {}})
+        problem = self.acceptance.validate("已删除旧模块。")
+        self.assertIn("no successful verification", problem)
+        self.assertIn("legacy.py", problem)
+        self.execute("exec", self.command("from pathlib import Path; assert not Path('legacy.py').exists()"))
+        self.assertIsNone(self.acceptance.validate("已删除并验证。"))
+
+    def test_initial_answer_cannot_verify_source_changed_by_the_check_itself(self):
+        self.acceptance = TaskAcceptance("分析并处理问题", workspace=self.workspace)
+        self.execute(
+            "exec",
+            self.command("from pathlib import Path; assert True; Path('app.py').write_text('answer = 42\\n')"),
+        )
+        self.assertIn("no successful verification", self.acceptance.validate("已完成。"))
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+
+    def test_a_check_that_replaces_and_restores_source_does_not_pass(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 41\n"})
+        program = (
+            "from pathlib import Path; source = Path('app.py'); saved = source.read_bytes(); "
+            "source.write_text('answer = 42\\n'); assert '42' in source.read_text(); "
+            "source.write_bytes(saved)"
+        )
+        self.assertEqual(self.execute("exec", self.command(program))["status"], "ok")
+        self.assertIn("source files were touched", self.acceptance.validate("Verified."))
+        self.assertEqual((self.workspace / "app.py").read_text(), "answer = 41\n")
+        self.execute("exec", self.command("from app import answer; assert answer == 41"))
+        self.assertIsNone(self.acceptance.validate("Verified without editing."))
+
+    def test_a_check_that_imports_then_removes_a_new_module_does_not_pass(self):
+        self.execute("write", {"path": "app.py", "content": "from missing_dependency import answer\n"})
+        program = (
+            "from pathlib import Path; dependency = Path('missing_dependency.py'); "
+            "dependency.write_text('answer = 42\\n'); from app import answer; "
+            "assert answer == 42; dependency.unlink()"
+        )
+        self.assertEqual(self.execute("exec", self.command(program))["status"], "ok")
+        self.assertFalse((self.workspace / "missing_dependency.py").exists())
+        self.assertIn("source files were touched", self.acceptance.validate("Verified."))
+
+    @unittest.skipUnless(sys.platform == "darwin" or sys.platform.startswith("linux"), "native file events required")
+    def test_checks_may_rebuild_ignored_output_on_consecutive_runs(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        (self.workspace / "dist").mkdir()
+        (self.workspace / "coverage.xml").write_text("<old/>\n")
+        program = (
+            "from pathlib import Path; from shutil import rmtree; from app import answer; "
+            "assert answer == 42; dist = Path('dist'); rmtree(dist); dist.mkdir(); "
+            "(dist / 'generated.py').write_text('answer = 42\\n'); "
+            "report = Path('coverage.xml'); report.unlink(); report.write_text('<report/>\\n')"
+        )
+        for _ in range(2):
+            self.assertEqual(self.execute("exec", self.command(program))["status"], "ok")
+            self.assertIsNone(self.acceptance.validate("Verified."))
+
+    @unittest.skipUnless(sys.platform == "darwin" or sys.platform.startswith("linux"), "native file events required")
+    def test_check_may_create_an_irrelevant_report_without_rebuilding_directories(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        check = "from pathlib import Path; from app import answer; assert answer == 42; Path('coverage.xml').touch()"
+        self.assertEqual(self.execute("exec", self.command(check))["status"], "ok")
+        self.assertIsNone(self.acceptance.validate("Verified."))
+
+    def test_ignored_output_does_not_mask_other_transient_source_changes(self):
+        self.execute("write", {"path": "app.py", "content": "from dependency import answer\n"})
+        program = (
+            "from pathlib import Path; from shutil import rmtree; "
+            "dist = Path('dist'); dist.mkdir(); rmtree(dist); "
+            "dependency = Path('dependency.py'); dependency.write_text('answer = 42\\n'); "
+            "from app import answer; assert answer == 42; dependency.unlink()"
+        )
+        self.assertEqual(self.execute("exec", self.command(program))["status"], "ok")
+        self.assertIn("source files were touched", self.acceptance.validate("Verified."))
+
+    def test_incomplete_file_events_cannot_explain_a_directory_change(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        program = "from pathlib import Path; assert True; Path('dist').mkdir()"
+        with patch("task_acceptance.SourceEvents") as tracker:
+            tracker.return_value.finish.return_value = ({(self.workspace / "dist", True, True)}, False)
+            self.assertEqual(self.execute("exec", self.command(program))["status"], "ok")
+        self.assertIn("source files were touched", self.acceptance.validate("Verified."))
+
+    def test_shell_cd_failure_does_not_hide_a_later_relative_cd(self):
+        with tempfile.TemporaryDirectory() as external:
+            parent = Path(external).resolve()
+            workspace = parent / "project"
+            workspace.mkdir()
+            missing = shlex.quote(str(parent / "missing" / "directory"))
+            self.acceptance = TaskAcceptance("Analyze and fix", workspace=workspace)
+            write_source = self.command("from pathlib import Path; Path('app.py').write_text('answer = 42\\n')")
+            self.assertEqual(self.execute("exec", {
+                "cwd": str(workspace), "command": f"cd {missing}; cd .. && {write_source['command']}",
+            })["status"], "ok")
+            self.assertTrue((parent / "app.py").is_file())
+            self.assertIn("working directory could not be resolved", self.acceptance.validate("Fixed."))
+
+    def test_shell_cd_distinguishes_logical_and_physical_symlink_parents(self):
+        with tempfile.TemporaryDirectory() as external:
+            root = Path(external).resolve()
+            logical, physical = root / "logical", root / "physical"
+            logical.mkdir()
+            (physical / "child").mkdir(parents=True)
+            alias = logical / "alias"
+            alias.symlink_to(physical / "child", target_is_directory=True)
+            write_source = self.command("from pathlib import Path; Path('app.py').write_text('answer = 42\\n')")
+            for mode, parent in (("", logical), ("-L ", logical), ("-P ", physical)):
+                with self.subTest(mode=mode):
+                    source = parent / "app.py"
+                    source.unlink(missing_ok=True)
+                    self.acceptance = TaskAcceptance("Analyze and fix", workspace=self.workspace)
+                    result = self.execute("exec", {"command": (
+                        f"cd {mode}{shlex.quote(str(alias / '..'))} && {write_source['command']}"
+                    )})
+                    self.assertEqual(result["status"], "ok")
+                    self.assertTrue(source.is_file())
+                    problem = self.acceptance.validate("Fixed.")
+                    self.assertIn(str(source) if mode else "working directory could not be resolved", problem)
+
+    def test_shell_cd_with_inherited_symlink_pwd_cannot_skip_external_scope(self):
+        with tempfile.TemporaryDirectory() as external:
+            parent = Path(external).resolve()
+            alias = parent / "alias"
+            alias.symlink_to(self.workspace, target_is_directory=True)
+            create_source = self.command("from pathlib import Path; Path('app.py').write_text('answer = 42\\n')")
+            with patch.dict(os.environ, {"PWD": str(alias)}):
+                result = self.execute("exec", {"command": f"cd .. && {create_source['command']}"})
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue((parent / "app.py").is_file())
+            self.assertIn("working directory could not be resolved", self.acceptance.validate("Fixed."))
+
+    def test_runtime_created_external_directory_is_tracked(self):
+        with tempfile.TemporaryDirectory() as external:
+            root = Path(external).resolve() / "created"
+            self.acceptance = TaskAcceptance("Analyze and fix", workspace=self.workspace)
+            create_source = self.command("from pathlib import Path; Path('app.py').write_text('answer = 42\\n')")["command"]
+            directory = shlex.quote(str(root))
+            command = f"mkdir {directory} && cd {directory} && {create_source}"
+            self.assertEqual(self.execute("exec", {"command": command})["status"], "ok")
+            self.assertIn(str(root / "app.py"), self.acceptance.validate("Fixed."))
+            self.execute("exec", {**self.command("from app import answer; assert answer == 42"), "cwd": str(root)})
+            self.assertIsNone(self.acceptance.validate("Verified."))
+
+    def test_runtime_computed_cd_does_not_claim_success(self):
+        with tempfile.TemporaryDirectory() as external:
+            self.acceptance = TaskAcceptance("Analyze and fix", workspace=self.workspace)
+            create_source = self.command("from pathlib import Path; Path('app.py').write_text('answer = 42\\n')")["command"]
+            command = f'ROOT=$(printf %s {shlex.quote(external)}) && cd "$ROOT" && {create_source}'
+            self.assertEqual(self.execute("exec", {"command": command})["status"], "ok")
+            self.assertTrue((Path(external) / "app.py").is_file())
+            self.assertIn("working directory could not be resolved", self.acceptance.validate("Fixed."))
+            self.assertEqual(self.acceptance.status, "incomplete")
+
+    def test_standalone_and_composed_checks_keep_shell_local_directory(self):
+        with tempfile.TemporaryDirectory(prefix="check path ") as external:
+            source = Path(external) / "app.py"
+            source.write_text("answer = 42\n")
+            self.execute("read", {"path": str(source)})
+            self.assertEqual(self.execute("write", {"path": str(source), "content": "answer = 41\n"})["status"], "ok")
+            check = self.command("from app import answer; assert answer == 41")["command"]
+            command = f'ROOT={shlex.quote(external)} && cd "$ROOT" && {check}'
+            self.assertEqual(self.execute("exec", {"command": command + " | cat"})["status"], "ok")
+            self.assertEqual(self.acceptance.rerun_candidates(), [(command, ".")])
+            self.assertEqual(self.execute("exec", {"command": command})["status"], "ok")
+            self.assertIsNone(self.acceptance.validate("Verified."))
+
+    def test_retargeting_a_configured_manifest_needs_a_check(self):
+        first = self.workspace / "first.json"
+        second = self.workspace / "second.json"
+        for source in (first, second):
+            source.write_text("{}\n")
+        link = self.workspace / "servers.json"
+        link.symlink_to(first.name)
+        self.acceptance = TaskAcceptance(
+            "Change MCP config", workspace=self.workspace, configuration_paths=(link,),
+        )
+        self.execute("exec", self.command(
+            "from pathlib import Path; link = Path('servers.json'); "
+            "link.unlink(); link.symlink_to('second.json')"
+        ))
+        self.assertIn("servers.json", self.acceptance.validate("Config changed."))
+        self.execute("exec", self.command(
+            "from pathlib import Path; assert Path('servers.json').readlink().name == 'second.json'"
+        ))
+        self.assertIsNone(self.acceptance.validate("Checked config."))
+
+    def test_check_cannot_change_source_in_a_shell_cd_target(self):
+        with tempfile.TemporaryDirectory() as external:
+            root = Path(external).resolve()
+            source = root / "app.py"
+            source.write_text("answer = 41\n")
+            check = self.command(
+                "from pathlib import Path; Path('app.py').write_text('answer = 42\\n'); assert True"
+            )["command"]
+            for option in ("", "-- ", "-P "):
+                with self.subTest(option=option):
+                    source.write_text("answer = 41\n")
+                    self.acceptance = TaskAcceptance("Analyze and fix", workspace=self.workspace)
+                    result = self.execute("exec", {"command": f"cd {option}{shlex.quote(str(root))} && {check}"})
+                    self.assertEqual(result["status"], "ok")
+                    self.assertIn(str(source), self.acceptance.validate("Checked."))
+
+    def test_shell_cd_expands_environment_directory_for_tracking(self):
+        with tempfile.TemporaryDirectory() as external, patch.dict(os.environ, {"ASTER_TEST_SOURCE": external}):
+            self.acceptance = TaskAcceptance("Analyze and fix", workspace=self.workspace)
+            command = self.command("from pathlib import Path; Path('app.py').write_text('answer = 2\\n')")["command"]
+            self.execute("exec", {"command": f'cd "$ASTER_TEST_SOURCE" && {command}'})
+            self.assertIn("app.py", self.acceptance.validate("Fixed."))
+
+    def test_shell_cd_tracks_a_directory_assigned_inside_the_command(self):
+        for prefix in ("export ", ""):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory(prefix="external source ") as external:
+                self.acceptance = TaskAcceptance("Analyze and fix", workspace=self.workspace)
+                command = self.command("from pathlib import Path; Path('app.py').write_text('answer = 2\\n')")["command"]
+                result = self.execute("exec", {"command": (
+                    f"{prefix}ASTER_LOCAL_ROOT={shlex.quote(external)}; "
+                    f'cd "${{ASTER_LOCAL_ROOT}}" && {command}'
+                )})
+                self.assertEqual(result["status"], "ok")
+                self.assertIn("app.py", self.acceptance.validate("Fixed."))
+
+    def test_unreplayable_directory_change_does_not_verify_the_original_cwd(self):
+        with tempfile.TemporaryDirectory() as external:
+            root = Path(external).resolve()
+            (root / "app.py").write_text("answer = 0\n")
+            self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+            check = self.command("from app import answer; assert answer == 42")["command"]
+            self.execute("exec", {"command": f"cd {shlex.quote(str(root))}; {check} | cat"})
+            self.assertIsNotNone(self.acceptance.validate("Checked."))
+            self.assertEqual(self.acceptance.rerun_candidates(), [])
+
+    def test_tracked_external_directory_can_be_deleted_and_verified(self):
+        with tempfile.TemporaryDirectory() as external:
+            root = Path(external).resolve() / "legacy"
+            root.mkdir()
+            (root / "app.py").write_text("answer = 0\n")
+            self.execute("exec", {"cwd": str(root), "command": "pwd"})
+            self.execute("exec", self.command(
+                f"import shutil; from pathlib import Path; shutil.rmtree({str(root)!r}); "
+                f"Path({str(root)!r}).write_text('replaced')"
+            ))
+            self.assertIn("app.py", self.acceptance.validate("Removed."))
+            self.execute("exec", self.command(f"from pathlib import Path; assert Path({str(root)!r}).is_file()"))
+            self.assertIsNone(self.acceptance.validate("Removed and verified."))
+            revision = self.acceptance.verified_source()
+            self.assertTrue(TaskAcceptance("", workspace=self.workspace).source_matches(revision))
+
+    def test_contract_callbacks_must_all_pass_on_one_revision(self):
+        source = self.workspace / "app.py"
+        source.write_text("first = True\nsecond = False\n")
+        acceptance = TaskAcceptance(
+            "Inspect", TaskContract(kind="answer", checks=(lambda: None, lambda: None)),
+            workspace=self.workspace,
+        )
+        validate = acceptance.validate_callback
+
+        def switch_after_first(check):
+            result = validate(check)
+            source.write_text("first = False\nsecond = True\n")
+            return result
+
+        with patch.object(acceptance, "validate_callback", side_effect=switch_after_first):
+            self.assertIn("source revision changed", acceptance.validate("All checks passed."))
+        self.assertNotEqual(acceptance.status, "completed")
+        self.assertFalse(acceptance.check_results)
+
+    def test_process_write_after_resume_snapshot_is_not_rebaselined(self):
+        source = self.workspace / "app.py"
+        source.write_text("answer = 1\n")
+        initial = TaskAcceptance("Fix app.py", TaskContract(kind="change"), workspace=self.workspace)
+        resumed = TaskAcceptance("Summarize the command result", workspace=self.workspace)
+        snapshot = resumed._snapshot
+
+        def change_after_first_snapshot(*args):
+            files = snapshot(*args)
+            source.write_text("answer = 2\n")
+            return files
+
+        with patch.object(resumed, "_snapshot", side_effect=change_after_first_snapshot):
+            resumed.resume_process("owned", initial.source_checkpoint())
+        invocation = call("monitor", {"action": "wait", "session_id": "owned"})
+        resumed.before_tool(invocation)
+        resumed.observe(invocation, {"status": "ok", "data": {"state": "completed", "session_id": "owned"}})
+        self.assertIsNotNone(resumed.validate("Done."))
+        self.assertGreater(resumed.code_revision, 0)
+
+    def test_configuration_scope_preserves_parent_segments_after_symlinks(self):
+        target = self.workspace / "real" / "nested"
+        target.mkdir(parents=True)
+        alias = self.workspace / "alias"
+        alias.symlink_to(target)
+        config = alias / ".." / "servers.json"
+        config.write_text("{}\n")
+        self.acceptance = TaskAcceptance(
+            "Change config", workspace=self.workspace, configuration_paths=(config,),
+        )
+        result = self.execute("exec", self.command(
+            "from pathlib import Path; Path('real/servers.json').write_text('{\"change\": true}')"
+        ))
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("servers.json", self.acceptance.validate("Changed config."))
+
+    def test_initial_answer_rejects_unverified_own_edits_during_background_handoff(self):
+        self.acceptance = TaskAcceptance("分析并修改，团队后台继续", workspace=self.workspace)
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.assertIn("verify your own change", self.acceptance.validate("已安排。", background=True))
+
+    def test_read_only_answers_do_not_snapshot_the_workspace(self):
+        (self.workspace / "app.py").write_text("answer = 42\n")
+        with patch("task_acceptance.source_snapshot") as snapshot:
+            self.acceptance = TaskAcceptance(
+                "解释 app.py", workspace=self.workspace, passive_tools=frozenset({"read"})
+            )
+            self.assertEqual(self.execute("read", {"path": "app.py"})["status"], "ok")
+            self.assertIsNone(self.acceptance.validate("answer 的值为 42。"))
+        snapshot.assert_not_called()
+
+    def test_writing_a_report_and_failed_edits_do_not_require_code_verification(self):
+        (self.workspace / "app.py").write_text("answer = 42\n")
+        self.acceptance = TaskAcceptance("调研实现并写一份报告", workspace=self.workspace)
+        self.execute("read", {"path": "app.py"})
+        result = self.execute(
+            "edit", {"path": "app.py", "edits": [{"oldText": "absent", "newText": "43"}]}
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(
+            self.execute("write", {"path": "report.md", "content": "# 研究报告\n"})["status"],
+            "ok",
+        )
+        self.assertIsNone(self.acceptance.validate("已保存研究报告。"))
+        self.assertEqual(self.acceptance.kind, "answer")
+
+    def test_research_data_is_not_code_but_build_configuration_is(self):
+        self.acceptance = TaskAcceptance("保存研究结果", workspace=self.workspace)
+        self.execute("write", {"path": "results.json", "content": "{}\n"})
+        self.assertIsNone(self.acceptance.validate("已保存。"))
+        for path in (
+            "package.json", "pyproject.toml", ".github/workflows/test.yml",
+            "babel.config.json", ".eslintrc.json",
+            "builtin/environment-templates/coding-team.json", ".agent/environments/test.json", "mcp.json",
+        ):
+            with self.subTest(path=path):
+                self.acceptance = TaskAcceptance("说明结果", workspace=self.workspace)
+                self.execute("write", {"path": path, "content": "{}\n"})
+                self.assertIn(path, self.acceptance.validate("已完成。"))
+
+    def test_no_op_write_does_not_invalidate_a_check_or_handoff(self):
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        self.execute("edit", {"path": "app.py", "edits": [{"oldText": "42", "newText": "42"}]})
+        self.assertIsNone(self.acceptance.validate("已验证。"))
+        self.assertIsNone(self.acceptance.validate("团队还在后台工作。", background=True))
+
+    def test_plan_user_question_and_mcp_status_do_not_scan_an_answer_workspace(self):
+        self.acceptance = TaskAcceptance("解释方案", workspace=self.workspace)
+        with patch("task_acceptance.source_snapshot") as snapshot:
+            for name, arguments in (
+                ("update_plan", {}), ("ask_user", {}), ("mcp", {"action": "status"}),
+            ):
+                invocation = call(name, arguments)
+                self.acceptance.before_tool(invocation)
+                self.acceptance.observe(invocation, {"status": "ok"})
+            self.assertIsNone(self.acceptance.validate("方案可行。"))
+        snapshot.assert_not_called()
+
+    def test_team_wait_changes_belong_to_an_integrating_task_not_a_report(self):
+        for kind in ("answer", "change", "auto"):
+            with self.subTest(kind=kind):
+                self.acceptance = TaskAcceptance(
+                    "先分析问题再修复 app.py", TaskContract(kind), workspace=self.workspace
+                )
+                invocation = call("team", {"action": "wait"})
+                self.acceptance.before_tool(invocation)
+                (self.workspace / f"member_{kind}.py").write_text("answer = 42\n")
+                self.acceptance.observe(invocation, {"status": "ok"})
+                problem = self.acceptance.validate("已经收到成员回复。")
+                if kind == "answer":
+                    self.assertIsNone(problem)
+                else:
+                    self.assertIn(f"member_{kind}.py", problem)
+
+    def test_extending_scope_does_not_rebaseline_existing_workspace_changes(self):
+        root = self.workspace / "nested"
+        root.mkdir()
+        path = root / "app.py"
+        path.write_text("answer = 42\n")
+        self.acceptance = TaskAcceptance("修复 app.py", workspace=root)
+        self.execute("exec", {**self.command("from app import answer; assert answer == 42"), "cwd": str(root)})
+        invocation = call("exec", {"command": "true", "cwd": str(self.workspace)})
+        snapshot = self.acceptance._snapshot
+
+        def snapshot_before_mutation(*args, **kwargs):
+            files = snapshot(*args, **kwargs)
+            path.write_text("answer = 0\n")
+            return files
+
+        with patch.object(self.acceptance, "_snapshot", side_effect=snapshot_before_mutation):
+            self.acceptance.before_tool(invocation)
+        self.acceptance.observe(invocation, {"status": "ok"})
+        self.assertIn("app.py", self.acceptance.validate("已完成。"))
+
+    def test_tracking_error_is_not_cleared_by_a_later_passing_check(self):
+        self.acceptance = TaskAcceptance("说明结果", workspace=self.workspace)
+        invocation = call("delegate", {"tasks": []})
+        self.acceptance.before_tool(invocation)
+        (self.workspace / "app.py").write_text("answer = 42\n")
+        with patch("task_acceptance.source_snapshot", side_effect=PermissionError("unreadable")):
+            self.acceptance.observe(invocation, {"status": "ok"})
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        self.assertIn("unreadable", self.acceptance.validate("已验证。"))
+        self.assertEqual(self.acceptance.status, "incomplete")
+        self.assertEqual(self.acceptance.outcome()["verified_revision"], -1)
+
+    def test_snapshot_timeout_propagates(self):
+        self.acceptance = TaskAcceptance("说明结果", workspace=self.workspace)
+        with patch("task_acceptance.source_snapshot", side_effect=TimeoutError("deadline")):
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                self.acceptance.before_tool(call("exec", {"command": "true"}))
+
+    def test_new_dependency_invalidates_previous_check_after_owned_change(self):
+        self.acceptance = TaskAcceptance("先分析再修复 app.py", workspace=self.workspace)
+        self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+        self.execute("exec", self.command("from app import answer; assert answer == 42"))
+        (self.workspace / "plugin.py").write_text("enabled = True\n")
+        self.assertIn("plugin.py", self.acceptance.validate("已修改并验证。"))
+
+    def test_manifest_deletion_invalidates_verification_even_inside_a_check(self):
+        self.acceptance = TaskAcceptance("保存结果", workspace=self.workspace)
+        self.execute("write", {"path": "package.json", "content": "{}"})
+        self.execute("exec", self.command("assert __import__('json').load(open('package.json')) == {}"))
+        self.assertIsNone(self.acceptance.validate("已修改并验证。"))
+        self.execute("exec", self.command("from pathlib import Path; assert Path('package.json').is_file(); Path('package.json').unlink()"))
+        self.assertIn("package.json", self.acceptance.validate("已修改并验证。"))
+
+    def test_background_command_that_has_not_written_yet_prevents_completion(self):
+        self.acceptance = TaskAcceptance("先分析再修复 app.py", workspace=self.workspace)
+        command = self.command("from pathlib import Path; input(); Path('app.py').write_text('answer = 42')")
+        started = self.execute("exec", {**command, "background": True})
+        self.assertIn("still running", self.acceptance.validate("已完成。"))
+        session_id = started["data"]["session_id"]
+        self.execute("monitor", {"action": "input", "session_id": session_id, "input": "\n"})
+        self.execute("monitor", {"action": "wait", "session_id": session_id})
+        self.assertIn("app.py", self.acceptance.validate("已完成。"))
+
+    def test_monitor_file_watch_does_not_own_a_teammate_change(self):
+        self.acceptance = TaskAcceptance("汇报文件出现", TaskContract("answer"), workspace=self.workspace)
+        invocation = call("monitor", {"action": "watch", "path": "member.py"})
+        with patch("task_acceptance.source_snapshot") as snapshot:
+            self.acceptance.before_tool(invocation)
+            (self.workspace / "member.py").write_text("answer = 42\n")
+            self.acceptance.observe(invocation, {"status": "ok"})
+            self.assertIsNone(self.acceptance.validate("成员已经写入文件。"))
+        snapshot.assert_not_called()
+
+    def test_malformed_mcp_action_does_not_raise_in_tracking(self):
+        self.acceptance = TaskAcceptance("说明结果", workspace=self.workspace)
+        invocation = call("mcp", {"action": []})
+        self.acceptance.before_tool(invocation)
+        self.acceptance.observe(invocation, {"status": "error"})
+        self.assertEqual(self.acceptance.code_revision, 0)
+
+    def test_first_contract_callback_cannot_verify_its_own_changes(self):
+        def mutating_check():
+            (self.workspace / "app.py").write_text("answer = 42")
+
+        self.acceptance = TaskAcceptance(
+            "说明结果", TaskContract("answer", (mutating_check,)), workspace=self.workspace
+        )
+        self.assertIn("checks changed source", self.acceptance.validate("已验证。"))
+        self.assertNotEqual(self.acceptance.status, "completed")
+
+    def test_monitor_queries_for_unowned_processes_do_not_attribute_concurrent_writes(self):
+        for action in ("status", "wait"):
+            self.acceptance = TaskAcceptance("汇报状态", TaskContract("answer"), workspace=self.workspace)
+            invocation = call("monitor", {"action": action, "session_id": "previous-turn"})
+            self.acceptance.before_tool(invocation)
+            (self.workspace / f"plugin_{action}.py").write_text("present = True\n")
+            self.acceptance.observe(invocation, {"status": "ok", "data": {"state": "running"}})
+            self.assertIsNone(self.acceptance.validate("进程仍在运行。"))
+
+    def test_sending_input_to_a_prior_process_requires_observing_its_result(self):
+        command = self.command("from pathlib import Path; input(); input(); Path('app.py').write_text('answer = 42')")
+        started = json.loads(self.tools.execute(call("exec", {**command, "background": True})))
+        session_id = started["data"]["session_id"]
+        self.acceptance = TaskAcceptance("处理已有进程", workspace=self.workspace)
+        self.execute("monitor", {"action": "input", "session_id": session_id, "input": "\n"})
+        self.assertIn("still running", self.acceptance.validate("已完成。"))
+
+    def test_mcp_discovery_code_side_effects_require_verification(self):
+        for action in ("search", "describe"):
+            self.acceptance = TaskAcceptance("检查工具目录", workspace=self.workspace)
+            invocation = call("mcp", {"action": action})
+            self.acceptance.before_tool(invocation)
+            (self.workspace / f"start_{action}.py").write_text("present = True\n")
+            self.acceptance.observe(invocation, {"status": "ok"})
+            self.assertIn("no successful verification", self.acceptance.validate("目录可用。"))
+
+    def test_deleting_a_scratch_check_used_by_unchanged_source_invalidates_verification(self):
+        (self.workspace / "app.py").write_text("from pathlib import Path\nassert list(Path('.').glob('verify_*.py'))\n")
+        self.acceptance = TaskAcceptance("分析 app.py 并修复", workspace=self.workspace)
+        self.execute("write", {"path": "verify_tmp.py", "content": "assert True\n"})
+        self.execute("exec", {"command": f"{shlex.quote(sys.executable)} verify_tmp.py"})
+        self.assertIsNone(self.acceptance.validate("已检查。"))
+        self.execute("exec", {"command": "rm verify_tmp.py"})
+        self.assertIn("verify_tmp.py", self.acceptance.validate("已检查。"))
+
+    def test_executable_bit_change_invalidates_previous_check(self):
+        self.execute("write", {"path": "app.sh", "content": "#!/bin/sh\nexit 0\n"})
+        self.execute("exec", {"command": "chmod +x app.sh"})
+        self.execute("exec", self.command("from pathlib import Path; assert Path('app.sh').stat().st_mode & 0o111"))
+        self.assertIsNone(self.acceptance.validate("已检查。"))
+        self.execute("exec", {"command": "chmod -x app.sh"})
+        self.assertIn("app.sh", self.acceptance.validate("已检查。"))
+
+    def test_extensionless_launcher_changes_require_verification(self):
+        (self.workspace / "bin").mkdir()
+        path = self.workspace / "bin" / "agent"
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        self.acceptance = TaskAcceptance("检查上线步骤", workspace=self.workspace)
+        for mode in ("-x", "+x"):
+            self.execute("exec", self.command("from pathlib import Path; assert Path('bin/agent').exists()"))
+            self.assertIsNone(self.acceptance.validate("已检查。"))
+            self.execute("exec", {"command": f"chmod {mode} bin/agent"})
+            self.assertIn("bin/agent", self.acceptance.validate("已检查。"))
+
+    def test_acceptance_mode_tracking_preserves_legacy_resource_digests(self):
+        path = self.workspace / "launch.py"
+        path.write_text("print(42)\n")
+        path.chmod(0o755)
+        cache = {}
+        expected = file_state.file_digest(path)
+        with patch("file_state._digest_identity_is_settled", return_value=True):
+            tracked = file_state.source_snapshot((self.workspace,), cache=cache)
+            self.assertNotEqual(tracked[str(path)], expected)
+            self.assertEqual(file_state.cached_file_digest(path, cache), expected)
 
     def test_failed_latest_check_invalidates_previous_success(self):
         self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
@@ -66,7 +656,7 @@ class TaskAcceptanceTests(unittest.TestCase):
         )
         walks = []
         refresh = self.acceptance._refresh_files
-        self.acceptance._refresh_files = lambda: walks.append(1) or refresh()
+        self.acceptance._refresh_files = lambda **options: walks.append(1) or refresh(**options)
         self.execute("read", {"path": "app.py"})
         self.execute("grep", {"pattern": "answer"})
         self.assertEqual(walks, [])
@@ -252,14 +842,14 @@ class TaskAcceptanceTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(TaskAcceptance.shell_checks(command, self.workspace)[0])
 
-    def test_deleting_an_unused_scratch_check_keeps_the_verification(self):
+    def test_deleting_an_apparent_scratch_check_requires_verifying_final_layout(self):
         self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
         self.execute("write", {"path": "verify_tmp.py", "content": "assert True\n"})
         quoted = shlex.quote(sys.executable)
         self.execute("exec", {"command": f"{quoted} verify_tmp.py"})
         self.assertIsNone(self.acceptance.validate("已完成并验证。"))
         self.execute("exec", {"command": "rm verify_tmp.py"})
-        self.assertIsNone(self.acceptance.validate("已完成并验证。"))
+        self.assertIn("verify_tmp.py", self.acceptance.validate("已完成并验证。"))
         # A file the remaining code uses is no scratch file.
         self.execute("write", {"path": "helper.py", "content": "value = 42\n"})
         self.execute("write", {"path": "app.py", "content": "from helper import value\n"})
@@ -498,6 +1088,23 @@ class TaskAcceptanceTests(unittest.TestCase):
         (self.workspace / "other.py").write_text("unfinished = True\n")
         self.assertIsNone(self.acceptance.validate("已安排。", background=True))
         self.assertEqual(self.acceptance.status, "background")
+
+    def test_background_handoff_requires_reverification_after_transient_source_edits(self):
+        for prior_edit in (False, True):
+            with self.subTest(prior_edit=prior_edit):
+                self.acceptance = TaskAcceptance("Analyze and fix", workspace=self.workspace)
+                if prior_edit:
+                    self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
+                self.execute("exec", self.command("assert True"))
+                self.execute("exec", self.command(
+                    "from pathlib import Path; source = Path('temporary.py'); "
+                    "source.write_text('answer = 42\\n'); from temporary import answer; "
+                    "assert answer == 42; source.unlink()"
+                ))
+                self.assertIn("verify your own change", self.acceptance.validate("Handed off.", background=True))
+                self.execute("exec", self.command("assert True"))
+                (self.workspace / "teammate.py").write_text("work_in_progress = True\n")
+                self.assertIsNone(self.acceptance.validate("Handed off.", background=True))
 
     def test_a_failed_monitored_check_does_not_verify_own_edits_for_the_background(self):
         self.execute("write", {"path": "app.py", "content": "answer = 42\n"})

@@ -123,6 +123,7 @@ class Settings:
     provider: str = "api"
     auth_file: Path | None = None
     account: str = ""
+    mcp_config_source: Path | None = None
 
     @property
     def resolved_websearch_api_key(self) -> str | None:
@@ -163,6 +164,10 @@ class Settings:
         ).expanduser()
         if not prompt_file.is_absolute():
             prompt_file = workspace / prompt_file
+        mcp_source = Path(
+            os.environ.get("DEEPSEEK_MCP_CONFIG_FILE", str(DEFAULT_MCP_CONFIG_FILE))
+        ).expanduser().absolute()
+        mcp_path = mcp_source.resolve()
 
         return cls(
             **fields,
@@ -197,11 +202,8 @@ class Settings:
             .expanduser()
             .resolve(),
             mcp_enabled=env_flag("DEEPSEEK_MCP_ENABLED", True),
-            mcp_config_file=Path(
-                os.environ.get("DEEPSEEK_MCP_CONFIG_FILE", str(DEFAULT_MCP_CONFIG_FILE))
-            )
-            .expanduser()
-            .resolve(),
+            mcp_config_file=mcp_path,
+            mcp_config_source=mcp_source if mcp_source != mcp_path else None,
             request_timeout_seconds=max(
                 1, env_number("DEEPSEEK_REQUEST_TIMEOUT_SECONDS", float, "180")
             ),

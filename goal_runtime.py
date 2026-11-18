@@ -239,8 +239,12 @@ class GoalRuntime:
 
     def _completion_problem(self, deadline) -> str | None:
         conversation = self.conversation
+        if self.goal.verification_required:
+            return "核实并验证前几轮尚未通过验收的源码改动。"
         if (conversation.last_outcome or {}).get("status") != "completed":
             return "核实并完成上一轮尚未通过的验收，再检查整个目标。"
+        if self._verified_source_changed(deadline):
+            return "源码在验证后发生变化；重新检查当前版本。"
         plan = conversation.tools.task_plan if conversation.tools is not None else None
         if plan and any(step["status"] != "completed" for step in plan["steps"]):
             return "任务计划还有未完成步骤；完成这些步骤或按实际成果更新计划，再核对目标。"
@@ -255,6 +259,16 @@ class GoalRuntime:
             ):
                 return "团队讨论尚未结束；先收集并整合讨论结论。"
         return None
+
+    def _verified_source_changed(self, deadline) -> bool:
+        revision = self.goal.verified_source
+        if revision is None or self.conversation.goal_source_matches(revision, deadline):
+            return False
+        if self.goal.source_scope is None:
+            self.goal.source_scope = {key: revision[key] for key in ("roots", "paths")}
+        self.goal.verified_source = None
+        self.goal.verification_required = True
+        return True
 
     def run(self) -> GoalState:
         conversation = self.conversation
@@ -277,7 +291,10 @@ class GoalRuntime:
         try:
             self._save()
             kind = TaskAcceptance(goal.objective, has_tools=bool(conversation.definitions)).kind
-            if goal.phase == "review" and goal.review_fingerprint != self._review_fingerprint():
+            stale_source = self._verified_source_changed(deadline)
+            if goal.phase == "review" and (
+                stale_source or goal.review_fingerprint != self._review_fingerprint()
+            ):
                 goal.phase = "work"
                 goal.next_step = (
                     "会话在上次工作后发生变化；先重新核对目标当前成果和验证结果，再继续。"
@@ -295,13 +312,23 @@ class GoalRuntime:
                         self._save()
                         if self.on_round:
                             self.on_round(goal)
-                        self.ask_turn(
-                            self._prompt(),
-                            deadline=deadline,
-                            task_contract=TaskContract(
-                                kind=kind, description="\n".join(goal.criteria)
-                            ),
-                        )
+                        previous_outcome = conversation.last_outcome
+                        try:
+                            self.ask_turn(
+                                self._prompt(),
+                                deadline=deadline,
+                                task_contract=TaskContract(
+                                    kind=kind, description="\n".join(goal.criteria),
+                                    verification_required=goal.verification_required,
+                                    background_handoff=False,
+                                    integrate_team=True,
+                                ),
+                            )
+                        finally:
+                            if conversation.last_outcome is not previous_outcome:
+                                goal.verification_required = (conversation.last_outcome or {}).get(
+                                    "verification_required", goal.verification_required
+                                )
                         goal.phase = "review"
                         goal.review_fingerprint = self._review_fingerprint()
                         self._save()

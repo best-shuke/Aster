@@ -348,10 +348,13 @@ class EnvironmentStore:
         )
         mcp_enabled = baseline.mcp_enabled and inherit_mcp
         mcp_path = baseline.mcp_config_file
+        mcp_source = baseline.mcp_config_source
         if "mcp_config_file" in data:
             mcp_enabled = data["mcp_config_file"] is not None
             if mcp_enabled:
                 mcp_path = self._path(base, data["mcp_config_file"])
+                candidate = base / Path(data["mcp_config_file"]).expanduser()
+                mcp_source = candidate if candidate != mcp_path else None
         startup_servers = self.baseline_servers
         if (
             mcp_enabled
@@ -550,6 +553,7 @@ class EnvironmentStore:
             max_subagents=workers,
             mcp_enabled=mcp_enabled,
             mcp_config_file=mcp_path,
+            mcp_config_source=mcp_source,
         )
         return ResolvedEnvironment(
             entry,
