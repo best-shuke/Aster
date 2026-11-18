@@ -264,7 +264,7 @@ except SessionConflictError:
     def test_blocked_task_is_not_displayed_as_completed(self):
         client = FakeClient(
             {"role": "assistant", "tool_calls": [call("exec", {"command": "false"})]},
-            {"role": "assistant", "content": "无法完成，测试失败。"},
+            {"role": "assistant", "content": "无法继续，需要你提供缺失的输入样本。"},
         )
         conversation = Conversation(self.settings, client, self.tools)
         output = io.StringIO()
@@ -355,6 +355,33 @@ except SessionConflictError:
         conversation = Conversation(settings, client, self.tools)
         self.assertEqual(conversation.ask("更新 MCP 配置"), "已验证。")
         self.assertEqual(len(client.requests), 4)
+
+    def test_same_runtime_evidence_yields_same_partial_outcome_for_different_wording(self):
+        for index, wording in enumerate(("无法验证。", "无法执行测试。")):
+            with self.subTest(wording=wording):
+                filename = f"module_{index}.py"
+                client = FakeClient(
+                    {"role": "assistant", "tool_calls": [call("write", {"path": filename, "content": "answer = 42\n"})]},
+                    *[{"role": "assistant", "content": wording} for _ in range(3)],
+                )
+                conversation = Conversation(self.settings, client, self.tools)
+                output = io.StringIO()
+                with patch("sys.stdout", output):
+                    console = Console()
+                    with (
+                        patch("main.load_settings", return_value=replace(self.settings, mcp_enabled=False)),
+                        patch("main.Conversation", return_value=conversation),
+                        patch("main.Console", return_value=console),
+                        patch("sys.argv", ["agent", "修复代码"]),
+                    ):
+                        self.assertEqual(main.main(), 1)
+                self.assertEqual(console._task_state, "incomplete")
+                self.assertEqual(conversation.last_outcome["status"], "incomplete")
+                self.assertEqual(conversation.last_outcome["verification_status"], "not_run")
+                self.assertEqual(len(client.requests), 4)
+                self.assertIn("部分结果（未验证）", output.getvalue())
+                self.assertIn(wording, output.getvalue())
+                self.assertIn(".invalid-response.json", output.getvalue())
 
     def test_a_rerun_that_fails_rejects_the_answer_with_its_output(self):
         verification = "from app import answer; assert answer == 42, answer"

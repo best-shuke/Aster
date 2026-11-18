@@ -693,7 +693,47 @@ class TaskAcceptanceTests(unittest.TestCase):
         self.execute("write", {"path": "app.py", "content": "answer = 42\n"})
         started = self.execute("exec", {**self.command("input(); assert True"), "background": True})
         self.execute("monitor", {"action": "stop", "session_id": started["data"]["session_id"]})
-        self.assertIn("unresolved", self.acceptance.validate("已完成并验证。"))
+        self.assertIn("result is unknown", self.acceptance.validate("已完成并验证。"))
+        self.assertEqual(self.acceptance.outcome()["verification_status"], "unknown")
+
+    def test_stopped_check_without_edits_carries_verification_into_the_next_round(self):
+        self.execute("exec", self.command("assert True"))
+        started = self.execute("exec", {**self.command("input(); assert True"), "background": True})
+        self.execute("monitor", {"action": "stop", "session_id": started["data"]["session_id"]})
+
+        self.assertIn("result is unknown", self.acceptance.validate("已完成。"))
+        outcome = json.loads(json.dumps(self.acceptance.outcome()))
+        self.assertEqual(outcome["code_revision"], 0)
+        self.assertEqual(outcome["verification_status"], "unknown")
+        self.assertTrue(outcome["verification_required"])
+        self.assertEqual(self.acceptance.last_passed_check, -1)
+
+        self.acceptance = TaskAcceptance(
+            "继续任务", TaskContract("answer", verification_required=outcome["verification_required"]),
+            workspace=self.workspace,
+        )
+        self.assertIn("no successful verification", self.acceptance.validate("已完成。"))
+        self.execute("exec", self.command("assert True"))
+        self.assertIsNone(self.acceptance.validate("已验证。"))
+        self.assertFalse(self.acceptance.outcome()["verification_required"])
+
+    def test_failed_explicit_acceptance_check_controls_outcome_until_recovery(self):
+        for shell_checked in (False, True):
+            with self.subTest(shell_checked=shell_checked):
+                failure = "required integration check failed"
+                results = iter((failure, None))
+                self.acceptance = TaskAcceptance(
+                    "检查集成", TaskContract("answer", checks=(lambda: next(results),)),
+                    workspace=self.workspace,
+                )
+                if shell_checked:
+                    self.execute("exec", self.command("assert True"))
+                self.assertEqual(self.acceptance.validate("已完成。"), f"Task acceptance failed: {failure}")
+                self.assertEqual(self.acceptance.outcome()["verification_status"], "failed")
+                self.assertTrue(self.acceptance.outcome()["verification_required"])
+                self.assertIsNone(self.acceptance.validate("已验证。"))
+                self.assertEqual(self.acceptance.outcome()["verification_status"], "passed")
+                self.assertFalse(self.acceptance.outcome()["verification_required"])
 
     def test_shell_write_requires_a_later_check(self):
         self.execute(
@@ -1220,20 +1260,17 @@ class BlockerAttributionTests(unittest.TestCase):
 
     def test_own_inability_is_a_blocker(self):
         for text in (
-            "无法完成，测试失败。",
-            "由于缺少依赖，无法执行测试。",
             "我已经修复了一半，但我无法继续：缺少权限。",
             "I fixed the parser. I cannot proceed without the API key.",
             "Unable to complete the migration: the database is read-only.",
             "需要你确认 n=1 时的行为。",
             # 之前 here means "until"; 其他 is not the pronoun 他; critic is an object.
             "在你确认之前，我无法继续。",
-            "其他测试无法执行，所以没有验证。",
-            "我让 critic 运行测试，但无法完成验证。",
-            "I asked the critic to run them, but cannot proceed.",
+            "我让 critic 运行测试，但因缺少授权无法完成验证。",
+            "I asked the critic to run them, but cannot proceed without credentials.",
             # The user and critic only say where the file and tests came from.
-            "用户提供的文件无法执行。",
-            "critic 写的测试无法执行，缺少依赖。",
+            "用户提供的文件无法执行，缺少权限。",
+            "critic 写的测试无法执行，缺少凭据。",
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.status(text), "blocked")
@@ -1254,6 +1291,12 @@ class BlockerAttributionTests(unittest.TestCase):
                 self.assertEqual(self.status(text), "completed")
 
     def test_unknown_names_still_count_as_the_agents_own_blocker(self):
-        self.assertEqual(self.status("pytest 无法执行，缺少依赖。", others=()), "blocked")
-        self.assertEqual(self.status("critic 无法执行测试。", others=()), "blocked")
-        self.assertEqual(self.status("critic 无法执行测试。"), "completed")
+        self.assertEqual(self.status("pytest 无法执行，缺少权限。", others=()), "blocked")
+        self.assertEqual(self.status("critic 无法执行测试，缺少权限。", others=()), "blocked")
+        self.assertEqual(self.status("critic 无法执行测试，缺少权限。"), "completed")
+
+    def test_self_reported_inability_without_external_blocker_does_not_complete(self):
+        for wording in ("无法验证。", "无法执行测试。", "无法完成，测试失败。"):
+            acceptance = self.acceptance()
+            self.assertIn("not finished", acceptance.validate(wording))
+            self.assertNotIn(acceptance.status, {"blocked", "completed"})

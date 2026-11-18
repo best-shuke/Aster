@@ -298,6 +298,7 @@ class TaskRuntime:
         check_active=None,
         cancelled=None,
         wire_cache: WireCache | None = None,
+        incomplete_final=None,
     ):
         deadline = min(deadline, getattr(client, "deadline", None) or deadline)
         self.client, self.settings, self.deadline = client, settings, deadline
@@ -309,6 +310,7 @@ class TaskRuntime:
         self.progress = TaskProgress(settings.workspace)
         self.recovery = OutputRecovery(client, settings, deadline)
         self.final_validator = final_validator
+        self.incomplete_final = incomplete_final
         self.requests = 0
         self.summary_requests = 0
         self.protocol_repairs = 0
@@ -605,7 +607,9 @@ class TaskRuntime:
             artifact_path=str(artifact) if artifact else None,
         )
         if self.protocol_repairs > 2:
-            raise CompletionError("invalid_final_response", problem, partial_message=response)
+            failure = CompletionError("invalid_final_response", problem, partial_message=response)
+            failure.artifact_path = str(artifact) if artifact else None
+            raise failure
         direction = (
             "Use only structured tool calls from the available interface, or give the final answer."
             if definitions
@@ -718,9 +722,16 @@ class TaskRuntime:
                         exc.partial_message = response
                     raise
                 if problem:
-                    with trace_scope(self.last_request_trace):
-                        repair = self._repair_instruction(response, problem, definitions)
-                    continue
+                    try:
+                        with trace_scope(self.last_request_trace):
+                            repair = self._repair_instruction(response, problem, definitions)
+                    except CompletionError as exc:
+                        partial = self.incomplete_final(exc) if self.incomplete_final else None
+                        if partial is None:
+                            raise
+                        response = {"role": "assistant", "content": partial}
+                    else:
+                        continue
                 if time.monotonic() >= self.deadline:
                     raise CompletionError(
                         "task_deadline",

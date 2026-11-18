@@ -187,6 +187,27 @@ class GoalRuntimeTests(unittest.TestCase):
         self.assertIn("42", (self.workspace / "feature.py").read_text())
         self.assertEqual(len(conversation.client.requests), 7)
 
+    def test_goal_retries_an_incomplete_round_before_accepting_completion(self):
+        conversation = self.conversation(
+            use("write", path="feature.py", content="answer = 42\n"),
+            say("无法验证。"),
+            say("无法执行测试。"),
+            say("无法验证。"),
+            assessment(),
+            use("exec", command=python_command("from feature import answer; assert answer == 42")),
+            say("已通过验证。"),
+            assessment(),
+            tools=True,
+        )
+        self.start(conversation, "分析并修复 feature.py")
+        observed = []
+        runtime = GoalRuntime(
+            conversation,
+            on_review=lambda _goal: observed.append(conversation.last_outcome["status"]),
+        )
+        self.assertEqual(runtime.run().status, "completed")
+        self.assertEqual(observed, ["incomplete", "completed"])
+
     def test_analysis_goal_round_cannot_accept_an_unverified_source_change(self):
         conversation = self.conversation(
             use("write", path="feature.py", content="answer = 42\n"),

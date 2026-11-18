@@ -929,6 +929,16 @@ class Conversation:
                 raise CompletionError("verification_unknown", problem)
             return problem
 
+        def incomplete_final(error):
+            if final_validator or acceptance.terminal_problem != str(error):
+                return None
+            acceptance.status = "incomplete"
+            return (
+                "未完成：当前改动尚未通过验证。\n\n" + str(error)
+                + "\n\n部分结果（未验证）：\n" + error.partial_message["content"]
+                + (f"\n\n原始答复已保留：`{error.artifact_path}`" if error.artifact_path else "")
+            )
+
         # Members work during the turn; afterwards they pause or, interactively, continue
         # in the background. Pending work resumes next turn. The team's turn starts before
         # the turn note so that it takes over background work first: nothing finishes in
@@ -963,7 +973,8 @@ class Conversation:
                 raise
             self.save()
             runtime = TaskRuntime(
-                self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache
+                self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache,
+                incomplete_final=incomplete_final,
             )
             try:
                 answer = self._run_turn(
@@ -977,8 +988,11 @@ class Conversation:
                     on_reasoning,
                     on_tool_result,
                 )
-            except BaseException:
-                acceptance.status = "incomplete"
+            except BaseException as exc:
+                acceptance.status = (
+                    "cancelled" if isinstance(exc, KeyboardInterrupt)
+                    or getattr(exc, "code", None) == "cancelled" else "incomplete"
+                )
                 self._save_outcome(acceptance)
                 raise
             finally:

@@ -228,7 +228,7 @@ class ReliabilityTests(unittest.TestCase):
             run_interactive(conversation, console)
         self.assertEqual(console.prompt.call_count, 2)
         self.assertIn("useful partial work", self.settings.session_file.read_text())
-        self.assertEqual(conversation.last_outcome["status"], "incomplete")
+        self.assertEqual(conversation.last_outcome["status"], "cancelled")
 
     def test_promise_only_response_is_repaired_before_publication(self):
         client = Mock()

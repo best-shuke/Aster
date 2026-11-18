@@ -579,7 +579,7 @@ print('RESULT:' + json.dumps({'status': status,
     def test_escape_during_a_stream_preserves_the_partial_response(self):
         result = self.read_keys(b"\x1b", width=80, code=STREAM_CODE, ready_marker=b"FIRST_ANSWER")
         self.assertIsNone(result["answer"])
-        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["status"], "cancelled")
         self.assertEqual(result["ui_status"], "paused")
         self.assertTrue(result["live_closed"])
         self.assertTrue(result["checkpointed"])

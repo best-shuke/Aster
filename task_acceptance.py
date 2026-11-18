@@ -25,11 +25,18 @@ from tool_runtime import command_environment
 
 # The agent cannot go on, or it waits on the user.
 INABILITY = re.compile(
-    r"(?:无法|不能|未能).{0,12}(?:完成|继续|执行)"
+    r"(?:无法|不能|未能).{0,12}(?:完成|继续|执行|验证)"
     r"|\b(?:blocked by|cannot proceed|unable to complete)\b",
     re.I,
 )
 NEEDS_USER = re.compile(r"需要你.{0,20}(?:提供|确认)|\bneed your clarification\b", re.I)
+EXTERNAL_REQUIREMENT = re.compile(
+    r"缺少.{0,15}(?:权限|凭据|密钥|材料|授权)|(?:你|用户).{0,16}(?:确认|提供|授权)"
+    r"|请(?:你)?(?:确认|提供|授权).{0,16}(?:目标|文件|路径|材料|权限|凭据|密钥)"
+    r"|\b(?:without|missing|need(?:s|ed)?)\b.{0,40}\b(?:credentials?|api key|permission|approval)\b"
+    r"|\b(?:database|volume|filesystem) is read-only\b",
+    re.I,
+)
 # The user lets the agent answer while delegated work goes on ("不要等待它完成", "don't wait").
 # 等 must be about waiting for someone or end the clause: not 等宽, 不要等太久 or 区别等.
 HANDOFF = re.compile(
@@ -694,6 +701,8 @@ class TaskAcceptance:
         self.code_revision = int(self.contract.verification_required)
         self.verified_revision = -1
         self.failed_verifications = {}
+        self.unknown_verification = None
+        self.terminal_problem = None
         # Evidence indexes of this agent's latest own source change and of
         # where its latest passing standalone check started (a background check finishes
         # later), whatever the code revision then was.
@@ -1106,7 +1115,9 @@ class TaskAcceptance:
                     self.pending_verifications.pop(data["session_id"])
                 )
                 record["verification_session_id"] = data["session_id"]
-                verification_result = {"status": "ok" if data["state"] == "completed" else "error"}
+                verification_result = {"status": {
+                    "completed": "ok", "failed": "error", "timed_out": "timeout", "stopped": "unknown",
+                }[data["state"]]}
         command = arguments.get("command", "")
         checks, proven, attributable, leading = (
             self.shell_checks(command, self._command_cwd(arguments))
@@ -1146,6 +1157,7 @@ class TaskAcceptance:
                     self.last_passed_check = started_at
                     self.last_verification = index
                     self.verified_revision = self.code_revision
+                    self.unknown_verification = None
                     self.unverified_changes = []
                     self.reruns = []
             elif verification_result.get("status") == "ok":
@@ -1157,6 +1169,12 @@ class TaskAcceptance:
             elif attributable and (unavailable := check_unavailable(checks[0][1], data)):
                 # The runner is missing: no check ran, so nothing failed or passed.
                 record["verification_unavailable"] = unavailable
+                record["command"] = excerpt_command(command)
+            elif verification_result.get("status") in {"unknown", "timeout"}:
+                record["verification_unknown"] = True
+                record["command"] = excerpt_command(command)
+                self._invalidate_verification()
+                self.unknown_verification = record
             elif attributable:
                 record["command"] = excerpt_command(command)
                 if checks[0][2] is not None:
@@ -1337,6 +1355,7 @@ class TaskAcceptance:
         not final yet, so they are not required to be verified now.
         """
         self.status = "in_progress"
+        self.terminal_problem = None
         self._refresh_files(own=bool(self._background_exec))
         if self._tracking_error:
             self.status = "incomplete"
@@ -1346,7 +1365,11 @@ class TaskAcceptance:
                 + ". Inspect the actual workspace before retrying."
             )
         text = content.strip()
-        blocked = self.reports_blocker(text)
+        unquoted = QUOTED.sub(" ", text)
+        unable = self.reports_blocker(text)
+        blocked = unable and bool(
+            NEEDS_USER.search(unquoted) or EXTERNAL_REQUIREMENT.search(unquoted)
+        )
         work_task = (
             self.kind in {"change", "inspect"} or bool(self.evidence) or bool(self.contract.checks)
         )
@@ -1368,15 +1391,12 @@ class TaskAcceptance:
             )
         ):
             return "The response only promises future work. Perform the next action or give a substantive answer or concrete blocker."
-        if self.kind in {"change", "inspect"} and not any(
-            e["status"] == "ok" for e in self.evidence
-        ):
-            return "No successful tool evidence supports completion of this task. Inspect and perform the requested work, or state the concrete blocker."
         if self._background_exec and not (self.handoff_allowed and self.last_own_edit < 0):
-            return (
+            self.terminal_problem = (
                 "A background command is still running and can change the workspace. Use monitor "
                 "to observe its terminal result before reporting completion, or stop it if no longer needed."
             )
+            return self.terminal_problem
         if background or self._background_exec:
             # Teammates' unfinished edits are not final yet, but this agent's own are.
             if self.contract.verification_required and self.verified_revision != self.code_revision:
@@ -1395,7 +1415,17 @@ class TaskAcceptance:
         if self.kind == "change" or self.code_revision:
             problem = self.verification_problem()
             if problem:
+                self.terminal_problem = problem
                 return problem
+        if unable and work_task:
+            self.terminal_problem = (
+                "The task is not finished. Continue from the observed results or identify the external input needed."
+            )
+            return self.terminal_problem
+        if self.kind in {"change", "inspect"} and not any(
+            e["status"] == "ok" for e in self.evidence
+        ):
+            return "No successful tool evidence supports completion of this task. Inspect and perform the requested work, or state the concrete blocker."
         self.check_results = []
         if self.contract.checks:
             revision = self.code_revision
@@ -1441,6 +1471,11 @@ class TaskAcceptance:
             return "Acceptance checks changed source files; they did not verify the resulting revision."
         return problem
 
+    def _current_unknown_verification(self):
+        if self.unknown_verification and self.unknown_verification["code_revision"] == self.code_revision:
+            return self.unknown_verification
+        return None
+
     def verification_problem(self, *, monitored=True):
         """What leaves the latest code revision unverified, or None.
 
@@ -1468,6 +1503,9 @@ class TaskAcceptance:
             )
         if self.pending_verifications and monitored:
             return "Background verification is still running. Use monitor to observe its final result before reporting completion."
+        if unknown := self._current_unknown_verification():
+            command = unknown["command"]
+            return f"Verification result is unknown for `{command}`. Inspect the result or rerun the check."
         if (
             self.code_revision > 0
             and self.verified_revision != self.code_revision
@@ -1492,8 +1530,13 @@ class TaskAcceptance:
                     "argument for its directory; chaining setup with && is fine."
                     + self._changes_note()
                 )
+            unavailable = next((
+                record["verification_unavailable"] for record in reversed(self.evidence)
+                if record.get("code_revision") == self.code_revision and record.get("verification_unavailable")
+            ), None)
             return (
                 "Code was changed but no successful verification followed the last edit. Run a relevant standalone test/build/assertion, or explicitly report why validation is blocked."
+                + (f" The attempted check did not run: {unavailable}." if unavailable else "")
                 + self._changes_note()
             )
         return None
@@ -1511,6 +1554,18 @@ class TaskAcceptance:
         )
 
     def outcome(self):
+        if self._tracking_error or self._current_unknown_verification():
+            verification_status = "unknown"
+        elif self.failed_verifications or any(not result["passed"] for result in self.check_results):
+            verification_status = "failed"
+        elif self.pending_verifications:
+            verification_status = "running"
+        elif self.verified_revision == self.code_revision or (
+            self.status == "completed" and self.check_results
+        ):
+            verification_status = "passed"
+        else:
+            verification_status = "not_run" if self.code_revision else "not_required"
         return {
             "kind": self.kind,
             "status": self.status,
@@ -1520,12 +1575,13 @@ class TaskAcceptance:
             "code_revision": self.code_revision,
             "verified_revision": self.verified_revision,
             "verification_required": bool(
-                self._tracking_error or self.failed_verifications or self.pending_verifications
+                verification_status in {"unknown", "failed", "running"}
                 or self._background_exec
                 or (
                     self.code_revision and self.verified_revision != self.code_revision
                     and not (self.status == "completed" and self.check_results)
                 )
             ),
+            "verification_status": verification_status,
             **({"tracking_error": self._tracking_error} if self._tracking_error else {}),
         }
