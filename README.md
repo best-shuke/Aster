@@ -67,6 +67,14 @@ uv sync --locked
 TERM=xterm-256color uv run --locked python -m unittest discover -s tests
 ```
 
+离线任务评测使用固定模型响应和临时工作区，不读取真实凭据或调用模型服务。单独重跑并输出指标：
+
+```bash
+TERM=xterm-256color ASTER_EVAL_METRICS=1 uv run --locked python -m unittest tests.test_task_evaluation
+```
+
+指标包含完成状态、修复次数、工具与模型请求数、上下文压缩、耗时和已报告用量。耗时仅用于观察，不作为 CI 门槛。
+
 终端渲染测试需要正常终端类型，上述命令显式设置 `TERM`，也可用于无交互执行环境。
 
 测试使用合成数据、临时目录和模拟模型客户端；部分协议测试会启动本地 fixture 进程或回环服务，不需要真实模型密钥。具体 MCP/技能能力包及其专用测试不在本框架仓库内。
