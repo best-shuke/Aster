@@ -1,13 +1,17 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from context_management import OutputRecovery
+from context_budget import LOCAL_METADATA
 from conversation import Conversation
 from deepseek_client import CompletionError
+from goals import GoalState
+from request_budget import budget_scope
 from skills import SkillCatalog
 from tests.support import make_settings
 from tools import CodingTools
@@ -135,6 +139,60 @@ class ConversationTests(unittest.TestCase):
         ):
             self.assertEqual(conversation.ask("Hello."), "Done.")
         self.assertEqual(save.call_count, 2)
+
+    def test_late_delegate_usage_is_saved_to_its_archived_session_and_goal(self):
+        release = threading.Event()
+        ready = threading.Event()
+        worker = []
+        assignment = {
+            "id": "delegate-1", "type": "function", "function": {
+                "name": "delegate", "arguments": json.dumps({
+                    "tasks": [{"task": "Recall a fact", "expected_output": "A fact", "mode": "reason"}],
+                    "timeout": 1,
+                }),
+            },
+        }
+
+        class DelayedClient(FakeClient):
+            def complete(inner, *args, **kwargs):
+                if threading.current_thread().name == "subagent":
+                    worker.append(threading.current_thread())
+                    ready.set()
+                    release.wait(5)
+                    return {"role": "assistant", "content": "late fact", LOCAL_METADATA: {
+                        "usage": {"prompt_tokens": 40, "completion_tokens": 20},
+                    }}
+                result = super().complete(*args, **kwargs)
+                result[LOCAL_METADATA] = {"usage": {"prompt_tokens": 0, "completion_tokens": 0}}
+                return result
+
+        client = DelayedClient(
+            {"role": "assistant", "tool_calls": [assignment]},
+            {"role": "assistant", "content": "The investigation timed out."},
+        )
+        settings = self.settings(session_token_budget=100000, goal_token_budget=100000, max_output_tokens=100)
+        client.settings = settings
+        conversation = Conversation(settings, client, CodingTools(self.workspace))
+        self.addCleanup(conversation.close)
+        conversation.goal = GoalState("Explain a fact")
+        ledger = conversation._restore_goal_budget(conversation.goal)
+        session_id = conversation.session_id
+        try:
+            with budget_scope(ledger):
+                conversation.ask("Explain a fact.")
+            self.assertTrue(ready.is_set())
+            self.assertEqual(conversation.sessions.read()["token_budget"]["measured"], 0)
+            conversation.clear()
+        finally:
+            release.set()
+            for thread in worker:
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+        archived = conversation.sessions.read(conversation.sessions.snapshot_path(session_id))
+        self.assertEqual(archived["token_budget"]["measured"], 60)
+        self.assertEqual(archived["token_budget"]["reserved"], 0)
+        self.assertEqual(archived["goal"]["token_budget"]["measured"], 60)
+        self.assertEqual(conversation.session_budget.snapshot()["measured"], 0)
 
     def test_operation_lock_is_released_after_failure_or_interruption(self):
         conversation = Conversation(self.settings(), FakeClient(), CodingTools(self.workspace))

@@ -17,6 +17,7 @@ class TokenBudgetExhausted(RuntimeError):
 _lock = RLock()
 _scopes = ContextVar("token_budget_scopes", default=())
 _attempt = ContextVar("token_budget_attempt", default=None)
+_persistence = ContextVar("token_budget_persistence", default=None)
 
 
 @dataclass(eq=False)
@@ -57,6 +58,23 @@ def current_budgets():
 
 def restore_budget(name, limit, data=None):
     return TokenBudget.restore(name, limit, data) if limit is not None or data else None
+
+
+@contextmanager
+def budget_persistence(callback):
+    """Keep the owner's persistence hook in inherited worker contexts."""
+    token = _persistence.set(callback)
+    try:
+        yield
+    finally:
+        _persistence.reset(token)
+
+
+def persist_budgets():
+    callback = _persistence.get()
+    ledgers = current_budgets()
+    if callback is not None and ledgers:
+        callback(ledgers)
 
 
 @contextmanager

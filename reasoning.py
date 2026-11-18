@@ -24,6 +24,7 @@ from contracts import (
 from deepseek_client import CompletionError
 from execution_trace import display_callback, emit_event, trace_scope
 from file_changes import FileMergeConflict, FileTransaction
+from request_budget import persist_budgets
 from task_runtime import TaskRuntime
 from tool_runtime import ExecutionContext, ToolResult
 from usage import CacheStats
@@ -513,8 +514,11 @@ class ReasoningTools:
                             report.data["file_changes"] = changes.summary("staged")
                 finally:
                     try:
-                        if self.on_worker_finish:
-                            self.on_worker_finish()
+                        try:
+                            persist_budgets()
+                        finally:
+                            if self.on_worker_finish:
+                                self.on_worker_finish()
                     finally:
                         for semaphore in acquired:
                             semaphore.release()

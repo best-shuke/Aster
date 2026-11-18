@@ -42,7 +42,7 @@ from execution_trace import (
 )
 from goals import GoalState
 from mcp_client import McpManager
-from request_budget import budget_scope, current_budgets, restore_budget
+from request_budget import budget_persistence, budget_scope, current_budgets, restore_budget
 from sessions import SessionStore
 from skills import SkillCatalog
 from task_acceptance import TaskAcceptance, TaskContract
@@ -676,6 +676,7 @@ class Conversation:
                 scope,
                 trace_scope(self.last_task_trace, self.event_sink),
                 budget_scope(self.session_budget, task_budget),
+                budget_persistence(self._save_background_budget),
             ):
                 emit_event("task_started")
                 try:
