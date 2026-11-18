@@ -158,12 +158,16 @@ class Conversation:
         }
 
     def context_status(self) -> dict:
-        return context_snapshot(
+        snapshot = context_snapshot(
             [self._runtime_system_message(), *self.messages],
             self.definitions,
             self.settings,
             self._wire_cache,
         )
+        if not self.messages:
+            # The idle display starts empty; request budgeting still counts the full prompt.
+            snapshot.update(tokens=0, chars=0, source="estimate", anchor_index=None)
+        return snapshot
 
     def _load(self) -> list[Message]:
         if not self.settings.session_file.exists():

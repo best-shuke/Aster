@@ -344,6 +344,31 @@ class BudgetTests(unittest.TestCase):
         restored.clear()
         self.assertEqual(restored.client.cache_stats.snapshot()["calls"], 0)
 
+    def test_empty_session_display_waits_for_the_first_request(self):
+        conversation = Conversation(self.settings, DeepSeekClient(self.settings), CodingTools(self.root))
+        self.addCleanup(conversation.close)
+        empty = conversation.context_status()
+        self.assertEqual(empty["tokens"], 0)
+        self.assertEqual(empty["chars"], 0)
+        actual = context_snapshot(
+            [conversation._runtime_system_message()], conversation.definitions, self.settings
+        )
+        self.assertGreater(actual["tokens"], 0)
+        self.assertEqual(empty["budget_tokens"], actual["budget_tokens"])
+        progress = []
+
+        def send(request, **_options):
+            body = json.loads(request.data)
+            self.assertTrue(body["tools"])
+            self.assertIn(conversation.system_message["content"], body["messages"][0]["content"])
+            self.assertGreater(conversation.context_status()["tokens"], 0)
+            return stream({"prompt_tokens": 20000, "completion_tokens": 1000})
+
+        with patch("http_transport.open_url", side_effect=send):
+            conversation.ask("What is 1 plus 1?", on_progress=progress.append)
+        self.assertTrue(any(event.get("phase") == "context" and event["tokens"] > 0 for event in progress))
+        self.assertEqual(conversation.context_status()["tokens"], 21000)
+
     def test_ui_context_snapshot_reuses_provider_usage_and_updates_after_clear(self):
         conversation = Conversation(self.settings, DeepSeekClient(self.settings), None)
         with patch(
@@ -364,7 +389,7 @@ class BudgetTests(unittest.TestCase):
         conversation.clear()
         cleared = conversation.context_status()
         self.assertEqual(cleared["source"], "estimate")
-        self.assertLess(cleared["tokens"], snapshot["tokens"])
+        self.assertEqual(cleared["tokens"], 0)
 
     def test_context_snapshot_reports_character_mode_without_changing_token_display(self):
         settings = replace(self.settings, max_context_chars=120000)
