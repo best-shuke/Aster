@@ -369,7 +369,11 @@ class _ResponsesEvents:
         } and not isinstance(delta, str):
             raise CompletionError("invalid_response", "Response delta must be text", retryable=True)
         if kind == "response.output_text.delta":
-            item = event.get("item_id")
+            item = (
+                self._refusal_key(event)[0]
+                if "item_id" in event or "output_index" in event
+                else None
+            )
             separator = "\n\n" if self.text_item not in (None, item) else ""
             self.text_item = item
             return [_chunk(content=separator + delta)] if isinstance(delta, str) else []

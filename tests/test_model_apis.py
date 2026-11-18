@@ -793,6 +793,74 @@ class ResponsesIdentityTests(unittest.TestCase):
                         client._read_stream(io.BytesIO(encode_sse([row])), lambda _: None)
                     self.assertEqual(error.exception.code, "invalid_response")
 
+    def test_mixed_text_and_refusal_share_one_message_identity(self):
+        for refusal_first in (False, True):
+            parts = [
+                {"type": "output_text", "text": "Prefix "},
+                {"type": "refusal", "refusal": "No."},
+            ]
+            if refusal_first:
+                parts.reverse()
+            expected = "".join(part.get("text", part.get("refusal", "")) for part in parts)
+            item = {"type": "message", "id": "msg", "role": "assistant", "content": parts}
+            for text_id in ({"item_id": "msg"}, {"output_index": 0}):
+                for refusal_delta in (False, True):
+                    rows = [{
+                        "type": "response.output_item.added", "output_index": 0,
+                        "item": {**item, "content": []},
+                    }]
+                    for index, part in enumerate(parts):
+                        if part["type"] == "output_text":
+                            rows.append({
+                                "type": "response.output_text.delta", **text_id,
+                                "content_index": index, "delta": part["text"],
+                            })
+                        elif refusal_delta:
+                            rows.append({
+                                "type": "response.refusal.delta", "item_id": "msg",
+                                "content_index": index, "delta": part["refusal"],
+                            })
+                        else:
+                            rows.append({
+                                "type": "response.refusal.done", "item_id": "msg",
+                                "content_index": index, "refusal": part["refusal"],
+                            })
+                    rows.extend([
+                        {"type": "response.output_item.done", "output_index": 0, "item": item},
+                        {"type": "response.completed", "response": {"output": [item]}},
+                    ])
+                    for client in self.clients:
+                        with self.subTest(
+                            client=client.__name__, first=refusal_first,
+                            text_id=text_id, delta=refusal_delta,
+                        ):
+                            shown = []
+                            result = client._read_stream(io.BytesIO(encode_sse(rows)), shown.append)
+                            self.assertEqual(result["content"], expected)
+                            self.assertEqual("".join(shown), expected)
+            payload = {"status": "completed", "output": [item]}
+            result = object.__new__(ResponsesClient)._read_nonstream_response(
+                io.BytesIO(json.dumps(payload).encode()), UsageAccumulator()
+            )
+            self.assertEqual(result["content"], expected)
+
+    def test_mixed_messages_keep_paragraph_boundaries_and_unidentified_text(self):
+        rows = [
+            {"type": "response.output_text.delta", "item_id": "msg1", "delta": "Prefix "},
+            {"type": "response.refusal.delta", "item_id": "msg1", "delta": "No."},
+            {"type": "response.output_text.delta", "item_id": "msg2", "delta": "Next."},
+            {"type": "response.completed", "response": {"output": []}},
+        ]
+        for client in self.clients:
+            with self.subTest(client=client.__name__):
+                result = client._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+                self.assertEqual(result["content"], "Prefix No.\n\nNext.")
+                anonymous = [
+                    {"type": "response.output_text.delta", "delta": "Text."}, rows[-1]
+                ]
+                result = client._read_stream(io.BytesIO(encode_sse(anonymous)), lambda _: None)
+                self.assertEqual(result["content"], "Text.")
+
     def test_nonstream_refusal_ids_use_the_same_validated_keys(self):
         for identity in ("msg", None, {}, [], 0):
             item = {"type": "message", "role": "assistant", "content": [
