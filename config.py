@@ -100,6 +100,9 @@ class Settings:
     mcp_enabled: bool = True
     mcp_config_file: Path = DEFAULT_MCP_CONFIG_FILE
     request_timeout_seconds: float = 180
+    task_token_budget: int | None = None
+    session_token_budget: int | None = None
+    goal_token_budget: int | None = None
     max_output_tokens: int | None = 131072
     websearch_enabled: bool = True
     websearch_base_url: str = "https://api.cline.bot/api/v1"
@@ -207,6 +210,9 @@ class Settings:
             request_timeout_seconds=max(
                 1, env_number("DEEPSEEK_REQUEST_TIMEOUT_SECONDS", float, "180")
             ),
+            task_token_budget=optional_limit("ASTER_TASK_TOKEN_BUDGET", int),
+            session_token_budget=optional_limit("ASTER_SESSION_TOKEN_BUDGET", int),
+            goal_token_budget=optional_limit("ASTER_GOAL_TOKEN_BUDGET", int),
             max_output_tokens=max(1, env_number("DEEPSEEK_MAX_OUTPUT_TOKENS", int, "131072")),
             websearch_enabled=env_flag("DEEPSEEK_WEBSEARCH_ENABLED", True),
             websearch_base_url=os.environ.get(

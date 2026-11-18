@@ -281,7 +281,10 @@ class ReasoningToolsTests(unittest.TestCase):
         events = []
 
         class StalledClient:
+            worker_thread = None
+
             def complete(self, messages, **kwargs):
+                self.worker_thread = threading.current_thread()
                 release.wait(2)
                 if kwargs.get("on_progress"):
                     kwargs["on_progress"]({"phase": "receiving"})
@@ -289,7 +292,8 @@ class ReasoningToolsTests(unittest.TestCase):
                 return {"role": "assistant", "content": "late report"}
 
         self.tools.on_task_update = events.append
-        self.tools.attach_reasoning(StalledClient())
+        client = StalledClient()
+        self.tools.attach_reasoning(client)
         try:
             result = json.loads(
                 self.tools.execute(
@@ -302,6 +306,9 @@ class ReasoningToolsTests(unittest.TestCase):
             events.clear()
         finally:
             release.set()
+            if client.worker_thread is not None:
+                client.worker_thread.join(2)
+                self.assertFalse(client.worker_thread.is_alive())
         self.assertTrue(returned.wait(1))
         self.assertEqual(events, [])
 

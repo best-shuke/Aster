@@ -54,6 +54,7 @@ class GoalState:
     verification_required: bool = False
     verified_source: dict | None = None
     source_scope: dict | None = None
+    token_budget: dict | None = None
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -61,6 +62,8 @@ class GoalState:
             del data["verified_source"]
         if self.source_scope is None:
             del data["source_scope"]
+        if self.token_budget is None:
+            del data["token_budget"]
         return data
 
     @classmethod
@@ -88,6 +91,12 @@ class GoalState:
             "repeated_rounds": integer,
             "reason": text,
             "verification_required": {"type": "boolean"},
+            "token_budget": {
+                "type": "object",
+                "properties": {
+                    key: integer for key in ("limit", "measured", "estimated", "unknown", "requests", "reserved")
+                },
+            },
             "source_scope": {
                 "type": "object",
                 "properties": {
@@ -115,7 +124,7 @@ class GoalState:
                 "properties": properties,
                 "required": [
                     name for name in properties
-                    if name not in {"verification_required", "verified_source", "source_scope"}
+                    if name not in {"verification_required", "verified_source", "source_scope", "token_budget"}
                 ],
                 "additionalProperties": False,
             },
@@ -135,6 +144,15 @@ class GoalState:
             f"状态：{STATUS_LABELS[self.status]} · 轮次 {self.rounds}/{self.max_rounds}"
             f" · 用时 {math.ceil(self.elapsed_ms / 1000)}/{self.max_seconds} 秒",
         ]
+        if self.token_budget:
+            limit = self.token_budget.get("limit")
+            measured = self.token_budget.get("measured", 0)
+            estimated = self.token_budget.get("estimated", 0)
+            unknown = self.token_budget.get("unknown", 0)
+            lines.append(
+                f"Token 额度：已报告 {measured}，估算 {estimated}，"
+                f"未报告用量的请求 {unknown}，上限 {limit if limit is not None else '不限'}"
+            )
         lines.extend(
             f"验收 {index + 1}：{criterion}" for index, criterion in enumerate(self.criteria)
         )

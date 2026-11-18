@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from config import (
     Login,
@@ -41,6 +42,7 @@ from execution_trace import (
 )
 from goals import GoalState
 from mcp_client import McpManager
+from request_budget import budget_scope, current_budgets, restore_budget
 from sessions import SessionStore
 from skills import SkillCatalog
 from task_acceptance import TaskAcceptance, TaskContract
@@ -125,6 +127,9 @@ class Conversation:
             baseline_servers=self._baseline_servers if mcp_manager is not None else None,
         )
         self.session_id = uuid4().hex
+        self._session_budgets = WeakValueDictionary()
+        self._goal_budgets = WeakValueDictionary()
+        self._restore_session_budget()
         self.template_id: str | None = None
         self.messages: list[Message] = self._load()
         repaired = self._repair_incomplete_tools()
@@ -193,6 +198,7 @@ class Conversation:
         self.last_environment_ref = data.get("environment_ref")
         self.tool_runs = data.get("tool_runs", [])
         self.last_outcome = data.get("last_outcome")
+        self._restore_session_budget(data.get("token_budget"))
         self.goal = (
             GoalState.from_dict(data["goal"], restoring=True)
             if data.get("goal") is not None else None
@@ -239,7 +245,8 @@ class Conversation:
             data = deepcopy(data)
             data["session_id"] = uuid4().hex
             for field in (
-                "cache_stats", "template_id", "tool_runs", "task_state", "last_outcome", "goal"
+                "cache_stats", "template_id", "tool_runs", "task_state", "last_outcome", "goal",
+                "token_budget",
             ):
                 data.pop(field, None)
             self._apply_environment(
@@ -254,11 +261,12 @@ class Conversation:
             and self.environment_id is None
             and self.last_environment_id is None
         ):
-            if self.messages:
+            with self._tool_runs_lock:
+                if self.messages:
+                    self.save()
+                self.messages = self._restore(data)
+                self._repair_incomplete_tools()
                 self.save()
-            self.messages = self._restore(data)
-            self._repair_incomplete_tools()
-            self.save()
             return
         environment = None
         selector = data.get("environment_id")
@@ -355,7 +363,14 @@ class Conversation:
         if self.template_id is not None:
             data["template_id"] = self.template_id
         if self.goal is not None:
+            ledger = self._goal_budgets.get((self.session_id, self.goal.goal_id))
+            if ledger is not None:
+                self.goal.token_budget = ledger.snapshot()
+                if self.goal.token_budget["limit"] is None:
+                    del self.goal.token_budget["limit"]
             data["goal"] = self.goal.to_dict()
+        if self.session_budget is not None:
+            data["token_budget"] = self.session_budget.snapshot()
         environment_id = self.environment_id or self.last_environment_id
         reference = self.environment_ref or self.last_environment_ref
         if environment_id is not None:
@@ -372,6 +387,44 @@ class Conversation:
     def save(self) -> None:
         with self._tool_runs_lock:
             self.sessions.save(self._session_data())
+
+    def _restore_session_budget(self, data=None) -> None:
+        ledger = self._session_budgets.get(self.session_id)
+        if ledger is None:
+            ledger = restore_budget("session", self.settings.session_token_budget, data)
+            if ledger is not None:
+                self._session_budgets[self.session_id] = ledger
+        self.session_budget = ledger
+
+    def _save_background_budget(self, ledgers) -> None:
+        with self._tool_runs_lock:
+            goals = {}
+            for (session_id, goal_id), ledger in list(self._goal_budgets.items()):
+                if ledger in ledgers:
+                    state = ledger.snapshot()
+                    if state["limit"] is None:
+                        del state["limit"]
+                    goals.setdefault(session_id, {})[goal_id] = state
+            if self.session_budget in ledgers or self.session_id in goals:
+                self.save()
+            for session_id, ledger in list(self._session_budgets.items()):
+                if session_id != self.session_id and ledger in ledgers:
+                    self.sessions.save_archived_budget(
+                        session_id, ledger.snapshot(), goals.pop(session_id, None)
+                    )
+            for session_id, goal_budgets in goals.items():
+                if session_id != self.session_id:
+                    self.sessions.save_archived_budget(session_id, None, goal_budgets)
+
+    def _restore_goal_budget(self, goal):
+        with self._tool_runs_lock:
+            key = (self.session_id, goal.goal_id)
+            ledger = self._goal_budgets.get(key)
+            if ledger is None:
+                ledger = restore_budget("goal", self.settings.goal_token_budget, goal.token_budget)
+                if ledger is not None:
+                    self._goal_budgets[key] = ledger
+            return ledger
 
     def clear(self) -> None:
         template = self.templates.default()
@@ -399,17 +452,19 @@ class Conversation:
 
     def _start_new(self, data: dict | None, template_id: str | None) -> None:
         messages = deepcopy(data["messages"]) if data is not None else []
-        if self.messages or self.goal is not None:
-            self.save()
-        if not messages:
-            self.sessions.remove_active()
-        self.messages.clear()
-        self.tool_runs.clear()
-        self.session_id = uuid4().hex
-        self.template_id = template_id
-        self.recovery_notice = None
-        self.last_outcome = None
-        self.goal = None
+        with self._tool_runs_lock:
+            if self.messages or self.goal is not None:
+                self.save()
+            if not messages:
+                self.sessions.remove_active()
+            self.messages.clear()
+            self.tool_runs.clear()
+            self.session_id = uuid4().hex
+            self.template_id = template_id
+            self.recovery_notice = None
+            self.last_outcome = None
+            self.goal = None
+            self._restore_session_budget()
         self.last_environment_id = self.environment_id
         self.last_environment_ref = self.environment_ref
         if self.tools is not None:
@@ -616,7 +671,12 @@ class Conversation:
                 if isinstance(stats, CacheStats)
                 else nullcontext()
             )
-            with scope, trace_scope(self.last_task_trace, self.event_sink):
+            task_budget = restore_budget("task", self.settings.task_token_budget)
+            with (
+                scope,
+                trace_scope(self.last_task_trace, self.event_sink),
+                budget_scope(self.session_budget, task_budget),
+            ):
                 emit_event("task_started")
                 try:
                     answer = self._ask(
@@ -639,6 +699,9 @@ class Conversation:
 
     def _save_outcome(self, acceptance: TaskAcceptance) -> None:
         self.last_outcome = acceptance.outcome()
+        for ledger in current_budgets():
+            if ledger.name == "task":
+                self.last_outcome["token_budget"] = ledger.snapshot()
         if self.tools is not None and acceptance.status == "completed":
             for session_id in acceptance.observed_processes:
                 session = self.tools.processes.lookup(session_id)
@@ -971,7 +1034,6 @@ class Conversation:
                 acceptance.status = "incomplete"
                 self._save_outcome(acceptance)
                 raise
-            self.save()
             runtime = TaskRuntime(
                 self.client, self.settings, deadline, validate_final, wire_cache=self._wire_cache,
                 incomplete_final=incomplete_final,

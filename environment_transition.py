@@ -17,6 +17,7 @@ from goals import GoalState
 from mcp_client import McpManager
 from mcp_scope import ScopedMcp
 from reasoning import RolePromptCache
+from request_budget import TokenBudget
 from skills import SkillCatalog
 from team_runtime import TeamRuntime
 from team_state import MAIN
@@ -48,6 +49,7 @@ class ConversationState:
     tool_runs: list[ToolRun]
     last_outcome: dict | None
     goal: GoalState | None
+    session_budget: TokenBudget | None
     recovery_notice: str | None
     team: TeamRuntime | None
 
@@ -138,11 +140,15 @@ class EnvironmentTransition:
             resume=self.restore_data is not None,
         )
         previous = ConversationState.capture(conversation)
-        previous_data = conversation._session_data()
         client_state = ClientState.capture(conversation.client)
         try:
             prepared = self.prepare(environment, client_state)
-            self.commit(prepared, previous_data)
+            with conversation._tool_runs_lock:
+                try:
+                    self.commit(prepared, conversation._session_data())
+                except BaseException:
+                    previous.restore(conversation)
+                    raise
         except BaseException as exc:
             self.rollback(previous, client_state, environment_id, attempt, exc)
             raise
@@ -311,6 +317,7 @@ class EnvironmentTransition:
             state_dir=settings.environment_state_dir,
             protected_paths=protected,
             on_progress=tools.on_task_update,
+            on_background_budget=self.conversation._save_background_budget,
         )
         tools.registry["team"] = TeamTool(self.team, MAIN).spec()
 
@@ -387,6 +394,7 @@ class EnvironmentTransition:
             conversation.tool_runs = []
             conversation.last_outcome = None
             conversation.goal = None
+            conversation._restore_session_budget()
             conversation.recovery_notice = None
             if prepared.tools is not None:
                 prepared.tools.reset_task()

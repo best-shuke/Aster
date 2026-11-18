@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import nullcontext, suppress
+from contextvars import copy_context
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -522,7 +523,7 @@ class ReasoningTools:
             else:
                 future.set_result(report)
 
-        thread = threading.Thread(target=run, name="subagent", daemon=True)
+        thread = threading.Thread(target=copy_context().run, args=(run,), name="subagent", daemon=True)
         counted = False
         try:
             if self.on_worker_start:

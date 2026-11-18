@@ -8,6 +8,7 @@ from contextlib import nullcontext, suppress
 from deepseek_client import CompletionError
 from execution_trace import TraceContext, trace_scope
 from goals import GoalCommand, GoalState
+from request_budget import budget_scope
 from task_acceptance import TaskAcceptance, TaskContract
 from task_runtime import TaskProgress, TaskRuntime
 from tool_runtime import ExecutionContext, validate
@@ -108,6 +109,10 @@ class GoalRuntime:
         self.goal.elapsed_ms = self._elapsed + max(
             0, int((time.monotonic() - self._started) * 1000)
         )
+        if self.token_budget is not None:
+            self.goal.token_budget = self.token_budget.snapshot()
+            if self.goal.token_budget["limit"] is None:
+                del self.goal.token_budget["limit"]
         self.conversation.save()
 
     def _prompt(self) -> str:
@@ -280,6 +285,7 @@ class GoalRuntime:
             "budget_exhausted",
         }:
             raise ValueError("没有可执行的目标。")
+        self.token_budget = conversation._restore_goal_budget(goal)
         self._started, self._elapsed = time.monotonic(), goal.elapsed_ms
         deadline = self._started + max(0, goal.max_seconds - goal.elapsed_ms / 1000)
         goal.status, goal.reason = "active", ""
@@ -299,7 +305,7 @@ class GoalRuntime:
                 goal.next_step = (
                     "会话在上次工作后发生变化；先重新核对目标当前成果和验证结果，再继续。"
                 )
-            with scope:
+            with scope, budget_scope(conversation.session_budget, self.token_budget):
                 while goal.status == "active":
                     if time.monotonic() >= deadline:
                         goal.status, goal.reason = "budget_exhausted", "时间预算已耗尽。"
@@ -364,11 +370,13 @@ class GoalRuntime:
             raise
         except (CompletionError, TimeoutError) as exc:
             expired = time.monotonic() >= deadline
-            goal.status = "budget_exhausted" if expired else "paused"
+            token_limited = getattr(exc, "code", None) == "budget_exhausted"
+            goal.status = "budget_exhausted" if expired or token_limited else "paused"
             goal.reason = (
-                "时间预算已耗尽。" if expired else f"执行中断：{exc}；用 /goal resume 重试。"
+                "时间预算已耗尽。" if expired else f"模型额度不足：{exc}。"
+                if token_limited else f"执行中断：{exc}；用 /goal resume 重试。"
             )
-            if not expired:
+            if not expired and not token_limited:
                 raise
         except Exception:
             goal.status, goal.reason = (

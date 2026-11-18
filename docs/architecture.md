@@ -11,6 +11,7 @@
 | 会话与上下文 | `conversation.py`、`sessions.py`、`context_budget.py`、`context_management.py` |
 | 任务编排与验收 | `reasoning.py`、`task_runtime.py`、`task_acceptance.py`、`worker_checkpoint.py` |
 | 持续目标 | `goals.py`（目标状态与命令参数）、`goal_runtime.py`（多轮调度、证据核对与预算） |
+| 共享模型请求执行 | `model_request.py`（传输、重试、限流等待、截止时间、取消与逐次请求预算结算）；协议适配器提供请求构造、响应解析和鉴权 |
 | 工具与文件状态 | `tools.py`、`tool_runtime.py`、`file_state.py`、`file_changes.py` |
 | 进程与执行记录 | `process_monitor.py`、`execution_history.py`、`execution_trace.py` |
 | 终端展示 | `ui.py`、`terminal_rendering.py`、`trace_ui.py` |
@@ -27,3 +28,16 @@
 环境层组合而非替换原有代理：`EnvironmentStore` 解析定义，`EnvironmentTransition` 原子地切换设置、技能、工具、MCP 和提示，多代理环境额外挂载 `TeamRuntime` 与 `team` 工具。成员复用 `TaskRuntime`、`CodingTools`、`McpManager` 和 `SkillCatalog`，各自持有独立上下文与模型客户端。设计与规则见 [环境](environments.md)。
 
 运行期间产生的会话、日志、命令输出与检查点可能包含任务原文，应保存在本地私密位置。配置加载和 Git 边界分别见 [配置入口](configuration.md) 与 [Git 策略](git-policy.md)。
+
+## 会话持久化与性能边界
+
+任务开始时，`Conversation.compact()` 已保存本轮用户输入与上下文，随后直接开始模型请求，
+不再重复保存相同状态。工具执行记录、最终验收和异常恢复仍分别持久化；首次请求之前的
+保存失败会中断任务，避免在无法保存恢复数据时继续执行。会话与目标的 token 账本也随保存
+更新；后台请求的迟到结算写回原会话及对应目标，不归入后来创建的会话或目标。
+
+2026-11-18 在本机临时目录、约 3 MB 合成会话上测量 12 次无工具工作轮次：每轮保存从
+3 次降为 2 次，中位耗时从 31.016 ms 降为 20.741 ms，fsync 总数从 72 次降为 48 次。
+这只衡量本地持久化开销，不代表真实模型任务的端到端提速。此前 4,000 文件扫描样本的
+冷/热中位耗时为 73.455 / 20.469 ms；保留已有按需扫描、摘要缓存和结构化验收状态，
+未据此新增数据库或进一步削弱修订检查。恢复产物继续保留，不自动删除仍可能被引用的文件。

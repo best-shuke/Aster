@@ -16,6 +16,7 @@ from context_budget import (
 )
 from contracts import CompletionClient, Message
 from deepseek_client import CompletionError, has_unexecuted_tool_text
+from request_budget import complete_with_budget
 from tool_runtime import ArtifactStore
 
 MAX_SUMMARY_SOURCE_CHARS = 60_000
@@ -227,7 +228,8 @@ def summarize(
                 on_request()
             chunk_deadline = min(summary_deadline, time.monotonic() + per_chunk_seconds)
             available = chunk_deadline - time.monotonic()
-            response = client.complete(
+            response = complete_with_budget(
+                client,
                 [
                     {
                         "role": "system",

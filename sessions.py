@@ -88,6 +88,8 @@ class SessionStore:
         outcome = data.get("last_outcome")
         if outcome is not None and not isinstance(outcome, dict):
             raise ValueError("invalid task outcome")
+        if data.get("token_budget") is not None and not isinstance(data["token_budget"], dict):
+            raise ValueError("invalid token budget")
         session_id = data.get("session_id")
         if session_id is not None:
             self.snapshot_path(session_id)
@@ -178,6 +180,19 @@ class SessionStore:
                         atomic_write_text(path, original)
                 raise
             self._revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def save_archived_budget(self, session_id: str, budget: dict | None, goals=None) -> None:
+        snapshot = self.snapshot_path(session_id)
+        with self._locked():
+            if not snapshot.exists():
+                return
+            data = self.read(snapshot)
+            if budget is not None:
+                data["token_budget"] = budget
+            goal = data.get("goal")
+            if goal is not None and goals and goal["goal_id"] in goals:
+                goal["token_budget"] = goals[goal["goal_id"]]
+            self._write(snapshot, json.dumps(data, ensure_ascii=False))
 
     def list(self) -> list[SavedSession]:
         self.diagnostics.clear()

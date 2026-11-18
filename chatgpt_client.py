@@ -319,6 +319,9 @@ class _ResponsesEvents:
 
 
 class ChatGPTClient(DeepSeekClient):
+    def _minimum_budget_output(self) -> int:
+        return 16
+
     def __init__(self, settings) -> None:
         super().__init__(settings)
         self.account = chatgpt_account(settings.auth_file or auth_file())

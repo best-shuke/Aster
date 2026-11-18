@@ -17,12 +17,12 @@ from typing import TYPE_CHECKING
 
 from client_runtime import fork_client
 from config import system_prompt
-from context_budget import LOCAL_METADATA, estimate_tokens
 from deepseek_client import CompletionError
 from environment_spec import MEMBER_DEFAULT_TOOLS, MEMBER_EXCLUDED, TEAM_TOOL, AgentSpec
 from execution_trace import TraceContext, trace_scope
 from file_state import CODE_SUFFIXES
 from mcp_scope import McpScope, ScopedMcp
+from request_budget import budget_scope, complete_with_budget
 from skills import skills_prompt_section
 from task_acceptance import TaskAcceptance, TaskContract
 from task_runtime import TaskRuntime
@@ -30,7 +30,7 @@ from team_state import TeamError
 from team_tools import TeamTool, member_instructions
 from tool_runtime import ExecutionContext, ToolResult
 from tools import ToolPolicy
-from usage import CacheStats, uncached_tokens
+from usage import CacheStats
 
 if TYPE_CHECKING:
     from team_runtime import Activation, ActivationResult, TeamRuntime
@@ -72,12 +72,9 @@ def mcp_scope(runtime: "TeamRuntime", spec: AgentSpec) -> McpScope:
 
 
 class BudgetedClient:
-    """Charges every model request (including summaries) to the member's token budget.
+    """Account for actual requests against the member turn that admitted them."""
 
-    A request costs its uncached prompt tokens plus its output, as the provider reports
-    them. Without reported usage the whole request is estimated, which overcounts a
-    cached prefix but never undercounts.
-    """
+    accounts_attempt_tokens = True
 
     def __init__(self, inner, runtime: "TeamRuntime", agent: str):
         self._inner = inner
@@ -96,22 +93,12 @@ class BudgetedClient:
         )
 
     def complete(self, messages, tools=None, on_content=None, timeout=180, **kwargs):
+        ledger, shared = self._runtime.member_request_budgets(self._agent)
         try:
-            self._runtime.charge_tokens(self._agent, 0, before=True)
-        except TeamError as exc:
-            raise CompletionError("budget_exhausted", str(exc)) from exc
-        response = self._inner.complete(messages, tools, on_content, timeout, **kwargs)
-        tokens = uncached_tokens((response.get(LOCAL_METADATA) or {}).get("usage"))
-        if tokens is None:
-            tokens = (
-                estimate_tokens(messages)
-                + estimate_tokens(tools or [])
-                + estimate_tokens(
-                    {key: value for key, value in response.items() if key != LOCAL_METADATA}
-                )
-            )
-        self._runtime.charge_tokens(self._agent, tokens)
-        return response
+            with budget_scope(*shared, ledger):
+                return complete_with_budget(self._inner, messages, tools, on_content, timeout, **kwargs)
+        finally:
+            self._runtime.record_member_budget(self._agent, ledger, shared)
 
 
 def repair_incomplete(messages: list[dict]) -> int:

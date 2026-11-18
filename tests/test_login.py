@@ -512,7 +512,7 @@ class SettingsTests(TempDirTest):
             (chatgpt.provider, chatgpt.base_url, chatgpt.api_key), ("chatgpt", CHATGPT_BASE_URL, "")
         )
         self.assertEqual(chatgpt.context_window_tokens, 258400)
-        self.assertEqual(chatgpt.auth_file, self.store.path)
+        self.assertEqual(chatgpt.auth_file, self.store.path.resolve())
         with self.assertRaises(LoginRequired):
             Settings.from_env()
 

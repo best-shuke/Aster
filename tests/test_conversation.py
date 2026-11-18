@@ -95,6 +95,47 @@ class ConversationTests(unittest.TestCase):
         finally:
             conversation._operation.release()
 
+    def test_late_budget_settlement_updates_the_archived_session(self):
+        from request_budget import budget_scope, reserve_request
+
+        conversation = Conversation(self.settings(session_token_budget=100), FakeClient(), None)
+        self.addCleanup(conversation.close)
+        conversation.messages.append({"role": "user", "content": "Original session"})
+        original_id = conversation.session_id
+        ledger = conversation.session_budget
+        with budget_scope(ledger), reserve_request(10, 20) as reservation:
+            conversation.clear()
+            reservation.dispatched = True
+            reservation.measured = 17
+        conversation._save_background_budget((ledger,))
+
+        snapshot = conversation.sessions.read(conversation.sessions.snapshot_path(original_id))
+        self.assertEqual(snapshot["token_budget"]["measured"], 17)
+        self.assertEqual(snapshot["token_budget"]["reserved"], 0)
+        self.assertEqual(conversation.session_budget.remaining(), 100)
+        conversation.resume(original_id)
+        self.assertEqual(conversation.session_budget.remaining(), 83)
+
+    def test_turn_saves_user_message_once_before_first_model_request(self):
+        client = FakeClient({"role": "assistant", "content": "Done."})
+        conversation = Conversation(self.settings(), client, None)
+        self.addCleanup(conversation.close)
+        real_complete = client.complete
+
+        def complete(*args, **kwargs):
+            messages = conversation.sessions.read()["messages"]
+            self.assertTrue(any(
+                item["role"] == "user" and item["content"] == "Hello." for item in messages
+            ))
+            return real_complete(*args, **kwargs)
+
+        with (
+            patch.object(client, "complete", side_effect=complete),
+            patch.object(conversation.sessions, "save", wraps=conversation.sessions.save) as save,
+        ):
+            self.assertEqual(conversation.ask("Hello."), "Done.")
+        self.assertEqual(save.call_count, 2)
+
     def test_operation_lock_is_released_after_failure_or_interruption(self):
         conversation = Conversation(self.settings(), FakeClient(), CodingTools(self.workspace))
         operations = (

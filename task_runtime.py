@@ -30,6 +30,7 @@ from contracts import (
 from deepseek_client import CompletionError, clean_completion_suffix, has_unexecuted_tool_text
 from execution_trace import current_trace, display_callback, trace_scope, traced_progress
 from file_state import atomic_write_text
+from request_budget import complete_with_budget
 from tool_runtime import ArtifactStore, validate_tool_calls
 
 _RETRY_REQUEST = object()
@@ -510,7 +511,8 @@ class TaskRuntime:
                     purpose="final" if self.finalizing else "solve",
                 )
                 try:
-                    response = self.client.complete(
+                    response = complete_with_budget(
+                        self.client,
                         [current_system, *messages],
                         tools=definitions or None,
                         on_content=lambda _: None,

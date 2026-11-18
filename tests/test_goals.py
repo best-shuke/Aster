@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -14,6 +15,7 @@ from deepseek_client import CompletionError
 from goal_runtime import GoalRuntime, prepare_goal
 from goals import GoalCommand, GoalState, parse_goal
 from main import handle_command
+from request_budget import budget_scope, reserve_request
 from task_acceptance import TaskContract
 from tests.support import make_settings
 from tests.team_support import Steps, TeamScript, say, team, use
@@ -127,6 +129,21 @@ class GoalRuntimeTests(unittest.TestCase):
     def start(self, conversation, text="撰写一份报告", **options):
         return prepare_goal(conversation, GoalCommand("start", text, **options))
 
+    def test_token_budget_is_restored_without_dispatching_an_impossible_request(self):
+        self.settings = replace(self.settings, goal_token_budget=100)
+        first = self.conversation()
+        goal = self.start(first)
+        goal.token_budget = {"limit": 100, "measured": 100, "estimated": 0, "unknown": 0, "requests": 1}
+        first.save()
+        first.close()
+        resumed = self.conversation()
+        result = GoalRuntime(resumed).run()
+        self.assertEqual(result.status, "budget_exhausted")
+        self.assertEqual(result.token_budget["measured"], 100)
+        self.assertEqual(result.token_budget["requests"], 1)
+        self.assertEqual(resumed.client.requests, [])
+        self.assertIn("已报告 100", "\n".join(result.status_lines()))
+
     def test_continues_until_entire_goal_and_all_criteria_are_met(self):
         conversation = self.conversation(
             say("报告初稿"),
@@ -146,6 +163,40 @@ class GoalRuntimeTests(unittest.TestCase):
         self.assertEqual(len(requests), 4)
         self.assertIsNone(requests[1]["tools"])
         self.assertIsNone(requests[3]["tools"])
+
+    def test_late_goal_usage_survives_resume_and_is_persisted(self):
+        self.settings = replace(self.settings, goal_token_budget=100)
+        conversation = self.conversation()
+        goal = self.start(conversation)
+        ledger = conversation._restore_goal_budget(goal)
+        with budget_scope(ledger), reserve_request(10, 50) as reservation:
+            reservation.dispatched = True
+            conversation.save()
+            prepare_goal(conversation, GoalCommand("resume"))
+            self.assertIs(conversation._restore_goal_budget(conversation.goal), ledger)
+            self.assertEqual(ledger.remaining(), 40)
+            reservation.measured = 60
+        conversation._save_background_budget((ledger,))
+        self.assertEqual(conversation.sessions.read()["goal"]["token_budget"]["measured"], 60)
+        conversation.close()
+        restored = self.conversation()
+        self.assertEqual(restored._restore_goal_budget(restored.goal).remaining(), 40)
+
+    def test_late_goal_only_usage_updates_its_archived_session(self):
+        self.settings = replace(self.settings, goal_token_budget=100)
+        conversation = self.conversation()
+        goal = self.start(conversation)
+        old_session = conversation.session_id
+        ledger = conversation._restore_goal_budget(goal)
+        with budget_scope(ledger), reserve_request(10, 50) as reservation:
+            reservation.dispatched = True
+            conversation.clear()
+            self.start(conversation, "new goal")
+            reservation.measured = 60
+        conversation._save_background_budget((ledger,))
+        archived = conversation.sessions.read(conversation.sessions.snapshot_path(old_session))
+        self.assertEqual(archived["goal"]["token_budget"]["measured"], 60)
+        self.assertIsNone(conversation.sessions.read()["goal"].get("token_budget"))
 
     def test_code_goal_runs_real_tools_and_verifies_before_completion(self):
         conversation = self.conversation(

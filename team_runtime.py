@@ -21,6 +21,7 @@ from typing import Any
 from uuid import uuid4
 
 from environment_spec import AgentSpec, format_limit, limit_reached, parse_agent
+from request_budget import TokenBudget, current_budgets
 from skills import SkillCatalog, skill_block
 from task_runtime import finalization_reserve
 from team_protocols import ProtocolEngine
@@ -103,6 +104,7 @@ class TeamRuntime:
         state_dir: Path,
         protected_paths: tuple[Path, ...] = (),
         on_progress: Callable[[dict], None] | None = None,
+        on_background_budget: Callable[[tuple[TokenBudget, ...]], None] | None = None,
         member_factory=None,
     ):
         from team_agent import MemberAgent
@@ -118,6 +120,7 @@ class TeamRuntime:
         self.state_dir = state_dir
         self.protected_paths = protected_paths
         self.on_progress = on_progress
+        self.on_background_budget = on_background_budget
         self.member_factory = member_factory or MemberAgent
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
@@ -145,6 +148,8 @@ class TeamRuntime:
         self._background_timer: threading.Timer | None = None
         # Whether the last turn handed work to the background, even if it has since finished.
         self.went_background = False
+        self._turn_budgets = ()
+        self._member_budgets: dict[str, TokenBudget] = {}
 
     # Members -------------------------------------------------------------------------
 
@@ -225,6 +230,8 @@ class TeamRuntime:
             data, notices = store.open(self.settings.workspace)
             self.store, self.state, self.session_id = store, TeamState(data), session_id
             self.members = {}
+            self._turn_budgets = ()
+            self._member_budgets.clear()
             self.state.sync_members([spec.name for spec in self.team.agents])
             for spec in self.team.agents:
                 if not spec.enabled:
@@ -274,6 +281,8 @@ class TeamRuntime:
             self.turn_reserve = finalization_reserve(self.settings, deadline)
             self.turn_background = background
             self.went_background = False
+            self._turn_budgets = current_budgets()
+            self._member_budgets.clear()
             self.nudges = 0
             data = self.state.data
             data["turn"] = {"number": data["turn"]["number"] + 1, "messages": 0}
@@ -1044,15 +1053,30 @@ class TeamRuntime:
 
     # Budgets called by members ------------------------------------------------------
 
-    def charge_tokens(self, name: str, tokens: int, *, before: bool = False) -> None:
+    def member_request_budgets(self, name: str) -> tuple[TokenBudget, tuple[TokenBudget, ...]]:
         with self.lock:
-            record = self.state.agents[name]["turn"]
-            if before:
-                if limit_reached(record["tokens"], self.limits.token_budget_per_agent):
-                    raise TeamError("token_budget", f"{name} exhausted its token budget this turn")
-                return
-            record["tokens"] += max(0, int(tokens))
-            record["model_requests"] += 1
+            ledger = self._member_budgets.get(name)
+            if ledger is None:
+                record = self.state.agents[name]["turn"]
+                ledger = self._member_budgets[name] = TokenBudget.restore(
+                    name, self.limits.token_budget_per_agent, record.get("token_budget") or {
+                        "estimated": record["tokens"], "requests": record["model_requests"],
+                    },
+                )
+            return ledger, self._turn_budgets
+
+    def record_member_budget(self, name: str, ledger: TokenBudget, shared: tuple[TokenBudget, ...]) -> None:
+        with self.lock:
+            if self.state is not None and self._member_budgets.get(name) is ledger:
+                record = self.state.agents[name]["turn"]
+                usage = ledger.snapshot()
+                record.update(tokens=usage["measured"] + usage["estimated"],
+                              model_requests=usage["requests"], token_budget=usage)
+            persist = self.on_background_budget is not None and (
+                self._background is not None or not self.accepting or shared != self._turn_budgets
+            )
+        if persist and shared:
+            self.on_background_budget(shared)
 
     def charge_tool_call(self, name: str) -> None:
         with self.lock:

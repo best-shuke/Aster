@@ -14,6 +14,7 @@ from environment_definitions import EnvironmentEditor
 from environment_spec import UNLIMITED_LIMITS
 from environments import EnvironmentStore
 from main import handle_command
+from request_budget import current_budgets
 from skills import SkillCatalog
 from team_state import TeamStore
 from team_tools import duration_text
@@ -1812,6 +1813,72 @@ class BackgroundWorkTests(TeamTestCase):
         self.assertEqual(self.background(conversation)["status"], "resumed")
         self.assertEqual(len(script.requests["engineer"]), 1)
 
+    def test_requests_after_takeover_use_the_new_turn_budget(self):
+        self.settings = replace(self.settings, task_token_budget=100_000, max_output_tokens=500)
+        started, release = threading.Event(), threading.Event()
+        ledgers = {"main": [], "engineer": []}
+
+        def capture(name):
+            ledgers[name].append(next(ledger for ledger in current_budgets() if ledger.name == "task"))
+
+        def engineer(messages, tools):
+            capture("engineer")
+            if not started.is_set():
+                started.set()
+                release.wait(5)
+                return use("ls", path=".")
+            return say("Done.")
+
+        def first_answer(messages, tools):
+            capture("main")
+            self.assertTrue(started.wait(5))
+            return say("Started.")
+
+        def release_and_wait(messages, tools):
+            capture("main")
+            release.set()
+            return team("wait", timeout=30)
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build"),
+                first_answer,
+                say("Started."),
+                release_and_wait,
+                say("Done."),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        self.assertEqual(self.ask(conversation), "Started.")
+        self.assertEqual(self.ask(conversation, "Any news?"), "Done.")
+        self.assertIs(ledgers["engineer"][0], ledgers["main"][0])
+        self.assertIs(ledgers["engineer"][1], ledgers["main"][1])
+
+    def test_session_budget_is_persisted_when_background_requests_settle(self):
+        self.settings = replace(self.settings, session_token_budget=100_000, max_output_tokens=500)
+        release = threading.Event()
+
+        def engineer(messages, tools):
+            release.wait(5)
+            return say("Done.")
+
+        script = TeamScript(
+            main=Steps(
+                team("send_message", to=["engineer"], kind="request", content="Build"),
+                say("Started."),
+                say("Started."),
+            ),
+            engineer=engineer,
+        )
+        conversation = self.background_conversation(script)
+        self.assertEqual(self.ask(conversation), "Started.")
+        requests = conversation.sessions.read()["token_budget"]["requests"]
+        release.set()
+        self.assertTrue(wait_until(lambda: self.background(conversation)["status"] == "finished"))
+        self.assertEqual(conversation.session_budget.snapshot()["requests"], requests + 1)
+        self.assertEqual(conversation.sessions.read()["token_budget"]["requests"], requests + 1)
+
     def test_interrupted_turns_still_pause_members(self):
         started = threading.Event()
 
@@ -2135,9 +2202,9 @@ class MemberSelfCheckTests(TeamTestCase):
         self.assertNotIn("no passing standalone check", answer)
 
     def test_a_finished_answer_survives_a_failed_follow_up_request(self):
-        self.define("tight", limits={"token_budget_per_agent": 1000})
+        self.define("tight", limits={"token_budget_per_agent": 12000})
         small = {"prompt_tokens": 100, "completion_tokens": 10}
-        usage = {"prompt_tokens": 2000, "completion_tokens": 10}
+        usage = {"prompt_tokens": 8000, "completion_tokens": 10}
         script = TeamScript(
             main=Steps(
                 team("send_message", to=["engineer"], kind="request", content="Fix app.py"),

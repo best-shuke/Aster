@@ -33,7 +33,10 @@
 | `DEEPSEEK_REASONING_EFFORT` | 推理档位：`off`、`low`、`high`、`max`、`default` |
 | `DEEPSEEK_MAX_CONTEXT_CHARS` / `DEEPSEEK_CONTEXT_WINDOW_TOKENS` | 上下文预算 |
 | `DEEPSEEK_MAX_OUTPUT_TOKENS` / `DEEPSEEK_MAX_TASK_SECONDS` | 输出上限与任务时限 |
+| `ASTER_TASK_TOKEN_BUDGET` / `ASTER_SESSION_TOKEN_BUDGET` / `ASTER_GOAL_TOKEN_BUDGET` | 单次任务、会话和持续目标的可选 token 额度；默认不限 |
 | `DEEPSEEK_MAX_SUBAGENTS` | 子代理并发上限 |
+
+启用 token 额度后，每次模型请求先预留估算输入与输出上限。主代理、团队成员、委派与摘要共享所属任务、会话和目标的额度；成员还受自己的单轮额度限制。已经开始的请求仍在原账本结算。响应有用量时，使用未命中缓存的输入与输出 token；正常响应缺少用量时使用估算，失败且用量未报告的请求单独记为未知。只报告部分用量时，已知部分仍计入，缺失部分保留未知标记。预留不可替代供应商计量，不是严格的费用上限。会话和目标恢复时延续已结算用量；同一进程内尚未结束的请求保留原目标账本及预留，迟到结算写回所属会话。
 
 配置先从进程环境读取；本地文件只补充尚未设置的值。文件每行一个 `KEY=value`，可带 `export` 前缀，值可加引号，未加引号的值中 ` #` 之后视为注释。数值项写错时启动会指出具体变量，不会继续运行。直接运行 Python 入口时，未指定配置文件则读取当前目录的 `.env`；`bin/agent` 则使用程序目录的 `.env`。
 
