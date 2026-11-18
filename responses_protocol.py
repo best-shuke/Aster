@@ -211,6 +211,8 @@ class _ResponsesEvents:
         self.reasoning_part: Any = None
         self.text_item: Any = None
         self.refusal_blocks: dict[Any, str] = {}
+        self.refusal_items: dict[Any, int] = {}
+        self.refusal_item_info: list[dict[str, Any]] = []
         self.done = False
 
     def _tool(self, event: dict[str, Any], item: dict[str, Any] | None = None) -> int:
@@ -240,7 +242,15 @@ class _ResponsesEvents:
         if mapped:
             index = next(iter(mapped))
         else:
-            index = len(self.tool_info)
+            index = (
+                output_index
+                if (
+                    type(output_index) is int
+                    and output_index >= 0
+                    and output_index not in self.tool_info
+                )
+                else max(self.tool_info, default=-1) + 1
+            )
             self.tool_info[index] = {
                 "id": item.get("id") or event.get("item_id"),
                 "call_id": item.get("call_id") or "",
@@ -274,11 +284,55 @@ class _ResponsesEvents:
         event: dict[str, Any],
         item: dict[str, Any] | None = None,
         content_index: int = 0,
-    ) -> Any:
+    ) -> tuple[int, int]:
         item = item or {}
-        item_id = item.get("id") or event.get("item_id") or event.get("output_index")
+        item_ids = []
+        for source, field in ((item, "id"), (event, "item_id")):
+            if field in source:
+                value = source[field]
+                if not isinstance(value, str) or not value:
+                    raise CompletionError(
+                        "invalid_response", "Refusal item ID must be non-empty text", retryable=True
+                    )
+                item_ids.append(value)
+        if len(set(item_ids)) > 1:
+            raise CompletionError(
+                "invalid_response", "Conflicting refusal item IDs", retryable=True
+            )
+        output_index = event.get("output_index")
+        if "output_index" in event and (type(output_index) is not int or output_index < 0):
+            raise CompletionError(
+                "invalid_response", "Refusal output index must be a non-negative integer",
+                retryable=True,
+            )
         c_idx = event.get("content_index", content_index)
-        return (item_id, c_idx)
+        if type(c_idx) is not int or c_idx < 0:
+            raise CompletionError(
+                "invalid_response", "Refusal content index must be a non-negative integer",
+                retryable=True,
+            )
+        aliases = [("item", item_ids[0])] if item_ids else []
+        if output_index is not None:
+            aliases.append(("output", output_index))
+        if not aliases:
+            raise CompletionError(
+                "invalid_response", "Refusal has no valid identity", retryable=True
+            )
+        mapped = {self.refusal_items[alias] for alias in aliases if alias in self.refusal_items}
+        if len(mapped) > 1:
+            raise CompletionError(
+                "invalid_response", "Conflicting refusal identities", retryable=True
+            )
+        index = next(iter(mapped)) if mapped else len(self.refusal_item_info)
+        info = self.refusal_item_info[index] if mapped else {}
+        if any(kind in info and info[kind] != value for kind, value in aliases):
+            raise CompletionError("invalid_response", "Refusal identity changed", retryable=True)
+        if not mapped:
+            self.refusal_item_info.append(info)
+        for kind, value in aliases:
+            info[kind] = value
+            self.refusal_items[(kind, value)] = index
+        return (index, c_idx)
 
     def _consume_refusal(
         self, key: Any, text: Any, *, delta: bool = False
@@ -351,6 +405,8 @@ class _ResponsesEvents:
             return [self._arguments(index, delta)]
         item = event.get("item")
         if kind == "response.output_item.added" and isinstance(item, dict):
+            if item.get("type") == "message":
+                self._refusal_key(event, item)
             if item.get("type") != "function_call":
                 return []
             self._validate_tool_item(item)
@@ -468,8 +524,16 @@ class _ResponsesEvents:
                         f"from streamed count ({len(self.tool_info)})",
                         retryable=True,
                     )
-                for index, final_call in enumerate(final_calls):
+                matched = set()
+                for final_call in final_calls:
                     self._validate_tool_item(final_call)
+                    index = self.tools.get(("item", final_call["id"]))
+                    if index is None or index in matched:
+                        raise CompletionError(
+                            "invalid_tool_calls", "Completed response repeats or changes a tool ID",
+                            retryable=True,
+                        )
+                    matched.add(index)
                     info = self.tool_info[index]
                     if any(
                         final_call[field] != info[field]

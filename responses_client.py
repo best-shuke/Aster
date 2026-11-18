@@ -67,7 +67,6 @@ class ResponsesClient(DeepSeekClient):
                 raise CompletionError(
                     "invalid_response", "Invalid Responses content blocks", retryable=True
                 )
-            item_id = item.get("id") or index
             if kind == "message":
                 for c_idx, part in enumerate(parts):
                     if part.get("type") == "output_text":
@@ -83,7 +82,8 @@ class ResponsesClient(DeepSeekClient):
                                 "invalid_response", "Refusal must be text", retryable=True
                             )
                         state.add_payload({"choices": [{"delta": {"content": refusal}}]})
-                        events.refusal_blocks[(item_id, c_idx)] = refusal
+                        key = events._refusal_key({"output_index": index}, item, c_idx)
+                        events.refusal_blocks[key] = refusal
             elif kind == "refusal":
                 refusal = item.get("refusal") if "refusal" in item else item.get("text")
                 if not isinstance(refusal, str):
@@ -91,7 +91,8 @@ class ResponsesClient(DeepSeekClient):
                         "invalid_response", "Refusal must be text", retryable=True
                     )
                 state.add_payload({"choices": [{"delta": {"content": refusal}}]})
-                events.refusal_blocks[(item_id, 0)] = refusal
+                key = events._refusal_key({"output_index": index}, item)
+                events.refusal_blocks[key] = refusal
             elif kind == "reasoning":
                 for part in parts:
                     if isinstance(part.get("text"), str):

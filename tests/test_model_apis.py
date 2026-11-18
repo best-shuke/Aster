@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from anthropic_client import AnthropicClient
 from auth import AuthStore
+from chatgpt_client import ChatGPTClient
 from config import Login, Settings
 from context_budget import LOCAL_METADATA, request_fingerprint
 from conversation import Conversation
@@ -716,6 +717,99 @@ class ModelApiTests(unittest.TestCase):
         conversation.switch_login(other, model_client(settings.with_login(other)))
         self.assertNotIn("websearch", tools.registry)
         self.assertNotIn("websearch", conversation._baseline_registry)
+
+
+class ResponsesIdentityTests(unittest.TestCase):
+    clients = (ResponsesClient, ChatGPTClient)
+
+    def test_reversed_done_only_calls_match_final_output_by_identity(self):
+        calls = [
+            {"type": "function_call", "id": f"fc_{i}", "call_id": f"call_{i}",
+             "name": "read", "arguments": json.dumps({"path": f"{i}.txt"})}
+            for i in range(2)
+        ]
+        rows = [
+            {"type": "response.output_item.done", "output_index": i, "item": calls[i]}
+            for i in (1, 0)
+        ]
+        rows.append({"type": "response.completed", "response": {"output": calls}})
+        for client in self.clients:
+            with self.subTest(client=client.__name__):
+                answer = client._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+                self.assertEqual([call["id"] for call in answer["tool_calls"]],
+                                 ["call_0", "call_1"])
+
+    def test_terminal_duplicate_identity_does_not_hide_a_missing_call(self):
+        calls = [
+            {"type": "function_call", "id": f"fc_{i}", "call_id": f"call_{i}",
+             "name": "read", "arguments": "{}"}
+            for i in range(2)
+        ]
+        rows = [
+            {"type": "response.output_item.done", "output_index": i, "item": call}
+            for i, call in enumerate(calls)
+        ]
+        rows.append({"type": "response.completed", "response": {"output": [calls[0]] * 2}})
+        for client in self.clients:
+            with self.subTest(client=client.__name__), self.assertRaises(CompletionError) as error:
+                client._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+            self.assertEqual(error.exception.code, "invalid_tool_calls")
+
+    def test_refusal_aliases_render_each_content_block_once(self):
+        texts = ["No.", "Ask something else."]
+        item = {"type": "message", "id": "msg", "role": "assistant", "content": [
+            {"type": "refusal", "refusal": text} for text in texts
+        ]}
+        for bridge in ("done", "added"):
+            rows = [{"type": "response.refusal.delta", "output_index": 0,
+                     "content_index": 0, "delta": texts[0]}]
+            if bridge == "added":
+                rows.extend([
+                    {"type": "response.output_item.added", "output_index": 0, "item": item},
+                    {"type": "response.refusal.delta", "item_id": "msg",
+                     "content_index": 1, "delta": texts[1]},
+                ])
+            rows.extend([
+                {"type": "response.output_item.done", "output_index": 0, "item": item},
+                {"type": "response.completed", "response": {"output": [item]}},
+            ])
+            for client in self.clients:
+                shown = []
+                with self.subTest(bridge=bridge, client=client.__name__):
+                    answer = client._read_stream(io.BytesIO(encode_sse(rows)), shown.append)
+                    self.assertEqual(answer["content"], "".join(texts))
+                    self.assertEqual("".join(shown), answer["content"])
+
+    def test_malformed_refusal_identifiers_are_structured_errors(self):
+        cases = [(field, value) for field in ("content_index", "output_index")
+                 for value in ({}, [], True, -1, "0", None)]
+        cases.extend(("item_id", value) for value in ({}, [], 0, True, "", None))
+        for field, value in cases:
+            row = {"type": "response.refusal.delta", "item_id": "msg",
+                   "output_index": 0, "content_index": 0, "delta": "No.", field: value}
+            for client in self.clients:
+                with self.subTest(field=field, value=value, client=client.__name__):
+                    with self.assertRaises(CompletionError) as error:
+                        client._read_stream(io.BytesIO(encode_sse([row])), lambda _: None)
+                    self.assertEqual(error.exception.code, "invalid_response")
+
+    def test_nonstream_refusal_ids_use_the_same_validated_keys(self):
+        for identity in ("msg", None, {}, [], 0):
+            item = {"type": "message", "role": "assistant", "content": [
+                {"type": "refusal", "refusal": "No."}
+            ]}
+            if identity is not None:
+                item["id"] = identity
+            data = io.BytesIO(json.dumps({"status": "completed", "output": [item]}).encode())
+            client = object.__new__(ResponsesClient)
+            with self.subTest(identity=identity):
+                if identity in ("msg", None):
+                    result = client._read_nonstream_response(data, UsageAccumulator())
+                    self.assertEqual(result["content"], "No.")
+                else:
+                    with self.assertRaises(CompletionError) as error:
+                        client._read_nonstream_response(data, UsageAccumulator())
+                    self.assertEqual(error.exception.code, "invalid_response")
 
 
 class ModelApiConfigTests(unittest.TestCase):
