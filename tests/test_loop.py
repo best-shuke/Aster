@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from commands import CommandName, CommandResult, LoopCommand, parse_command, parse_loop
+from conversation import Conversation
 from main import handle_command, main, use_loop
 from model_request import CompletionError
 from tests.support import make_settings
@@ -212,6 +213,13 @@ class LoopCheckTests(unittest.TestCase):
         self.assertEqual(parse_loop(*command.arguments), LoopCommand(120, 4, shell, True, 5))
         self.assertEqual(parse_loop(f"1s --check {shell}"), LoopCommand(1, None, shell, True, 30))
 
+    def test_parse_check_preserves_leading_shell_whitespace(self):
+        shell = " \t\n\u00a0:"
+        for options in ("--check", "--check --timeout 5"):
+            with self.subTest(options=options):
+                command = parse_command(f"/loop 1s {options} {shell}")
+                self.assertEqual(parse_loop(*command.arguments).task, shell)
+
     def test_rejects_missing_check_command_and_invalid_timeout(self):
         for source in (
             "1s --check", "1s --count 2 --check", "1s --check --timeout",
@@ -321,6 +329,45 @@ class LoopCheckTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertGreaterEqual(len(client.requests), 1)
         self.assertTrue(all(not request["tools"] for request in client.requests))
+
+    def test_anomaly_analysis_does_not_resume_team_work(self):
+        client = FakeClient({"role": "assistant", "content": "Check failed."})
+        conversation = Conversation(self.settings, client, CodingTools(self.workspace))
+        self.addCleanup(conversation.close)
+        team = Mock(main_instructions=Mock(return_value="Team instructions."))
+        team.turn.return_value = nullcontext()
+        team.turn_context.return_value = ""
+        team.member_names.return_value = ()
+        team.source_workers_at_takeover.return_value = (False, 0)
+        team.final_answer_problem.return_value = None
+        team.continues_in_background.return_value = False
+        conversation.team = team
+
+        status = use_loop(conversation, self.console, ["1s --count 1 --check exit 4"])
+
+        self.assertEqual(status, 1)
+        self.assertEqual(len(client.requests), 1)
+        self.evidence(client.requests[0])
+        team.turn.assert_not_called()
+
+    def test_environment_approval_is_rechecked_between_rounds(self):
+        client = FakeClient()
+        conversation = Conversation(self.settings, client, CodingTools(self.workspace))
+        self.addCleanup(conversation.close)
+        environment = Mock()
+        conversation.active_environment = environment
+        command = "1s --count 2 --check printf 'round\\n' >> rounds"
+        with (
+            patch.object(conversation, "environments") as store,
+            patch("command_ui.time.sleep"),
+        ):
+            store.require_approved.side_effect = [None, ValueError("Approval revoked")]
+            with self.assertRaisesRegex(ValueError, "Approval revoked"):
+                use_loop(conversation, self.console, [command])
+
+        self.assertEqual((self.workspace / "rounds").read_text(), "round\n")
+        store.verify.assert_called_once_with(environment)
+        self.assertEqual(client.requests, [])
 
     def test_check_requires_exec_permission_before_running_shell(self):
         tools = CodingTools(self.workspace)

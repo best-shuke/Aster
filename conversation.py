@@ -571,11 +571,11 @@ class Conversation:
     def _summarize(self, messages: list[Message], deadline: float | None = None) -> str:
         return summarize(self.client, self.settings, messages, deadline)
 
-    def compact(self, deadline: float | None = None, on_progress=None) -> None:
+    def compact(self, deadline: float | None = None, on_progress=None, *, allow_tools=True) -> None:
         compact_messages(
             self.messages,
             self._runtime_system_message(),
-            self.definitions,
+            self.definitions if allow_tools else [],
             self.client,
             self.settings,
             deadline,
@@ -620,10 +620,13 @@ class Conversation:
             self.team,
         )
 
-    def refresh_skills(self) -> None:
+    def verify_environment(self) -> None:
         if self.active_environment is not None:
             self.environments.require_approved(self.active_environment)
             self.environments.verify(self.active_environment)
+
+    def refresh_skills(self) -> None:
+        self.verify_environment()
         if self.skills is None:
             return
         self.skills.reload()
@@ -932,13 +935,14 @@ class Conversation:
         if self.tools is not None:
             self.tools.reset_task(" ".join(prompt.split())[:120])
         contract = task_contract or TaskContract(kind="answer" if final_validator else "auto")
+        team = self.team if contract.allow_tools else None
         acceptance = TaskAcceptance(
             prompt,
             contract,
             has_tools=contract.allow_tools and bool(self.definitions),
             deadline=deadline,
             defer_baseline=True,
-            others=self.team.member_names() if self.team is not None else (),
+            others=team.member_names() if team is not None else (),
             passive_tools=frozenset(
                 name for name, spec in self.tools.registry.items() if spec.read_only
             )
@@ -955,13 +959,13 @@ class Conversation:
         handoff_source = (self.last_outcome or {}).get("handoff_source")
         self.last_outcome = acceptance.outcome()
         try:
-            active_members, reported_work = self.team.source_workers_at_takeover() if self.team is not None else (False, False)
+            active_members, reported_work = team.source_workers_at_takeover() if team is not None else (False, False)
             integrating = acceptance.integrates_team or acceptance.contract.kind != "answer"
             if integrating and reported_work and handoff_source and prior_revision is None:
                 acceptance.include_source_scope(handoff_source)
                 prior_revision = handoff_source
             acceptance.begin(
-                team_pending=active_members or reported_work or (self.team is not None and self.team.has_pending_work()),
+                team_pending=active_members or reported_work or (team is not None and team.has_pending_work()),
                 team_active=active_members or (reported_work and prior_revision is None),
                 prior_revision=prior_revision,
             )
@@ -979,17 +983,17 @@ class Conversation:
                         raise CompletionError("verification_unknown", problem)
                     return problem
             background = False
-            if self.team is not None:
+            if team is not None:
                 # Hold at most once per run of rejected answers: TaskRuntime fails the turn
                 # after a few in a row. A tool call in between ends the run.
-                problem = self.team.final_answer_problem(
+                problem = team.final_answer_problem(
                     handoff=acceptance.handoff_allowed or runtime.protocol_repairs > 0,
                     require_settled=acceptance.integrates_team,
                 )
                 if problem:
                     return problem
                 # Members' unfinished edits are verified when their work is done, not now.
-                background = self.team.continues_in_background()
+                background = team.continues_in_background()
             problem = acceptance.validate(content, background=background)
             if problem and contract.allow_tools and not background and acceptance.status != "incomplete":
                 problem = self._rerun_checks(
@@ -1014,13 +1018,13 @@ class Conversation:
         # the turn note so that it takes over background work first: nothing finishes in
         # the background after the note reports it.
         with (
-            self.team.turn(
+            team.turn(
                 deadline, background=self.team_background and acceptance.contract.background_handoff,
             )
-            if self.team is not None
+            if team is not None
             else nullcontext()
         ):
-            team_note = self.team.turn_context() if self.team is not None else ""
+            team_note = team.turn_context() if team is not None else ""
             user_message: Message = {"role": "user", "content": expanded_prompt}
             if expanded_prompt != prompt:
                 # History and session lists show what the user typed, not the loaded skill.
@@ -1036,7 +1040,7 @@ class Conversation:
                 }
             )
             try:
-                self.compact(deadline, on_progress)
+                self.compact(deadline, on_progress, allow_tools=contract.allow_tools)
             except BaseException:
                 acceptance.status = "incomplete"
                 self._save_outcome(acceptance)
@@ -1071,19 +1075,19 @@ class Conversation:
                         if session is not None:
                             session.stop()
         if (
-            self.team is not None
+            team is not None
             and acceptance.status == "background"
-            and not self.team.went_background
+            and not team.went_background
             and not acceptance.background_sessions()
         ):
             # The members finished before the turn ended: nothing continues, nothing verified.
             acceptance.status = "incomplete"
             self._save_outcome(acceptance)
         if (
-            reported_work and self.team is not None and acceptance.integrates_team
+            reported_work and team is not None and acceptance.integrates_team
             and acceptance.verified_source() is not None
         ):
-            self.team.acknowledge_background_source(reported_work)
+            team.acknowledge_background_source(reported_work)
         return answer
 
     def _rerun_checks(self, acceptance, runtime, content, problem, on_tool_result=None):

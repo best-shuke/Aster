@@ -216,21 +216,23 @@ def parse_loop(source: str = "") -> LoopCommand:
         if count < 1:
             raise ValueError("--count 须为正整数。")
         task = options[2]
-    flag, *command = task.split(maxsplit=1)
-    if flag != "--check":
+    check = re.match(r"--check(?:[ \t\r\n]|$)", task)
+    if check is None:
         return LoopCommand(seconds, count, task.rstrip())
-    if not command:
-        raise ValueError(f"用法：{LOOP_CHECK_USAGE}")
+    # Consume one separator after the final option, preserving the shell text.
+    command = task[check.end():]
     timeout = 30
-    if command[0].split(maxsplit=1)[0] == "--timeout":
-        options = command[0].split(maxsplit=2)
-        if len(options) != 3 or re.fullmatch(r"[0-9]+", options[1]) is None:
+    if re.match(r"[ \t\r\n]*--timeout(?=[ \t\r\n]|$)", command):
+        option = re.match(r"[ \t\r\n]*--timeout[ \t\r\n]+([0-9]+)[ \t\r\n]", command)
+        if option is None:
             raise ValueError(f"--timeout 须指定正整数秒数和命令。用法：{LOOP_CHECK_USAGE}")
-        timeout = int(options[1])
+        timeout = int(option[1])
         if not 1 <= timeout < threading.TIMEOUT_MAX:
             raise ValueError("--timeout 须大于零且在系统可等待范围内。")
-        command = [options[2]]
-    return LoopCommand(seconds, count, command[0], check=True, timeout=timeout)
+        command = command[option.end():]
+    if not command.strip(" \t\r\n"):
+        raise ValueError(f"用法：{LOOP_CHECK_USAGE}")
+    return LoopCommand(seconds, count, command, check=True, timeout=timeout)
 
 
 def execute_command(

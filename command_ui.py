@@ -93,6 +93,7 @@ def run_loop(
                 console.info(f"循环第 {label} 轮")
                 task = loop.task
                 if loop.check:
+                    conversation.verify_environment()
                     result = conversation.tools.run_check(loop.task, loop.timeout)
                     if result.status == "ok":
                         console.info("检查通过。")
