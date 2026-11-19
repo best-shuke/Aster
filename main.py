@@ -39,6 +39,7 @@ from command_ui import (
 )
 from commands import (
     COMMAND_NAMES,
+    LOOP_CHECK_USAGE,
     LOOP_USAGE,
     QUOTED_ARGUMENTS,
     CommandName,
@@ -78,6 +79,7 @@ HELP = (
             ("/goal resume [补充说明]", "恢复目标；--max-rounds / --max-seconds 调整总预算"),
             ('--criterion "条件"', "创建目标时添加验收条件，可重复；默认 20 轮、3600 秒"),
             (LOOP_USAGE, "立即执行，之后每轮结束等指定间隔（如 30s、5m）；Esc 或 Ctrl-C 停止"),
+            (LOOP_CHECK_USAGE, "检查命令退出码，异常时调用模型分析输出；默认超时 30 秒"),
         ),
     ),
     (
@@ -151,7 +153,7 @@ def use_goal(conversation: Conversation, console: Console, arguments: list[str])
 
 
 def use_loop(conversation: Conversation, console: Console, arguments: list[str]) -> int:
-    return run_loop(conversation, console, *parse_loop(*arguments), ask_task=ask)
+    return run_loop(conversation, console, parse_loop(*arguments), ask_task=ask)
 
 
 def handle_command(conversation: Conversation, console: Console, prompt: str) -> CommandResult:
@@ -373,10 +375,11 @@ def main() -> int:
     )
     parser.add_argument("prompt", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
-    prompt = " ".join(arguments.prompt).strip()
+    prompt = " ".join(arguments.prompt)
     if len(arguments.prompt) > 1 and COMMAND_NAMES.get(arguments.prompt[0]) in QUOTED_ARGUMENTS:
         prompt = shlex.join(arguments.prompt)
     command = parse_command(prompt)
+    prompt = prompt.strip()
     loop = None
     if command is not None and command.name is CommandName.LOOP:
         try:
@@ -486,7 +489,7 @@ def main() -> int:
             if prompt:
                 if loop is not None:
                     try:
-                        return run_loop(conversation, console, *loop, ask_task=ask)
+                        return run_loop(conversation, console, loop, ask_task=ask)
                     except KeyboardInterrupt:
                         console.info("循环已停止。")
                         return 130

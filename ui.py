@@ -1468,7 +1468,9 @@ class Console:
         # Anything printed before this prompt has been on screen for the user to read.
         self._unseen_error = None
         value = self._read_input("  You  › ")
-        return value if self.interactive else value.strip()
+        if self.interactive or value.split(maxsplit=1)[:1] == ["/loop"]:
+            return value
+        return value.strip()
 
     def read_value(
         self, prompt: str, *, secret: bool = False, until: threading.Event | None = None

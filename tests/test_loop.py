@@ -1,3 +1,5 @@
+import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -5,10 +7,13 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from commands import CommandName, CommandResult, parse_command, parse_loop
+from commands import CommandName, CommandResult, LoopCommand, parse_command, parse_loop
 from main import handle_command, main, use_loop
+from model_request import CompletionError
 from tests.support import make_settings
 from tests.test_conversation import FakeClient
+from tool_runtime import PAGE_CHARS
+from tools import CodingTools, ToolPolicy
 from ui import Console
 
 
@@ -23,7 +28,7 @@ class LoopTests(unittest.TestCase):
         task = 'Run `rg "ERROR details" logs`\nReport new matches.'
         command = parse_command(f"/loop 5m --count 3 {task}")
         self.assertIs(command.name, CommandName.LOOP)
-        self.assertEqual(parse_loop(command.arguments[0]), (300, 3, task))
+        self.assertEqual(parse_loop(command.arguments[0]), LoopCommand(300, 3, task))
 
     def test_rejects_invalid_interval_count_and_missing_task(self):
         for source in (
@@ -158,3 +163,198 @@ class LoopTests(unittest.TestCase):
         messages = client.requests[1]["messages"]
         self.assertEqual([item["content"] for item in messages if item["role"] == "user"], [task] * 2)
         self.assertIn("First result.", [item["content"] for item in messages])
+
+
+class LoopCheckTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.workspace = Path(directory.name)
+        self.console = Mock(spec=Console)
+        self.console.interactive = False
+        self.settings = make_settings(
+            workspace=self.workspace,
+            session_file=self.workspace / "session.json",
+            api_key="test",
+            base_url="https://example.invalid",
+            model="test",
+            max_context_chars=120_000,
+            keep_recent_turns=6,
+            max_task_seconds=None,
+            max_subagents=None,
+            skills_enabled=False,
+            mcp_enabled=False,
+            websearch_enabled=False,
+        )
+
+    def run_cli(self, client, *arguments):
+        with (
+            patch("sys.argv", ["agent", "/loop", "1s", *arguments]),
+            patch("main.load_settings", return_value=self.settings),
+            patch("main.Console", return_value=self.console),
+            patch("main.model_client", return_value=client),
+            patch("command_ui.time") as clock,
+        ):
+            status = main()
+        self.console.error.assert_not_called()
+        return status, clock.sleep
+
+    def evidence(self, request):
+        self.assertFalse(request["tools"])
+        prompt = next(
+            item["content"] for item in reversed(request["messages"]) if item["role"] == "user"
+        )
+        return json.loads(prompt.split("\n", 1)[1])
+
+    def test_parse_check_preserves_literal_shell_remainder(self):
+        shell = 'printf "%s\\n" "--timeout 2" > "check log"\ntest -s "check log"'
+        command = parse_command(f"/loop 2m --count 4 --check --timeout 5 {shell}")
+        self.assertEqual(parse_loop(*command.arguments), LoopCommand(120, 4, shell, True, 5))
+        self.assertEqual(parse_loop(f"1s --check {shell}"), LoopCommand(1, None, shell, True, 30))
+
+    def test_rejects_missing_check_command_and_invalid_timeout(self):
+        for source in (
+            "1s --check", "1s --count 2 --check", "1s --check --timeout",
+            "1s --check --timeout 1", "1s --check --timeout 0 true",
+            "1s --check --timeout -1 true", "1s --check --timeout 1.5 true",
+        ):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                parse_loop(source)
+
+    def test_healthy_shell_checks_run_each_round_without_requesting_model(self):
+        client = FakeClient()
+        shell = 'if read -r line; then exit 9; fi\nprintf "%s\\n" "--timeout 2" >> "check log"'
+
+        status, sleep = self.run_cli(client, "--count", "2", "--check", shell)
+
+        self.assertEqual(status, 0)
+        self.assertEqual((self.workspace / "check log").read_text(), "--timeout 2\n" * 2)
+        self.assertEqual(client.requests, [])
+        sleep.assert_called_once_with(1)
+
+    def test_cli_preserves_a_trailing_escaped_space_in_check_command(self):
+        client = FakeClient()
+        shell = "printf '%s' > escaped value\\ "
+
+        status, _ = self.run_cli(client, "--count", "1", "--check", shell)
+
+        self.assertEqual(status, 0)
+        self.assertEqual((self.workspace / "escaped").read_text(), "value ")
+        command = parse_command(f"/loop 1s --check {shell}")
+        self.assertEqual(parse_loop(*command.arguments).task, shell)
+        self.assertEqual(client.requests, [])
+
+    def test_nonzero_check_reports_bounded_output_and_fails_even_after_recovery(self):
+        client = FakeClient({"role": "assistant", "content": "Check exited with an error."})
+        shell = (
+            "if test -f attempted; then touch recovered; exit 0; fi; touch attempted; "
+            f"printf 'start-of-output'; printf '%*s' {2 * PAGE_CHARS} ''; "
+            "printf 'diagnostic-tail\\n' >&2; exit 7"
+        )
+
+        status, sleep = self.run_cli(client, "--count", "2", "--check", shell)
+
+        self.assertEqual(status, 1)
+        self.assertTrue((self.workspace / "recovered").is_file())
+        sleep.assert_called_once_with(1)
+        self.assertEqual(len(client.requests), 1)
+        evidence = self.evidence(client.requests[0])
+        self.assertEqual(evidence["command"], shell)
+        self.assertEqual(evidence["exit_code"], 7)
+        self.assertTrue(evidence["output_truncated"])
+        self.assertLessEqual(len(evidence["output"]), PAGE_CHARS)
+        self.assertTrue(evidence["output"].endswith("diagnostic-tail\n"))
+        self.assertNotIn("start-of-output", evidence["output"])
+
+    def test_timed_out_check_sends_captured_output_to_model(self):
+        client = FakeClient({"role": "assistant", "content": "Check timed out."})
+        shell = "printf 'before timeout\\n' >&2; exec sleep 10"
+
+        status, sleep = self.run_cli(client, "--count", "1", "--check", "--timeout", "1", shell)
+
+        self.assertEqual(status, 1)
+        sleep.assert_not_called()
+        self.assertEqual(len(client.requests), 1)
+        evidence = self.evidence(client.requests[0])
+        self.assertIn("超过 1 秒", evidence["reason"])
+        self.assertEqual(evidence["output"], "before timeout\n")
+        self.assertFalse(evidence["output_truncated"])
+
+    def test_completion_error_does_not_stop_subsequent_checks(self):
+        client = FakeClient(
+            CompletionError("fixture", "analysis failed"),
+            {"role": "assistant", "content": "Second check failed."},
+        )
+        shell = "printf 'round\\n' >> rounds; wc -l < rounds; exit 3"
+
+        status, sleep = self.run_cli(client, "--count", "2", "--check", shell)
+
+        self.assertEqual(status, 1)
+        sleep.assert_called_once_with(1)
+        outputs = [self.evidence(request)["output"].strip() for request in client.requests]
+        self.assertEqual(outputs, ["1", "2"])
+        warnings = [call.args[0] for call in self.console.warning.call_args_list]
+        self.assertTrue(any("analysis failed" in warning for warning in warnings))
+
+    def test_unsolicited_tool_call_cannot_run_in_anomaly_analysis(self):
+        client = FakeClient(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "unsolicited-exec",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": json.dumps({"command": "touch model-executed"}),
+                        },
+                    },
+                ],
+            },
+            {"role": "assistant", "content": "Check failed."},
+        )
+
+        status, _ = self.run_cli(client, "--count", "1", "--check", "exit 4")
+
+        self.assertFalse((self.workspace / "model-executed").exists())
+        self.assertEqual(status, 1)
+        self.assertGreaterEqual(len(client.requests), 1)
+        self.assertTrue(all(not request["tools"] for request in client.requests))
+
+    def test_check_requires_exec_permission_before_running_shell(self):
+        tools = CodingTools(self.workspace)
+        self.addCleanup(tools.close)
+        tools.policy = ToolPolicy(deny=frozenset({"exec"}))
+        conversation = Mock(tools=tools)
+        with patch("main.ask") as ask, self.assertRaises(PermissionError):
+            use_loop(conversation, self.console, ["1s --count 1 --check touch check-executed"])
+
+        ask.assert_not_called()
+        self.assertFalse((self.workspace / "check-executed").exists())
+
+    def test_interrupt_during_check_reaps_shell_and_skips_model_and_next_round(self):
+        tools = CodingTools(self.workspace)
+        self.addCleanup(tools.close)
+        conversation = Mock(tools=tools)
+        wait = subprocess.Popen.wait
+        interrupted = []
+
+        def interrupt_wait(process, timeout=None):
+            if timeout is not None:
+                interrupted.append(process)
+                raise KeyboardInterrupt
+            return wait(process, timeout=5)
+
+        with (
+            patch.object(subprocess.Popen, "wait", interrupt_wait),
+            patch("main.ask") as ask,
+            patch("command_ui.time") as clock,
+        ):
+            status = use_loop(conversation, self.console, ["1s --count 2 --check exec sleep 10"])
+
+        self.assertEqual(status, 130)
+        self.assertEqual(len(interrupted), 1)
+        self.assertIsNotNone(interrupted[0].returncode)
+        ask.assert_not_called()
+        clock.sleep.assert_not_called()

@@ -631,6 +631,7 @@ class TaskContract:
     verification_required: bool = False
     background_handoff: bool = True
     integrate_team: bool = False
+    allow_tools: bool = True
 
 
 @dataclass

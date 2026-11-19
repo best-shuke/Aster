@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -130,6 +131,7 @@ def run_process(
     shell: bool = False,
     *,
     tool: str = "exec",
+    stdin: int | None = None,
 ) -> ProcessResult:
     """Spool complete output to disk; enforce the shared deadline and cancellation."""
     context.remaining()
@@ -141,6 +143,7 @@ def run_process(
                 command,
                 cwd=cwd,
                 shell=shell,
+                stdin=stdin,
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -1412,6 +1415,31 @@ class CodingTools:
         self.file_versions[path] = text_digest(content)
         if self.edit_ledger is not None:
             self.edit_ledger.record_write(path, content)
+
+    def run_check(self, command: str, timeout: int) -> ToolResult:
+        """Run a noninteractive check and keep only a bounded excerpt on failure."""
+        if not self.tool_available("exec"):
+            raise PermissionError("当前环境未启用 exec，无法执行循环检查。")
+        with tempfile.TemporaryDirectory(prefix="aster-check-") as scratch:
+            process = run_process(
+                command,
+                self.workspace,
+                ArtifactStore(Path(scratch)),
+                ExecutionContext(time.monotonic() + timeout),
+                shell=True,
+                stdin=subprocess.DEVNULL,
+            )
+            if process.exit_code == 0 and not process.timed_out:
+                return ToolResult()
+            with process.path.open("rb") as stream:
+                size = stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, size - PAGE_CHARS))
+                output = stream.read(PAGE_CHARS).decode("utf-8", errors="replace")
+        return ToolResult(
+            status="timeout" if process.timed_out else "error",
+            data={"exit_code": process.exit_code, "output": output},
+            truncated=size > PAGE_CHARS,
+        )
 
     def run_command(
         self,

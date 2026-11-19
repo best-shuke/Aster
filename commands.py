@@ -86,7 +86,17 @@ QUOTED_ARGUMENTS = frozenset(
     {CommandName.TEMPLATE, CommandName.ENVIRONMENT, CommandName.WORKFLOW, CommandName.GOAL}
 )
 LOOP_USAGE = "/loop 间隔 [--count 轮数] 任务"
+LOOP_CHECK_USAGE = "/loop 间隔 [--count 轮数] --check [--timeout 秒数] Shell 命令"
 _INTERVAL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+@dataclass(frozen=True)
+class LoopCommand:
+    interval: int
+    count: int | None
+    task: str
+    check: bool = False
+    timeout: int = 30
 
 
 @dataclass(frozen=True)
@@ -165,11 +175,11 @@ class CommandActions:
 
 
 def parse_command(prompt: str) -> ParsedCommand | None:
-    prompt = prompt.strip()
     head = prompt.split(maxsplit=1)
     if head and head[0] == "/loop":
         # Preserve shell quotes and pasted line breaks in the task.
         return ParsedCommand(CommandName.LOOP, tuple(head[1:]))
+    prompt = prompt.strip()
     if "\n" in prompt or "\r" in prompt:
         return None
     parts = prompt.split()
@@ -186,7 +196,7 @@ def parse_command(prompt: str) -> ParsedCommand | None:
     return ParsedCommand(name, tuple(arguments))
 
 
-def parse_loop(source: str = "") -> tuple[int, int | None, str]:
+def parse_loop(source: str = "") -> LoopCommand:
     parts = source.split(maxsplit=1)
     if len(parts) != 2:
         raise ValueError(f"用法：{LOOP_USAGE}")
@@ -206,7 +216,21 @@ def parse_loop(source: str = "") -> tuple[int, int | None, str]:
         if count < 1:
             raise ValueError("--count 须为正整数。")
         task = options[2]
-    return seconds, count, task
+    flag, *command = task.split(maxsplit=1)
+    if flag != "--check":
+        return LoopCommand(seconds, count, task.rstrip())
+    if not command:
+        raise ValueError(f"用法：{LOOP_CHECK_USAGE}")
+    timeout = 30
+    if command[0].split(maxsplit=1)[0] == "--timeout":
+        options = command[0].split(maxsplit=2)
+        if len(options) != 3 or re.fullmatch(r"[0-9]+", options[1]) is None:
+            raise ValueError(f"--timeout 须指定正整数秒数和命令。用法：{LOOP_CHECK_USAGE}")
+        timeout = int(options[1])
+        if not 1 <= timeout < threading.TIMEOUT_MAX:
+            raise ValueError("--timeout 须大于零且在系统可等待范围内。")
+        command = [options[2]]
+    return LoopCommand(seconds, count, command[0], check=True, timeout=timeout)
 
 
 def execute_command(

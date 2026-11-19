@@ -931,10 +931,11 @@ class Conversation:
         expanded_prompt = self.skills.expand_command(prompt) if self.skills is not None else prompt
         if self.tools is not None:
             self.tools.reset_task(" ".join(prompt.split())[:120])
+        contract = task_contract or TaskContract(kind="answer" if final_validator else "auto")
         acceptance = TaskAcceptance(
             prompt,
-            task_contract or TaskContract(kind="answer" if final_validator else "auto"),
-            has_tools=bool(self.definitions),
+            contract,
+            has_tools=contract.allow_tools and bool(self.definitions),
             deadline=deadline,
             defer_baseline=True,
             others=self.team.member_names() if self.team is not None else (),
@@ -990,7 +991,7 @@ class Conversation:
                 # Members' unfinished edits are verified when their work is done, not now.
                 background = self.team.continues_in_background()
             problem = acceptance.validate(content, background=background)
-            if problem and not background and acceptance.status != "incomplete":
+            if problem and contract.allow_tools and not background and acceptance.status != "incomplete":
                 problem = self._rerun_checks(
                     acceptance, runtime, content, problem, on_tool_result
                 )
@@ -1155,7 +1156,7 @@ class Conversation:
             message = runtime.generate(
                 self.messages,
                 self.system_message,
-                self.definitions,
+                self.definitions if acceptance.contract.allow_tools else [],
                 on_content,
                 on_response_start,
                 on_response_end,
