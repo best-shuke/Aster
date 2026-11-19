@@ -11,6 +11,7 @@ from command_ui import (
     conversation_count,
     present_command,
     resume_conversation,
+    run_loop,
     show_history,
     show_skill_diagnostics,
     show_skills,
@@ -30,7 +31,6 @@ from command_ui import (
     use_environment as use_environment,
 )
 from command_ui import use_goal as present_goal
-from command_ui import use_loop as present_loop
 from command_ui import (
     use_multiagents as use_multiagents,
 )
@@ -45,6 +45,7 @@ from commands import (
     CommandResult,
     execute_command,
     parse_command,
+    parse_loop,
 )
 from config import APP_NAME, CLI_NAME, LoginRequired, Settings, auth_file, load_env, user_path
 from conversation import Conversation
@@ -150,7 +151,7 @@ def use_goal(conversation: Conversation, console: Console, arguments: list[str])
 
 
 def use_loop(conversation: Conversation, console: Console, arguments: list[str]) -> int:
-    return present_loop(conversation, console, arguments, ask_task=ask)
+    return run_loop(conversation, console, *parse_loop(*arguments), ask_task=ask)
 
 
 def handle_command(conversation: Conversation, console: Console, prompt: str) -> CommandResult:
@@ -376,6 +377,13 @@ def main() -> int:
     if len(arguments.prompt) > 1 and COMMAND_NAMES.get(arguments.prompt[0]) in QUOTED_ARGUMENTS:
         prompt = shlex.join(arguments.prompt)
     command = parse_command(prompt)
+    loop = None
+    if command is not None and command.name is CommandName.LOOP:
+        try:
+            loop = parse_loop(*command.arguments)
+        except ValueError as exc:
+            print(f"{CLI_NAME}: {exc}", file=sys.stderr)
+            return 2
     environment_command = command is not None and command.name is CommandName.ENVIRONMENT
     settings = load_settings(choose=arguments.login, one_shot=bool(prompt))
     if settings is None:
@@ -476,18 +484,22 @@ def main() -> int:
                 mcp_manager.start_all()
                 console.update_mcp(mcp_manager.status().data["servers"])
             if prompt:
-                if command is not None and command.name in {CommandName.GOAL, CommandName.LOOP}:
+                if loop is not None:
+                    try:
+                        return run_loop(conversation, console, *loop, ask_task=ask)
+                    except KeyboardInterrupt:
+                        console.info("循环已停止。")
+                        return 130
+                    except Exception as exc:
+                        console.error(exc)
+                        return 1
+                if command is not None and command.name is CommandName.GOAL:
                     try:
                         if command.error is not None:
                             raise command.error
-                        if command.name is CommandName.LOOP:
-                            return use_loop(conversation, console, list(command.arguments))
                         return 0 if use_goal(conversation, console, list(command.arguments)) else 1
                     except KeyboardInterrupt:
-                        console.info(
-                            "循环已停止。" if command.name is CommandName.LOOP
-                            else "目标已暂停，已保存可恢复的进展。"
-                        )
+                        console.info("目标已暂停，已保存可恢复的进展。")
                         return 130
                     except ValueError as exc:
                         console.error(exc)

@@ -7,14 +7,7 @@ from pathlib import Path
 from typing import cast
 
 from auth import AuthStore
-from commands import (
-    CommandActions,
-    CommandExecution,
-    CommandName,
-    EffectKind,
-    ParsedCommand,
-    parse_loop,
-)
+from commands import CommandActions, CommandExecution, CommandName, EffectKind, ParsedCommand
 from config import REASONING_EFFORTS, LoginRequired, auth_file
 from conversation import Conversation
 from environment_commands import enter_multiagents, environment_subcommand
@@ -65,8 +58,15 @@ def use_goal(conversation: Conversation, console: Console, arguments: list[str],
     return command.action in {"pause", "cancel"} or goal.status == "completed"
 
 
-def use_loop(conversation: Conversation, console: Console, arguments: list[str], *, ask_task) -> int:
-    interval, count, task = parse_loop(arguments[0] if arguments else "")
+def run_loop(
+    conversation: Conversation,
+    console: Console,
+    interval: int,
+    count: int | None,
+    task: str,
+    *,
+    ask_task,
+) -> int:
     contract = TaskContract(
         description="Perform one iteration using fresh observations where applicable, then report "
         "the result. Aster schedules subsequent iterations."

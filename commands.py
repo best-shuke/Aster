@@ -186,7 +186,7 @@ def parse_command(prompt: str) -> ParsedCommand | None:
     return ParsedCommand(name, tuple(arguments))
 
 
-def parse_loop(source: str) -> tuple[int, int | None, str]:
+def parse_loop(source: str = "") -> tuple[int, int | None, str]:
     parts = source.split(maxsplit=1)
     if len(parts) != 2:
         raise ValueError(f"用法：{LOOP_USAGE}")

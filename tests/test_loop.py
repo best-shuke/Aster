@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from contextlib import nullcontext
+from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -76,6 +77,50 @@ class LoopTests(unittest.TestCase):
             result = use_loop(self.conversation, self.console, ["1s --count 2 inspect"])
         self.assertEqual(result, 1)
         self.assertEqual(ask.call_count, 2)
+
+    def test_cli_rejects_invalid_arguments_before_loading_settings(self):
+        with (
+            patch("sys.argv", ["agent", "/loop", "0s", "inspect"]),
+            patch("sys.stderr", new_callable=StringIO) as stderr,
+            patch("main.load_settings", return_value=None) as load_settings,
+        ):
+            self.assertEqual(main(), 2)
+
+        load_settings.assert_not_called()
+        self.assertIn("循环间隔须大于零", stderr.getvalue())
+
+    def test_cli_round_value_error_exits_with_runtime_failure(self):
+        self.console.interactive = False
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            settings = make_settings(
+                workspace=workspace,
+                session_file=workspace / "session.json",
+                api_key="test",
+                base_url="https://example.invalid",
+                model="test",
+                max_context_chars=120_000,
+                keep_recent_turns=6,
+                max_task_seconds=None,
+                max_subagents=None,
+                skills_enabled=False,
+                mcp_enabled=False,
+                websearch_enabled=False,
+            )
+            client = FakeClient()
+            with (
+                patch("main.load_settings", return_value=settings),
+                patch("main.Console", return_value=self.console),
+                patch("main.model_client", return_value=client),
+                patch("command_ui.time.sleep") as sleep,
+                patch("sys.argv", ["agent", "/loop", "1s", "--count", "2", "/skill:missing inspect"]),
+            ):
+                self.assertEqual(main(), 1)
+
+        self.console.error.assert_called_once()
+        self.assertIn("Skills 已关闭", str(self.console.error.call_args.args[0]))
+        self.assertEqual(client.requests, [])
+        sleep.assert_not_called()
 
     def test_cli_runs_multiple_turns_in_same_session(self):
         self.console.interactive = False
