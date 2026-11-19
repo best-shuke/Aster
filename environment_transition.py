@@ -441,9 +441,12 @@ class EnvironmentTransition:
             except Exception as exc:
                 self.warnings.append(f"环境已提交，但后台命令清理失败：{exc}")
             try:
+                limits = (
+                    prepared.settings.max_subagents, conversation.tools._global_worker_limit
+                )
                 conversation.tools.worker_status.configure(
                     environment.status_file if environment else None,
-                    min(prepared.settings.max_subagents, conversation.tools._global_worker_limit),
+                    min((limit for limit in limits if limit is not None), default=None),
                 )
                 if conversation.tools.worker_status.last_error:
                     self.warnings.append(conversation.tools.worker_status.last_error)

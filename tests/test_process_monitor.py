@@ -111,6 +111,7 @@ class ProcessMonitorTests(unittest.TestCase):
             deadline=time.monotonic() + 0.1,
         )
         session_id = launched["data"]["session_id"]
+        self.assertIsNone(launched["data"]["timeout_seconds"])
         time.sleep(0.15)
         self.assertEqual(self.monitor(session_id)["data"]["state"], "running")
         self.monitor(session_id, "input", input="\n")

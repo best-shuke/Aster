@@ -36,9 +36,13 @@
 | `DEEPSEEK_WEBSEARCH_BASE_URL` / `DEEPSEEK_WEBSEARCH_API_KEY` | 搜索服务地址与独立凭据；地址留空自动选择，同源时复用模型 Key |
 | `DEEPSEEK_REASONING_EFFORT` | 推理档位：`off`、`low`、`high`、`max`、`default` |
 | `DEEPSEEK_MAX_CONTEXT_CHARS` / `DEEPSEEK_CONTEXT_WINDOW_TOKENS` | 上下文预算 |
-| `DEEPSEEK_MAX_OUTPUT_TOKENS` / `DEEPSEEK_MAX_TASK_SECONDS` | 输出上限与任务时限 |
+| `DEEPSEEK_MAX_OUTPUT_TOKENS` / `DEEPSEEK_MAX_TASK_SECONDS` | 可选输出上限与任务时限，默认不限 |
 | `ASTER_TASK_TOKEN_BUDGET` / `ASTER_SESSION_TOKEN_BUDGET` / `ASTER_GOAL_TOKEN_BUDGET` | 单次任务、会话和持续目标的可选 token 额度；默认不限 |
-| `DEEPSEEK_MAX_SUBAGENTS` | 子代理并发上限 |
+| `DEEPSEEK_MAX_SUBAGENTS` | 可选子代理并发上限，默认不限 |
+
+普通生成默认由服务端决定输出上限。Anthropic Messages 原生接口要求提供 `max_tokens`，未配置时使用 8192 作为兼容值，可按模型能力显式配置。DeepSeek 官方 Messages 入口允许省略该字段。设置 token 预算也可能为单次请求指定可用输出额度。
+
+`exec` 和 `delegate` 省略 `timeout` 时沿用父任务的截止时间。长命令可以用 `exec(background=true)` 启动，再通过 `monitor` 等待、读日志或停止。后台命令只在显式指定 `timeout` 时有自己的运行时限，退出应用或切换环境会清理这些进程。
 
 启用 token 额度后，每次模型请求先预留估算输入与输出上限。主代理、团队成员、委派与摘要共享所属任务、会话和目标的额度；成员还受自己的单轮额度限制。已经开始的请求仍在原账本结算。响应有用量时，使用未命中缓存的输入与输出 token；正常响应缺少用量时使用估算，失败且用量未报告的请求单独记为未知。只报告部分用量时，已知部分仍计入，缺失部分保留未知标记。预留不可替代供应商计量，不是严格的费用上限。会话和目标恢复时延续已结算用量；同一进程内尚未结束的请求保留原目标账本及预留，迟到结算写回所属会话。
 

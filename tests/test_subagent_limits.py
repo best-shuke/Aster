@@ -3,8 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import http_transport
-from config import MAX_SUBAGENTS, Settings
+from config import Settings
 from reasoning import ReasoningTools
 
 
@@ -21,25 +20,27 @@ class SubagentLimitTests(unittest.TestCase):
             ):
                 self.assertEqual(Settings.from_env().max_task_seconds, expected)
 
-    def test_default_configuration_allows_twenty_subagents(self):
+    def test_default_configuration_leaves_subagents_and_output_unlimited(self):
         with (
             patch("config.load_env"),
             patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test"}, clear=True),
         ):
-            self.assertEqual(MAX_SUBAGENTS, 20)
-            self.assertEqual(Settings.from_env().max_subagents, 20)
+            settings = Settings.from_env()
+            self.assertIsNone(settings.max_subagents)
+            self.assertIsNone(settings.max_output_tokens)
 
-    def test_configuration_preserves_lower_limits_and_clamps_to_twenty(self):
+    def test_configuration_honors_explicit_limits_or_unlimited(self):
         for configured, expected in [
             (-1, 1),
-            (0, 1),
+            (0, None),
+            ("unlimited", None),
             (1, 1),
             (2, 2),
             (8, 8),
             (19, 19),
             (20, 20),
-            (21, 20),
-            (100, 20),
+            (21, 21),
+            (100, 100),
         ]:
             with (
                 self.subTest(configured=configured),
@@ -69,21 +70,18 @@ class SubagentLimitTests(unittest.TestCase):
             ):
                 Settings.from_env()
 
-    def test_reasoning_runner_uses_twenty_as_default_and_hard_limit(self):
+    def test_reasoning_runner_only_enforces_explicit_limits(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             default = ReasoningTools(Mock(), Mock(), [], workspace=workspace)
-            self.assertEqual(default.max_workers, 20)
-            for configured, expected in [(0, 1), (2, 2), (20, 20), (21, 20)]:
+            self.assertIsNone(default.slots)
+            for configured, expected in [(0, 1), (2, 2), (20, 20), (21, 21)]:
                 with self.subTest(configured=configured):
                     reasoning = ReasoningTools(
                         Mock(), Mock(), [], max_workers=configured, workspace=workspace
                     )
                     self.assertEqual(reasoning.max_workers, expected)
                     self.assert_slot_capacity(reasoning.slots, expected)
-
-    def test_http_transport_has_twenty_bounded_worker_slots(self):
-        self.assert_slot_capacity(http_transport._SLOTS, 20)
 
     def assert_slot_capacity(self, semaphore, capacity):
         acquired = 0

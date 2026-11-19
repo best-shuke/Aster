@@ -39,7 +39,9 @@ def use_goal(conversation: Conversation, console: Console, arguments: list[str],
                     ),
                     on_progress=console.progress,
                     on_round=lambda state: console.info(
-                        f"目标第 {state.rounds}/{state.max_rounds} 轮：{state.objective}"
+                        f"目标第 {state.rounds}"
+                        + (f"/{state.max_rounds}" if state.max_rounds is not None else "")
+                        + f" 轮：{state.objective}"
                     ),
                     on_review=lambda state: console.info("正在核对目标、验收条件与执行证据…"),
                 ).run()

@@ -445,16 +445,32 @@ class GoalRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(conversation.goal.notes, ["目标读者是开发者"])
 
-    def test_three_identical_rounds_are_blocked_instead_of_looping_forever(self):
+    def test_unlimited_goal_continues_past_old_round_cap_and_identical_rounds(self):
         responses = []
-        for _ in range(3):
+        for _ in range(21):
             responses.extend([say("同样的结果"), assessment("continue", next_step="继续调查")])
+        responses.extend([say("调查完成"), assessment()])
         conversation = self.conversation(*responses)
         self.start(conversation)
         goal = GoalRuntime(conversation).run()
-        self.assertEqual(goal.status, "blocked")
-        self.assertEqual(goal.rounds, 3)
-        self.assertIn("连续三轮", goal.reason)
+        self.assertEqual(goal.status, "completed")
+        self.assertEqual(goal.rounds, 22)
+        self.assertIsNone(goal.max_seconds)
+
+    def test_resume_can_clear_exhausted_limits_in_old_sessions(self):
+        conversation = self.conversation()
+        saved = GoalState(
+            "task", max_rounds=20, max_seconds=3600, rounds=20,
+            elapsed_ms=3600000, status="budget_exhausted",
+        ).to_dict()
+        conversation.goal = GoalState.from_dict(
+            {**saved, "repeated_rounds": 3, "last_fingerprint": "legacy"}
+        )
+        command = parse_goal(["resume", "--max-rounds", "unlimited", "--max-seconds", "unlimited"])
+        goal = prepare_goal(conversation, command)
+        self.assertIsNone(goal.max_rounds)
+        self.assertIsNone(goal.max_seconds)
+        self.assertEqual(goal.rounds, 20)
 
     def test_same_summary_with_different_tool_work_is_not_blocked(self):
         responses = []
@@ -471,7 +487,6 @@ class GoalRuntimeTests(unittest.TestCase):
         goal = GoalRuntime(conversation).run()
         self.assertEqual(goal.status, "budget_exhausted")
         self.assertEqual((self.workspace / "report.md").read_text(), "完整内容")
-        self.assertEqual(goal.repeated_rounds, 1)
 
     def test_interrupt_during_work_pauses_and_preserves_checkpoint(self):
         conversation = self.conversation()

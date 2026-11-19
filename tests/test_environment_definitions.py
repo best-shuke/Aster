@@ -202,7 +202,7 @@ class LimitEditingTests(EditorTestCase):
             ("token_budget_per_agent", 1.5),
             ("token_budget_per_agent", "forever"),
             ("background_seconds", -1),
-            ("max_concurrent_agents", None),
+            ("max_concurrent_agents", 0),
         ):
             candidate = {**definition, "limits": {key: value}}
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
@@ -232,15 +232,12 @@ class LimitEditingTests(EditorTestCase):
                     f"unlimited-{index}", limits=dict.fromkeys(UNLIMITED_LIMITS, value)
                 )
                 for name in UNLIMITED_LIMITS:
-                    self.assertIsNone(getattr(environment.team.limits, name))
+                    expected = self.settings.max_subagents if name == "max_concurrent_agents" else None
+                    self.assertEqual(getattr(environment.team.limits, name), expected)
         self.editor.create("crew", template="multi-agent")
         before = (self.user / "crew.json").read_text()
-        for assignment in ("max_concurrent_agents=unlimited", "max_agents=unlimited"):
-            with (
-                self.subTest(assignment=assignment),
-                self.assertRaisesRegex(ValueError, "不能设为 unlimited"),
-            ):
-                self.editor.set_limits("crew", [assignment])
+        with self.assertRaisesRegex(ValueError, "不能设为 unlimited"):
+            self.editor.set_limits("crew", ["max_agents=unlimited"])
         self.assertEqual((self.user / "crew.json").read_text(), before)
 
     def test_keywords_are_case_insensitive(self):

@@ -17,7 +17,6 @@ from typing import Any, TextIO
 from uuid import uuid4
 
 from client_runtime import snapshot_client
-from config import MAX_SUBAGENTS
 from contracts import CompletionClient, ProgressCallback, ToolCall, ToolDefinition
 from execution_trace import display_callback, emit_event, trace_scope
 from file_changes import MAX_AUTO_MERGE_CHARS, EditLedger, FileTransaction, text_digest
@@ -47,6 +46,7 @@ TIMEOUT = {
     "maximum": 3600,
     "description": "Maximum elapsed seconds; also bounded by the task deadline.",
 }
+OPTIONAL_TIMEOUT = {"type": "integer", "minimum": 1, "maximum": 31_536_000}
 OFFSET = {
     "type": "integer",
     "minimum": 1,
@@ -298,7 +298,7 @@ class WorkerStatus:
         self.running = 0
         self.started_total = 0
         self.finished_total = 0
-        self.limit = MAX_SUBAGENTS
+        self.limit: int | None = None
         self.path: Path | None = None
         self.generation = uuid4().hex
         self.owner = uuid4().hex
@@ -332,7 +332,7 @@ class WorkerStatus:
     def status_path(self, base: Path) -> Path:
         return base.with_name(f"{base.stem}.{os.getpid()}.{self.owner}{base.suffix}")
 
-    def configure(self, path: Path | None, limit: int) -> None:
+    def configure(self, path: Path | None, limit: int | None) -> None:
         path = self.status_path(path) if path is not None else None
         with self.lock:
             if path == self.path and limit == self.limit and not self.stop.is_set():
@@ -518,9 +518,8 @@ class CodingTools:
                     "command": {"type": "string", "minLength": 1},
                     "cwd": PATH,
                     "timeout": {
-                        **TIMEOUT,
-                        "default": 120,
-                        "description": "Foreground commands are bounded by the task deadline. For background=true, this is an independent process lifetime in seconds.",
+                        **OPTIONAL_TIMEOUT,
+                        "description": "Optional time limit in seconds. Foreground commands also respect the task deadline. Background commands have no lifetime limit unless specified.",
                     },
                     "background": {"type": "boolean", "default": False},
                 },
@@ -593,6 +592,7 @@ class CodingTools:
         self.cache_scope = "default"
         self._global_worker_slots = None
         self._global_worker_limit = None
+        self._worker_slots_initialized = False
         self.worker_status = WorkerStatus()
         self.role_loader = None
         # Team members get private session state hidden and, optionally, write scopes.
@@ -639,6 +639,7 @@ class CodingTools:
         self.role_loader = other.role_loader
         self._global_worker_slots = other._global_worker_slots
         self._global_worker_limit = other._global_worker_limit
+        self._worker_slots_initialized = other._worker_slots_initialized
         self.protected_paths = other.protected_paths
         self.write_roots = other.write_roots
 
@@ -656,12 +657,16 @@ class CodingTools:
         return getattr(self._file_versions, "transaction", None)
 
     @contextmanager
-    def worker_session(self, context: ExecutionContext):
+    def worker_session(self, context: ExecutionContext, tools: frozenset[str] | None = None):
         previous = self.worker_changes
         previous_versions = getattr(self._file_versions, "worker_versions", None)
         previous_worker = getattr(self._file_versions, "worker", False)
+        previous_tools = getattr(self._file_versions, "worker_tool_scope", None)
+        if previous_tools is not None:
+            tools = previous_tools if tools is None else previous_tools & tools
+        self._file_versions.worker_tool_scope = tools
         writable = any(
-            name in self.worker_allow and self.policy.permits(name) for name in ("write", "edit")
+            self.tool_available(name, worker=True) for name in ("write", "edit")
         )
         ledger = self.edit_ledger
         changes = (
@@ -678,6 +683,7 @@ class CodingTools:
         finally:
             self._file_versions.transaction = previous
             self._file_versions.worker = previous_worker
+            self._file_versions.worker_tool_scope = previous_tools
             if previous_versions is None:
                 del self._file_versions.worker_versions
             else:
@@ -699,13 +705,18 @@ class CodingTools:
 
     def tool_available(self, name: str, *, worker: bool = False) -> bool:
         spec = self.registry.get(name)
+        worker_scope = getattr(self._file_versions, "worker_tool_scope", None)
         return bool(
             spec is not None
             and self.policy.permits(name)
             and (name != "monitor" or self.policy.permits("exec"))
             and (
                 not worker
-                or (name not in WORKER_EXCLUDED and (spec.read_only or name in self.worker_allow))
+                or (
+                    name not in WORKER_EXCLUDED
+                    and (spec.read_only or name in self.worker_allow)
+                    and (worker_scope is None or name in worker_scope)
+                )
             )
         )
 
@@ -863,17 +874,22 @@ class CodingTools:
             instructions += " Use ask_user only when a necessary choice cannot be inferred safely."
         return instructions
 
-    def attach_reasoning(self, client: CompletionClient, max_workers: int = MAX_SUBAGENTS) -> None:
-        workers = max(1, min(MAX_SUBAGENTS, max_workers))
-        if self._global_worker_slots is None:
-            self._global_worker_slots = threading.BoundedSemaphore(workers)
+    def attach_reasoning(self, client: CompletionClient, max_workers: int | None = None) -> None:
+        workers = max(1, max_workers) if max_workers is not None else None
+        if not self._worker_slots_initialized:
+            self._global_worker_slots = (
+                threading.BoundedSemaphore(workers) if workers is not None else None
+            )
             self._global_worker_limit = workers
+            self._worker_slots_initialized = True
         snapshot = self.fork()
         worker_client = snapshot_client(client)
+        definitions = self.worker_definitions
+        available_tools = [definition["function"]["name"] for definition in definitions]
         reasoning = ReasoningTools(
             worker_client,
             snapshot.execute_workspace,
-            self.worker_definitions,
+            definitions,
             workers,
             workspace=self.workspace,
             on_progress=self.on_task_update,
@@ -889,12 +905,12 @@ class CodingTools:
         reasoning.runner.cache_scope = self.cache_scope
         self.registry["delegate"] = ToolSpec(
             "delegate",
-            "Delegate bounded tasks when independent investigation, parallel work, focused verification, or other useful division of work improves efficiency or quality; task complexity is not the criterion. There is no tool-call count limit. The task count limit is capacity, not a target: choose the smallest useful number of workers, avoid delegation with no clear benefit, and sequence dependent work. Use mode=reason for reasoning/recall without tools; mode=inspect to use the granted tools. Do not repeat an assignment without new evidence or a distinct question. Workers are read-only unless the active environment grants extra worker tools; they can never delegate. Writable workers use private snapshots for read/write/edit, then successful drafts are merged in task order. Non-overlapping changes can merge; conflicts preserve patches and never overwrite existing changes. Check file_changes before claiming edits are applied, and validate the integrated result. grep/find/ls and external tools still see the shared workspace, not drafts. exec is blocked while a worker has staged changes; run tests after integration. Some environments provide worker roles: pass role to load that role's system instructions. The parent synthesizes their evidence; status=ok only means a report was returned.",
+            "Delegate tasks for independent investigation, implementation, or verification. Parallelize independent tasks and sequence dependent work. Use mode=reason for reasoning without tools, or mode=inspect with the tools the assignment needs. Per-task tools can select from the available worker capabilities. Workers can never delegate. Writable workers use private snapshots for read/write/edit, then successful drafts are merged in task order. Non-overlapping changes can merge; conflicts preserve patches and never overwrite existing changes. Check file_changes before claiming edits are applied, and validate the integrated result. grep/find/ls and external tools still see the shared workspace, not drafts. exec is blocked while a worker has staged changes; run tests after integration. Some environments provide worker roles: pass role to load that role's instructions.",
             {
                 "tasks": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": workers,
+                    **({"maxItems": workers} if workers is not None else {}),
                     "items": {
                         "type": "object",
                         "properties": {
@@ -902,6 +918,15 @@ class CodingTools:
                             "task": {"type": "string", "minLength": 1},
                             "context": TEXT,
                             "expected_output": {"type": "string", "minLength": 1},
+                            "tools": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    **({"enum": available_tools} if available_tools else {}),
+                                },
+                                **({"maxItems": 0} if not available_tools else {}),
+                                "description": "Tool names needed for this task. Omit to inherit the worker tool set; [] grants no tools.",
+                            },
                             "role": {
                                 "type": "string",
                                 "minLength": 1,
@@ -918,7 +943,10 @@ class CodingTools:
                     },
                 },
                 "context": TEXT,
-                "timeout": {**TIMEOUT, "default": 300},
+                "timeout": {
+                    **OPTIONAL_TIMEOUT,
+                    "description": "Optional time limit in seconds. Defaults to the parent task deadline.",
+                },
             },
             ("tasks",),
             reasoning.delegate,
@@ -979,12 +1007,9 @@ class CodingTools:
         deadline: float | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> str:
-        context = ExecutionContext(
-            deadline
-            if deadline is not None
-            else time.monotonic() + (max_timeout if max_timeout is not None else 3600),
-            on_progress=on_progress,
-        )
+        if deadline is None:
+            deadline = time.monotonic() + max_timeout if max_timeout is not None else float("inf")
+        context = ExecutionContext(deadline, on_progress=on_progress)
         return self._execute(tool_call, context, worker=False)
 
     def execute_in(self, tool_call: ToolCall, context: ExecutionContext) -> str:
@@ -1392,7 +1417,7 @@ class CodingTools:
         self,
         command: str,
         cwd: str = ".",
-        timeout: int = 120,
+        timeout: int | None = None,
         background: bool = False,
         *,
         _context: ExecutionContext,
@@ -1401,9 +1426,8 @@ class CodingTools:
         if background:
             _context.remaining()
             return self.processes.start(command, directory, timeout)
-        process = run_process(
-            command, directory, self.artifacts, _context.child(timeout), shell=True
-        )
+        context = _context if timeout is None else _context.child(timeout)
+        process = run_process(command, directory, self.artifacts, context, shell=True)
         output, truncated = _preview(process.path)
         result = ToolResult(
             data={

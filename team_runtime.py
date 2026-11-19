@@ -527,7 +527,7 @@ class TeamRuntime:
         if reason is not None:
             self._exhaust(name, reason)
             return
-        if len(self.activations) >= self.limits.max_concurrent_agents:
+        if limit_reached(len(self.activations), self.limits.max_concurrent_agents):
             record["status"] = "queued"
             self._progress(
                 name,
@@ -605,7 +605,7 @@ class TeamRuntime:
             key=lambda name: self._wakeable(name)[0].get("created_at", 0),
         )
         for name in waiting:
-            if len(self.activations) >= self.limits.max_concurrent_agents:
+            if limit_reached(len(self.activations), self.limits.max_concurrent_agents):
                 for rest in waiting:
                     if rest not in self.activations and self.state.agents[rest]["status"] == "idle":
                         self.state.agents[rest]["status"] = "queued"

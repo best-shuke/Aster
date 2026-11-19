@@ -197,6 +197,26 @@ class ModelApiTests(unittest.TestCase):
         data = encode_sse(events(api, value)) if streaming else json.dumps(value).encode()
         self.replies.append((200, "text/event-stream" if streaming else "application/json", data))
 
+    def test_only_messages_requires_a_default_output_limit(self):
+        messages = [{"role": "user", "content": "hello"}]
+        for api, field in (
+            ("openai-completions", "max_tokens"),
+            ("openai-responses", "max_output_tokens"),
+            ("anthropic-messages", "max_tokens"),
+        ):
+            with self.subTest(api=api):
+                client = model_client(replace(self.settings(api), max_context_chars=None))
+                body = client._request_body(messages, None, True, None)
+                if api == "anthropic-messages":
+                    self.assertGreater(body[field], 0)
+                else:
+                    self.assertNotIn(field, body)
+                self.assertEqual(client._request_body(messages, None, True, 2048)[field], 2048)
+        deepseek = model_client(replace(
+            self.settings("anthropic-messages"), base_url="https://api.deepseek.com/anthropic"
+        ))
+        self.assertNotIn("max_tokens", deepseek._request_body(messages, None, True, None))
+
     def test_factory_separates_authentication_from_protocol_and_auto_detection(self):
         for api, expected in [
             ("openai-completions", DeepSeekClient),

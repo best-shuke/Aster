@@ -12,7 +12,7 @@ Inheritance and override rules (see docs/environments.md):
 """
 
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +78,7 @@ class AgentSpec:
 
 @dataclass(frozen=True)
 class TeamLimits:
-    max_concurrent_agents: int = 20
+    max_concurrent_agents: int | None = None
     max_agents: int = 128
     max_messages_per_turn: int | None = None
     max_activations_per_agent: int | None = None
@@ -93,7 +93,7 @@ class TeamLimits:
 
 
 LIMIT_RANGES = {
-    "max_concurrent_agents": (1, 20),
+    "max_concurrent_agents": (1, None),
     "max_agents": (1, 1024),
     "max_messages_per_turn": (1, 1_000_000_000),
     "max_activations_per_agent": (1, 1_000_000),
@@ -108,6 +108,7 @@ LIMIT_RANGES = {
 
 UNLIMITED_LIMITS = frozenset(
     {
+        "max_concurrent_agents",
         "max_messages_per_turn",
         "max_activations_per_agent",
         "max_tool_calls_per_agent",
@@ -315,33 +316,29 @@ def parse_agent(
     )
 
 
-def parse_limits(value: Any, startup_max_agents: int) -> TeamLimits:
+def parse_limits(value: Any, startup_max_agents: int | None) -> TeamLimits:
     if not isinstance(value, dict):
         raise ValueError("limits 必须是对象")
     unknown = set(value) - set(LIMIT_RANGES)
     if unknown:
         raise ValueError(f"不支持的 limits 字段：{', '.join(sorted(unknown))}")
-    values = {}
+    values = {"max_concurrent_agents": startup_max_agents}
     for name, item in value.items():
         if name in UNLIMITED_LIMITS and (
             item is None
             or (isinstance(item, str) and item.strip().lower() in {"unlimited", "none"})
         ):
-            values[name] = None
+            if name != "max_concurrent_agents":
+                values[name] = None
             continue
         low, high = LIMIT_RANGES[name]
         if name == "max_concurrent_agents":
-            high = min(high, startup_max_agents)
-        if type(item) is not int or not low <= item <= high:
-            raise ValueError(f"limits.{name} 必须是 {low} 到 {high} 之间的整数")
+            high = startup_max_agents
+        if type(item) is not int or item < low or (high is not None and item > high):
+            allowed = f"{low} 到 {high} 之间" if high is not None else f"大于等于 {low}"
+            raise ValueError(f"limits.{name} 必须是{allowed}的整数")
         values[name] = item
-    limits = TeamLimits(**values)
-    if "max_concurrent_agents" not in values:
-        limits = replace(
-            limits,
-            max_concurrent_agents=min(limits.max_concurrent_agents, startup_max_agents),
-        )
-    return limits
+    return TeamLimits(**values)
 
 
 def parse_collaboration(value: Any) -> CollaborationPolicy:

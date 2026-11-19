@@ -1,8 +1,8 @@
-"""Cancellable HTTP reads with bounded workers and no credential redirects.
+"""Cancellable HTTP reads with no credential redirects.
 
-DNS resolution cannot be interrupted portably. Such a worker retains its slot
-until it returns, cannot send a request after cancellation, and cannot hold up
-process exit. Established sockets are shut down immediately on cancellation.
+DNS resolution cannot be interrupted portably. Its daemon thread cannot send
+a request after cancellation or hold up process exit. Established sockets
+are shut down immediately on cancellation.
 """
 
 import http.client
@@ -13,9 +13,6 @@ import time
 import urllib.request
 from contextlib import suppress
 
-from config import MAX_SUBAGENTS
-
-
 class TransportCancelled(Exception):
     pass
 
@@ -24,7 +21,6 @@ class TransportDeadline(TimeoutError):
     pass
 
 
-_SLOTS = threading.BoundedSemaphore(MAX_SUBAGENTS)
 _EOF = object()
 
 
@@ -175,8 +171,6 @@ class _Response:
             self.put(_EOF)
         except Exception as exc:
             self.put(exc)
-        finally:
-            _SLOTS.release()
 
     def next_chunk(self):
         idle_deadline = time.monotonic() + self.timeout
@@ -197,27 +191,16 @@ class _Response:
             return item
 
     def start(self):
-        acquired = False
-        started = False
         try:
-            slot_deadline = time.monotonic() + self.timeout
-            while not acquired:
-                self.check()
-                if time.monotonic() >= slot_deadline:
-                    raise TimeoutError("HTTP connection capacity exhausted")
-                self.progress()
-                acquired = _SLOTS.acquire(timeout=0.05)
+            self.check()
             self.thread = threading.Thread(target=self.worker, name="model-http", daemon=True)
             self.thread.start()
-            started = True
             headers = self.next_chunk()
             if not isinstance(headers, tuple) or headers[0] != "headers":
                 raise OSError("HTTP response has no headers")
             self.headers = headers[1]
             return self
         except BaseException:
-            if acquired and not started and (self.thread is None or self.thread.ident is None):
-                _SLOTS.release()
             self.close()
             raise
 

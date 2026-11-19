@@ -29,7 +29,6 @@ BUILTIN_DIR = PROGRAM_DIR / "builtin"
 BUILTIN_SKILLS_DIR = BUILTIN_DIR / "skills"
 BUILTIN_TEMPLATES_DIR = BUILTIN_DIR / "environment-templates"
 DEFAULT_REASONING_EFFORT = "max"
-MAX_SUBAGENTS = 20
 REASONING_EFFORTS = ("default", "off", "low", "high", "max")
 TASK_CONTEXT_PREFIX = "Current task environment:\n"
 
@@ -113,7 +112,7 @@ class Settings:
     max_context_chars: int | None
     keep_recent_turns: int
     max_task_seconds: int | None
-    max_subagents: int
+    max_subagents: int | None
     workspace: Path
     prompt_file: Path = DEFAULT_PROMPT_FILE
     skills_enabled: bool = True
@@ -126,7 +125,7 @@ class Settings:
     task_token_budget: int | None = None
     session_token_budget: int | None = None
     goal_token_budget: int | None = None
-    max_output_tokens: int | None = 131072
+    max_output_tokens: int | None = None
     websearch_enabled: bool = True
     websearch_base_url: str = ""
     websearch_api_key: str | None = None
@@ -238,10 +237,7 @@ class Settings:
             max_context_chars=optional_limit("DEEPSEEK_MAX_CONTEXT_CHARS", int),
             keep_recent_turns=max(1, env_number("DEEPSEEK_KEEP_RECENT_TURNS", int, "6")),
             max_task_seconds=optional_limit("DEEPSEEK_MAX_TASK_SECONDS", int, default="unlimited"),
-            max_subagents=max(
-                1,
-                min(MAX_SUBAGENTS, env_number("DEEPSEEK_MAX_SUBAGENTS", int, str(MAX_SUBAGENTS))),
-            ),
+            max_subagents=optional_limit("DEEPSEEK_MAX_SUBAGENTS", int),
             workspace=workspace,
             prompt_file=prompt_file.resolve(),
             skills_enabled=env_flag("DEEPSEEK_SKILLS_ENABLED", True),
@@ -259,7 +255,7 @@ class Settings:
             task_token_budget=optional_limit("ASTER_TASK_TOKEN_BUDGET", int),
             session_token_budget=optional_limit("ASTER_SESSION_TOKEN_BUDGET", int),
             goal_token_budget=optional_limit("ASTER_GOAL_TOKEN_BUDGET", int),
-            max_output_tokens=max(1, env_number("DEEPSEEK_MAX_OUTPUT_TOKENS", int, "131072")),
+            max_output_tokens=optional_limit("DEEPSEEK_MAX_OUTPUT_TOKENS", int),
             websearch_enabled=env_flag("DEEPSEEK_WEBSEARCH_ENABLED", True),
             websearch_base_url=os.environ.get("DEEPSEEK_WEBSEARCH_BASE_URL", "")
             .strip()

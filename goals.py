@@ -25,7 +25,7 @@ STATUS_LABELS = {
     "cancelled": "已取消",
 }
 USAGE = (
-    '/goal [start] "目标" [--criterion "验收条件"] [--max-rounds 20] [--max-seconds 3600]\n'
+    '/goal [start] "目标" [--criterion "验收条件"] [--max-rounds 上限] [--max-seconds 上限]\n'
     "/goal status | pause | cancel\n"
     "/goal resume [补充说明] [--max-rounds 总轮数] [--max-seconds 总秒数]"
 )
@@ -36,8 +36,8 @@ class GoalState:
     objective: str
     criteria: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    max_rounds: int = 20
-    max_seconds: int = 3600
+    max_rounds: int | None = None
+    max_seconds: int | None = None
     goal_id: str = field(default_factory=lambda: uuid4().hex)
     status: str = "paused"
     rounds: int = 0
@@ -48,8 +48,6 @@ class GoalState:
     next_step: str = ""
     evidence: list[str] = field(default_factory=list)
     criteria_met: list[bool] = field(default_factory=list)
-    last_fingerprint: str = ""
-    repeated_rounds: int = 0
     reason: str = ""
     verification_required: bool = False
     verified_source: dict | None = None
@@ -87,8 +85,6 @@ class GoalState:
             "next_step": text,
             "evidence": strings,
             "criteria_met": {"type": "array", "items": {"type": "boolean"}, "maxItems": 32},
-            "last_fingerprint": text,
-            "repeated_rounds": integer,
             "reason": text,
             "verification_required": {"type": "boolean"},
             "token_budget": {
@@ -117,6 +113,13 @@ class GoalState:
                 "additionalProperties": False,
             },
         }
+        # Sessions from earlier versions can still carry the old progress counter.
+        data = dict(data)
+        data.pop("last_fingerprint", None)
+        data.pop("repeated_rounds", None)
+        for name in ("max_rounds", "max_seconds"):
+            if data.get(name) is None:
+                data.pop(name, None)
         validate(
             data,
             {
@@ -124,7 +127,10 @@ class GoalState:
                 "properties": properties,
                 "required": [
                     name for name in properties
-                    if name not in {"verification_required", "verified_source", "source_scope", "token_budget"}
+                    if name not in {
+                        "max_rounds", "max_seconds", "verification_required",
+                        "verified_source", "source_scope", "token_budget",
+                    }
                 ],
                 "additionalProperties": False,
             },
@@ -141,8 +147,8 @@ class GoalState:
     def status_lines(self) -> list[str]:
         lines = [
             f"目标：{self.objective}",
-            f"状态：{STATUS_LABELS[self.status]} · 轮次 {self.rounds}/{self.max_rounds}"
-            f" · 用时 {math.ceil(self.elapsed_ms / 1000)}/{self.max_seconds} 秒",
+            f"状态：{STATUS_LABELS[self.status]} · 轮次 {self.rounds}/{self.max_rounds or '不限'}"
+            f" · 用时 {math.ceil(self.elapsed_ms / 1000)}/{self.max_seconds or '不限'} 秒",
         ]
         if self.token_budget:
             limit = self.token_budget.get("limit")
@@ -173,8 +179,8 @@ class GoalCommand:
     action: str
     text: str = ""
     criteria: tuple[str, ...] = ()
-    max_rounds: int | None = None
-    max_seconds: int | None = None
+    max_rounds: int | str | None = None
+    max_seconds: int | str | None = None
 
 
 def parse_goal(arguments: list[str]) -> GoalCommand:
@@ -204,9 +210,9 @@ def parse_goal(arguments: list[str]) -> GoalCommand:
                 criteria.append(option.strip())
             else:
                 key = value[2:].replace("-", "_")
-                if key in options or not option.isdecimal():
-                    raise ValueError(f"{value} 需要一个正整数，且只能指定一次。")
-                options[key] = int(option)
+                if key in options or (not option.isdecimal() and option != "unlimited"):
+                    raise ValueError(f"{value} 需要正整数或 unlimited，且只能指定一次。")
+                options[key] = None if option == "unlimited" else int(option)
         else:
             text.append(value)
     description = " ".join(text).strip()
@@ -216,4 +222,6 @@ def parse_goal(arguments: list[str]) -> GoalCommand:
         GoalState.from_dict(GoalState("resume", **options).to_dict())
         if len(description) > 16000:
             raise ValueError("补充说明过长。")
-    return GoalCommand(action, description, tuple(criteria), **options)
+    return GoalCommand(action, description, tuple(criteria), **{
+        key: "unlimited" if value is None else value for key, value in options.items()
+    })

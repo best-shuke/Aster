@@ -306,7 +306,7 @@ class BudgetTests(unittest.TestCase):
     def test_output_budget_fits_remaining_window_without_changing_effort(self):
         messages = [self.system, {"role": "user", "content": "question"}]
         messages.append(self.response(messages, prompt=40000, output=2000))
-        client = DeepSeekClient(self.settings)
+        client = DeepSeekClient(replace(self.settings, max_output_tokens=64000))
         with patch("http_transport.open_url", return_value=stream()) as opened:
             client.complete(messages, on_content=lambda _: None)
         body = json.loads(opened.call_args.args[0].data)

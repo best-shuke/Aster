@@ -356,9 +356,8 @@ class DeepSeekClient(ModelRequestRunner):
                 raise CompletionError(
                     "context_overflow", "Input exceeds the configured context window"
                 )
-            output_tokens = (
-                min(output_tokens, available) if output_tokens is not None else available
-            )
+            if output_tokens is not None:
+                output_tokens = min(output_tokens, available)
         return output_tokens
 
     def _set_reasoning_parameters(self, body: dict[str, Any]) -> None:

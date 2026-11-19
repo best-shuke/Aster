@@ -203,6 +203,16 @@ class _AnthropicEvents:
 
 
 class AnthropicClient(DeepSeekClient):
+    def _output_tokens(self, messages, tools, max_output_tokens):
+        # Native Messages requires this field. DeepSeek's HTTP endpoint makes it optional.
+        if (
+            max_output_tokens is None
+            and self.settings.max_output_tokens is None
+            and urlsplit(self.settings.base_url).hostname != "api.deepseek.com"
+        ):
+            max_output_tokens = 8192
+        return super()._output_tokens(messages, tools, max_output_tokens)
+
     def _request_body(self, messages, tools, streaming, max_output_tokens) -> dict[str, Any]:
         compat = self.settings.model_compat
         system, items = [], []
@@ -258,13 +268,14 @@ class AnthropicClient(DeepSeekClient):
                         )
                 if blocks:
                     items.append({"role": "assistant", "content": blocks})
-        limit = self._output_tokens(messages, tools, max_output_tokens) or 8192
+        limit = self._output_tokens(messages, tools, max_output_tokens)
         body: dict[str, Any] = {
             "model": self.settings.model,
             "messages": items,
-            "max_tokens": limit,
             "stream": streaming,
         }
+        if limit is not None:
+            body["max_tokens"] = limit
         if system:
             body["system"] = "\n\n".join(system)
         if tools is not None:

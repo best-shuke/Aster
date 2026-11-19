@@ -303,8 +303,13 @@ class EnvironmentStore:
         if websearch and not baseline.websearch_enabled:
             raise ValueError("环境不能启用启动时已关闭的 websearch")
         workers = data.get("max_subagents", baseline.max_subagents)
-        if type(workers) is not int or not 1 <= workers <= baseline.max_subagents:
-            raise ValueError(f"max_subagents 必须在 1 到启动上限 {baseline.max_subagents} 之间")
+        if workers is None or (isinstance(workers, str) and workers.lower() == "unlimited"):
+            workers = baseline.max_subagents
+        if workers is not None and (
+            type(workers) is not int or workers < 1
+            or (baseline.max_subagents is not None and workers > baseline.max_subagents)
+        ):
+            raise ValueError("max_subagents 必须为正整数，且不能超过启动上限")
         effort = data.get("reasoning_effort", baseline.reasoning_effort)
         if not isinstance(effort, str) or not effort.strip():
             raise ValueError("reasoning_effort 必须是合法档位")
@@ -762,7 +767,7 @@ class EnvironmentStore:
             f"继承启动 skills：{'是' if environment.inherit_skills else '否'}",
             f"继承启动 MCP：{'是' if environment.inherit_mcp else '否'}；"
             f"启用 {sum(not server.disabled for server in environment.servers.values())} 个服务",
-            f"effort：{settings.reasoning_effort}；子代理上限：{settings.max_subagents}",
+            f"effort：{settings.reasoning_effort}；子代理上限：{format_limit(settings.max_subagents)}",
             f"websearch：{'开启（需启动凭据）' if settings.websearch_enabled else '关闭'}",
             "tools.allow："
             + (", ".join(sorted(policy.allow)) if policy.allow is not None else "启动工具面"),
@@ -810,7 +815,7 @@ class EnvironmentStore:
         if team.multi_agent:
             limits = team.limits
             lines.append(
-                f"成员：{len(team.agents)} 个；并发上限 {limits.max_concurrent_agents}；"
+                f"成员：{len(team.agents)} 个；并发上限 {format_limit(limits.max_concurrent_agents)}；"
                 f"每轮消息上限 {format_limit(limits.max_messages_per_turn)}；消息链上限 {limits.max_message_hops}；"
                 f"会议轮数上限 {limits.max_meeting_rounds}；任务嵌套上限 {limits.max_task_depth}"
             )

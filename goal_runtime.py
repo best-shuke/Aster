@@ -3,14 +3,14 @@
 import hashlib
 import json
 import time
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 
 from deepseek_client import CompletionError
 from execution_trace import TraceContext, trace_scope
 from goals import GoalCommand, GoalState
 from request_budget import budget_scope
 from task_acceptance import TaskAcceptance, TaskContract
-from task_runtime import TaskProgress, TaskRuntime
+from task_runtime import TaskRuntime
 from tool_runtime import ExecutionContext, validate
 
 ASSESSMENT_SCHEMA = {
@@ -54,8 +54,8 @@ def prepare_goal(conversation, command: GoalCommand) -> GoalState:
         goal = GoalState(
             command.text,
             list(command.criteria),
-            max_rounds=command.max_rounds if command.max_rounds is not None else 20,
-            max_seconds=command.max_seconds if command.max_seconds is not None else 3600,
+            max_rounds=None if command.max_rounds == "unlimited" else command.max_rounds,
+            max_seconds=None if command.max_seconds == "unlimited" else command.max_seconds,
         )
         GoalState.from_dict(goal.to_dict())
     else:
@@ -65,19 +65,18 @@ def prepare_goal(conversation, command: GoalCommand) -> GoalState:
             if goal.status in {"completed", "cancelled", "active"}:
                 raise ValueError("该目标不能恢复；已完成或取消的目标请重新创建。")
             if command.max_rounds is not None:
-                goal.max_rounds = command.max_rounds
+                goal.max_rounds = None if command.max_rounds == "unlimited" else command.max_rounds
             if command.max_seconds is not None:
-                goal.max_seconds = command.max_seconds
+                goal.max_seconds = None if command.max_seconds == "unlimited" else command.max_seconds
             if command.text:
                 goal.notes.append(command.text)
                 goal.next_step = command.text
                 goal.phase = "work"
             GoalState.from_dict(goal.to_dict())
-            if goal.rounds >= goal.max_rounds and goal.phase != "review":
+            if goal.max_rounds is not None and goal.rounds >= goal.max_rounds and goal.phase != "review":
                 raise ValueError("轮次预算已耗尽；用 --max-rounds 增加总轮数。")
-            if goal.elapsed_ms >= goal.max_seconds * 1000:
+            if goal.max_seconds is not None and goal.elapsed_ms >= goal.max_seconds * 1000:
                 raise ValueError("时间预算已耗尽；用 --max-seconds 增加总秒数。")
-            goal.repeated_rounds = 0
             goal.reason = ""
         elif command.action in {"pause", "cancel"}:
             if goal.status in {"completed", "cancelled"}:
@@ -141,40 +140,6 @@ class GoalRuntime:
         }
         return hashlib.sha256(
             json.dumps(context, sort_keys=True, ensure_ascii=False).encode()
-        ).hexdigest()
-
-    def _progress_fingerprint(self) -> str:
-        conversation = self.conversation
-        start = next(
-            (
-                index
-                for index in range(len(conversation.messages) - 1, -1, -1)
-                if conversation.messages[index]["role"] == "user"
-            ),
-            0,
-        )
-        executions = []
-        for run in conversation.execution_snapshot():
-            if run.get("assistant_index", -1) < start:
-                continue
-            result = run.get("result")
-            if isinstance(result, str):
-                with suppress(ValueError):
-                    result = json.loads(result)
-            executions.append(
-                {
-                    "tool": run.get("tool"),
-                    "arguments": run.get("arguments"),
-                    "result": TaskProgress.stable(result),
-                }
-            )
-        progress = {
-            "answer": conversation.messages[-1].get("content") if conversation.messages else None,
-            "criteria_met": self.goal.criteria_met,
-            "executions": executions,
-        }
-        return hashlib.sha256(
-            json.dumps(progress, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()
 
     def _assessment(self, deadline) -> dict:
@@ -287,7 +252,10 @@ class GoalRuntime:
             raise ValueError("没有可执行的目标。")
         self.token_budget = conversation._restore_goal_budget(goal)
         self._started, self._elapsed = time.monotonic(), goal.elapsed_ms
-        deadline = self._started + max(0, goal.max_seconds - goal.elapsed_ms / 1000)
+        deadline = (
+            float("inf") if goal.max_seconds is None
+            else self._started + max(0, goal.max_seconds - goal.elapsed_ms / 1000)
+        )
         goal.status, goal.reason = "active", ""
         background = conversation.team_background
         # Goal rounds own delegated work until it settles; nothing leaks past a stopped goal.
@@ -311,7 +279,7 @@ class GoalRuntime:
                         goal.status, goal.reason = "budget_exhausted", "时间预算已耗尽。"
                         break
                     if goal.phase == "work":
-                        if goal.rounds >= goal.max_rounds:
+                        if goal.max_rounds is not None and goal.rounds >= goal.max_rounds:
                             goal.status, goal.reason = "budget_exhausted", "轮次预算已耗尽。"
                             break
                         goal.rounds += 1
@@ -350,18 +318,7 @@ class GoalRuntime:
                         problem = self._completion_problem(deadline)
                         if problem:
                             status, goal.next_step = "continue", problem
-                    if status == "continue":
-                        fingerprint = self._progress_fingerprint()
-                        goal.repeated_rounds = (
-                            goal.repeated_rounds + 1 if fingerprint == goal.last_fingerprint else 1
-                        )
-                        goal.last_fingerprint = fingerprint
-                        if goal.repeated_rounds >= 3:
-                            goal.status, goal.reason = (
-                                "blocked",
-                                "连续三轮结果相同；请补充信息或调整方案后恢复。",
-                            )
-                    else:
+                    if status != "continue":
                         goal.status = status
                     goal.phase = "work"
                     self._save()

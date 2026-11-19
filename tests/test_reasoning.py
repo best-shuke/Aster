@@ -149,27 +149,39 @@ class ReasoningToolsTests(unittest.TestCase):
         self.assertEqual(len(client.requests), 2)
         self.assertEqual([report["data"]["model_requests"] for report in reports], [1, 1])
 
-    def test_default_capacity_is_twenty_without_starting_unused_workers(self):
+    def test_default_capacity_has_no_limit_and_only_starts_requested_workers(self):
         client = ReportingClient()
         self.tools.attach_reasoning(client)
         definition = self.tools.registry["delegate"].definition()["function"]
-        self.assertEqual(definition["parameters"]["properties"]["tasks"]["maxItems"], 20)
+        self.assertNotIn("maxItems", definition["parameters"]["properties"]["tasks"])
         self.assertEqual(self.delegate([task("single investigation")])["status"], "ok")
         self.assertEqual(len(client.requests), 1)
 
-    def test_worker_capacity_is_clamped_at_twenty_and_rejects_larger_batches(self):
+    def test_explicit_capacity_over_twenty_rejects_larger_batches(self):
         client = ReportingClient()
         self.tools.attach_reasoning(client, max_workers=21)
         definition = self.tools.registry["delegate"].definition()["function"]
-        self.assertEqual(definition["parameters"]["properties"]["tasks"]["maxItems"], 20)
-        result = self.delegate([task(f"investigation {index}") for index in range(21)])
+        self.assertEqual(definition["parameters"]["properties"]["tasks"]["maxItems"], 21)
+        result = self.delegate([task(f"investigation {index}") for index in range(22)])
         self.assertEqual(result["error"]["code"], "invalid_arguments")
         self.assertEqual(client.requests, [])
 
-    def test_default_capacity_runs_twenty_independent_tasks_concurrently(self):
-        self.tools.attach_reasoning(ParallelClient(workers=20))
-        result = self.delegate([task(f"investigation {index}") for index in range(20)])
+    def test_default_capacity_runs_more_than_twenty_tasks_concurrently(self):
+        self.tools.attach_reasoning(ParallelClient(workers=21))
+        result = self.delegate([task(f"investigation {index}") for index in range(21)])
         self.assertEqual(result["status"], "ok", result)
+
+    def test_delegate_limits_tools_per_assignment(self):
+        client = ReportingClient()
+        self.tools.worker_allow = frozenset({"write"})
+        self.tools.attach_reasoning(client)
+        self.assertEqual(self.delegate([task(tools=["exec"])])["status"], "error")
+        result = self.delegate([task(tools=["read"]), task(tools=["write"])])
+        self.assertEqual(result["status"], "ok", result)
+        self.assertCountEqual(
+            [[tool["function"]["name"] for tool in request["tools"]] for request in client.requests],
+            [["read"], ["write"]],
+        )
 
     def test_delegate_really_runs_independent_tasks_concurrently(self):
         self.tools.attach_reasoning(ParallelClient(), max_workers=2)

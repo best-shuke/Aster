@@ -105,6 +105,8 @@
    - 技能：未声明时使用环境启用的全部技能；声明后只取其中环境已启用的部分。
 6. **动态成员**：开启 `dynamic_agents` 后，成员可用 `spawn_agent` 创建会话级成员，其工具不能超过创建者自身的工具，且不授予 MCP。
 
+`delegate` 可在每个子任务填写 `tools`，从当前可用的只读工具与环境 `worker_tools` 授权中选择所需工具。省略时继承可用的子代理工具集，空数组表示不授予工具。团队成员通过自己的 `tools`、`mcp` 和 `write_paths` 按职责配置。
+
 ## 凭据
 
 环境定义不保存凭据。MCP 服务的令牌、密码和认证头继续使用原有机制：在 MCP 配置中写 `${环境变量}`，值来自进程环境或被 Git 忽略的 `.env`。`/env mcp add 名称 --command …|--url …` 新建环境专属服务时，认证头、看起来是凭据的环境变量与参数必须是 `${VAR}` 引用，URL 中不能内嵌用户名密码；该文件权限为 600。
@@ -158,7 +160,7 @@
 
 | 限制 | 默认 | 作用 |
 | --- | --- | --- |
-| `max_concurrent_agents` | min(20, 启动子代理上限) | 同时运行的成员数 |
+| `max_concurrent_agents` | 继承启动子代理上限（默认不限） | 同时运行的成员数 |
 | `max_agents` | 128 | 成员总数（含动态成员），可显式提高到 1024 |
 | `max_messages_per_turn` | unlimited | 每轮团队消息总数 |
 | `max_activations_per_agent` | unlimited | 每个成员每轮激活次数 |
@@ -170,9 +172,9 @@
 | `activation_timeout_seconds` | unlimited | 单次激活时限；不能在后台继续的轮次同时受主任务时限约束 |
 | `background_seconds` | unlimited | 交互会话中主代理答复后，成员可持续工作；0 表示轮次结束即暂停 |
 
-上述六项工作预算在 JSON 中用 `null`、`"unlimited"` 或 `"none"` 表示不设上限，命令行用
+并发和其余六项可选工作预算在 JSON 中用 `null`、`"unlimited"` 或 `"none"` 表示环境不另设上限，命令行用
 `键=unlimited`。这与把数值调得很大不同：不会因为累计用量或经过的时间超过某个预算而暂停。
-并发、成员容量、消息跳数、协议轮数和任务深度仍要求整数；达到并发上限的成员排队，已有工作继续执行。
+成员容量、消息跳数、协议轮数和任务深度仍要求整数。设置了并发上限时，达到上限的成员排队，已有工作继续执行。
 `background_seconds=0` 保持原有的关闭后台语义，不能把所有字段的 `0` 都当作无限。
 
 默认值用于定义中未显式配置的字段；已有环境写入的 `limits` 保留原值。运行 `/env limits`
@@ -183,7 +185,7 @@
 主任务总时限也默认不设上限。旧 `.env` 中已有的数字仍优先生效；持续任务可显式启动：
 
 ```sh
-DEEPSEEK_MAX_TASK_SECONDS=unlimited DEEPSEEK_MAX_SUBAGENTS=20 agent
+DEEPSEEK_MAX_TASK_SECONDS=unlimited DEEPSEEK_MAX_SUBAGENTS=unlimited agent
 ```
 
 这些进程设置也可写入本机 `.env` 后重启。单次命令模式仍等待成员完成后结束；交互会话中可转入
@@ -195,7 +197,7 @@ DEEPSEEK_MAX_TASK_SECONDS=unlimited DEEPSEEK_MAX_SUBAGENTS=20 agent
 ```text
 /env limits max_messages_per_turn=unlimited max_activations_per_agent=unlimited max_tool_calls_per_agent=unlimited
 /env limits token_budget_per_agent=unlimited activation_timeout_seconds=unlimited background_seconds=unlimited
-/env limits max_concurrent_agents=20 max_agents=128 max_message_hops=100 max_meeting_rounds=32 max_task_depth=32
+/env limits max_concurrent_agents=unlimited max_agents=128 max_message_hops=100 max_meeting_rounds=32 max_task_depth=32
 ```
 
 其他边界：成员的文件工具不能访问环境状态目录、信任记录和主对话的会话文件（含原子写入的临时文件）；`write_paths` 可限制成员写入范围；代理之间看不到彼此的私信与私有上下文；同一环境会话同一时间只能被一个进程打开；状态文件绑定所属环境，跨环境加载会被拒绝；需要用户决定的事项由成员转交主代理，只有主代理能使用 `ask_user`。工具策略不是操作系统沙箱，`exec` 仍以运行用户的权限执行命令。

@@ -12,7 +12,6 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 
 from client_runtime import client_settings
-from config import MAX_SUBAGENTS
 from contracts import (
     CompletionClient,
     Message,
@@ -152,6 +151,7 @@ class SubagentRunner:
         on_progress: WorkerProgressCallback | None = None,
         role: str | None = None,
         checkpoint: WorkerCheckpoint | None = None,
+        tools: frozenset[str] | None = None,
     ) -> ToolResult:
         label = role
         if label is None:
@@ -174,6 +174,7 @@ class SubagentRunner:
                 on_progress,
                 role,
                 checkpoint or WorkerCheckpoint(self.workspace),
+                tools,
             )
 
     def _run(
@@ -186,6 +187,7 @@ class SubagentRunner:
         on_progress: WorkerProgressCallback | None = None,
         role: str | None = None,
         checkpoint: WorkerCheckpoint | None = None,
+        tools: frozenset[str] | None = None,
     ) -> ToolResult:
         if mode == "auto":
             mode = (
@@ -232,7 +234,12 @@ class SubagentRunner:
                 return ToolResult.failure(
                     "unknown_role", f"Unknown worker role {role!r}; available: {available}"
                 )
-        definitions = self.worker_tools if mode == "inspect" else []
+        definitions = []
+        if mode == "inspect":
+            definitions = [
+                definition for definition in self.worker_tools
+                if tools is None or definition["function"]["name"] in tools
+            ]
         discipline = (
             WORKER_SYSTEM_PROMPT
             if definitions
@@ -434,7 +441,7 @@ class ReasoningTools:
         client: CompletionClient,
         execute_workspace: WorkspaceExecutor,
         worker_tools: list[ToolDefinition],
-        max_workers: int = MAX_SUBAGENTS,
+        max_workers: int | None = None,
         *,
         workspace: Path,
         on_progress: ProgressCallback | None = None,
@@ -446,7 +453,7 @@ class ReasoningTools:
         on_worker_finish: Callable[[], None] | None = None,
         worker_session: Callable | None = None,
     ) -> None:
-        self.max_workers = max(1, min(MAX_SUBAGENTS, max_workers))
+        self.max_workers = max(1, max_workers) if max_workers is not None else None
         self.on_progress = on_progress
         self.agent_sequence = 0
         self.worker_session = worker_session
@@ -461,14 +468,17 @@ class ReasoningTools:
         )
         # Slots belong to the tool, not a single batch. Timed-out requests keep
         # their slot until they actually exit, including non-cooperative clients.
-        self.slots = threading.BoundedSemaphore(self.max_workers)
+        self.slots = (
+            threading.BoundedSemaphore(self.max_workers) if self.max_workers is not None else None
+        )
         self.global_slots = global_slots
         self.on_worker_start = on_worker_start
         self.on_worker_finish = on_worker_finish
 
     def submit(self, execution, item, context, on_progress=None):
+        tool_names = frozenset(item["tools"]) if "tools" in item else None
         acquired = []
-        semaphores = [self.slots, *([self.global_slots] if self.global_slots is not None else [])]
+        semaphores = (slot for slot in (self.slots, self.global_slots) if slot is not None)
         try:
             for semaphore in semaphores:
                 while True:
@@ -489,7 +499,8 @@ class ReasoningTools:
                 try:
                     execution.remaining()
                     session = (
-                        self.worker_session(execution) if self.worker_session else nullcontext()
+                        self.worker_session(execution, tool_names)
+                        if self.worker_session else nullcontext()
                     )
                     with session as changes:
                         future.file_changes = changes
@@ -505,6 +516,7 @@ class ReasoningTools:
                                     on_progress=on_progress,
                                     role=item.get("role"),
                                     checkpoint=future.checkpoint,
+                                    tools=tool_names,
                                 )
                             except BaseException as exc:
                                 emit_event("agent_failed", error_type=type(exc).__name__)
@@ -599,11 +611,11 @@ class ReasoningTools:
         self,
         tasks: list[dict[str, str]],
         context: str = "",
-        timeout: int = 300,
+        timeout: int | None = None,
         *,
         _context: ExecutionContext,
     ) -> ToolResult:
-        execution = _context.child(timeout)
+        execution = _context if timeout is None else _context.child(timeout)
         execution.remaining()
         reports: list[ToolResult | None] = [None] * len(tasks)
         transactions: list[FileTransaction | None] = [None] * len(tasks)

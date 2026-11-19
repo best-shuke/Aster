@@ -1,7 +1,7 @@
 """Managed command sessions that survive a paused model turn.
 
-Only explicitly backgrounded commands use this lifetime. Each session has its
-own timeout and is cleaned up when the owning application closes.
+Only explicitly backgrounded commands use this lifetime. A session supports an
+optional timeout and is cleaned up when the owning application closes.
 """
 
 import codecs
@@ -34,7 +34,7 @@ class ProcessSession:
     path: Path
     process: subprocess.Popen
     started: float
-    timeout: int
+    timeout: int | None
     state: str = "running"
     ended: float | None = None
     done: threading.Event = field(default_factory=threading.Event)
@@ -48,7 +48,10 @@ class ProcessSession:
 
     def watch(self) -> None:
         try:
-            remaining = max(0, self.started + self.timeout - time.monotonic())
+            remaining = (
+                None if self.timeout is None
+                else max(0, self.started + self.timeout - time.monotonic())
+            )
             try:
                 self.process.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
@@ -101,7 +104,7 @@ class ProcessMonitor:
         self.lock = threading.RLock()
         self.closed = False
 
-    def start(self, command: str, cwd: Path, timeout: int) -> ToolResult:
+    def start(self, command: str, cwd: Path, timeout: int | None) -> ToolResult:
         with self.lock:
             if self.closed:
                 return ToolResult.failure("monitor_closed", "Process monitor is closed")
