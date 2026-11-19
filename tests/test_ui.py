@@ -42,7 +42,7 @@ class CommandCompletionTests(unittest.TestCase):
         commands = [candidate.text for candidate in candidates]
 
         self.assertEqual(commands, sorted(commands))
-        for command in ("/effort", "/help", "/new", "/clear", "/tasks", "/todo", "/quit"):
+        for command in ("/effort", "/help", "/new", "/clear", "/tasks", "/todo", "/quit", "/loop"):
             self.assertIn(command, commands)
         self.assertTrue(all(candidate.display_meta_text for candidate in candidates))
 

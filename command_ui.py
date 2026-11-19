@@ -1,12 +1,20 @@
 """Terminal presentation and interactive selection for parsed commands."""
 
+import time
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import cast
 
 from auth import AuthStore
-from commands import CommandActions, CommandExecution, CommandName, EffectKind, ParsedCommand
+from commands import (
+    CommandActions,
+    CommandExecution,
+    CommandName,
+    EffectKind,
+    ParsedCommand,
+    parse_loop,
+)
 from config import REASONING_EFFORTS, LoginRequired, auth_file
 from conversation import Conversation
 from environment_commands import enter_multiagents, environment_subcommand
@@ -15,6 +23,7 @@ from execution_history import execution_entries
 from goal_runtime import GoalRuntime, prepare_goal
 from goals import parse_goal
 from login_ui import describe, logout, model_client, run_login
+from task_acceptance import TaskContract
 from ui import Console
 
 
@@ -54,6 +63,38 @@ def use_goal(conversation: Conversation, console: Console, arguments: list[str],
     for line in goal.status_lines():
         console.info(line)
     return command.action in {"pause", "cancel"} or goal.status == "completed"
+
+
+def use_loop(conversation: Conversation, console: Console, arguments: list[str], *, ask_task) -> int:
+    interval, count, task = parse_loop(arguments[0] if arguments else "")
+    contract = TaskContract(
+        description="Perform one iteration using fresh observations where applicable, then report "
+        "the result. Aster schedules subsequent iterations."
+    )
+    interrupt = console.interrupt_on_escape() if console.interactive is True else nullcontext()
+    stop_key = "Esc 或 Ctrl-C" if console.interactive is True else "Ctrl-C"
+    rounds = incomplete = 0
+    try:
+        with interrupt:
+            console.info(f"循环已启动，按 {stop_key} 停止。")
+            while count is None or rounds < count:
+                rounds += 1
+                label = f"{rounds}/{count}" if count is not None else str(rounds)
+                console.info(f"循环第 {label} 轮")
+                ask_task(
+                    conversation, console, task, title=f"循环 {label} · {task}",
+                    task_contract=contract,
+                )
+                if (conversation.last_outcome or {}).get("status") != "completed":
+                    incomplete += 1
+                if count is None or rounds < count:
+                    console.info(f"{interval} 秒后开始下一轮。")
+                    time.sleep(interval)
+    except KeyboardInterrupt:
+        console.info("循环已停止。")
+        return 130
+    console.info(f"循环已结束，共执行 {rounds} 轮，{incomplete} 轮未完成。")
+    return int(incomplete > 0)
 
 
 def conversation_count(conversation: Conversation) -> int:

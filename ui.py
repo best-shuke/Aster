@@ -117,6 +117,7 @@ _SLASH_COMMANDS = {
     "/history": "查看对话历史",
     "/login": "选择登录方式：ChatGPT 账户或第三方 API",
     "/logout": "退出登录并删除保存的凭据",
+    "/loop": "按指定间隔重复执行任务",
     "/multiagents": "进入默认多代理团队环境",
     "/trace": "浏览执行轨迹、命令和工具结果",
     "/tool": "按编号查看某次工具调用",

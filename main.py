@@ -30,6 +30,7 @@ from command_ui import (
     use_environment as use_environment,
 )
 from command_ui import use_goal as present_goal
+from command_ui import use_loop as present_loop
 from command_ui import (
     use_multiagents as use_multiagents,
 )
@@ -38,6 +39,7 @@ from command_ui import (
 )
 from commands import (
     COMMAND_NAMES,
+    LOOP_USAGE,
     QUOTED_ARGUMENTS,
     CommandName,
     CommandResult,
@@ -74,6 +76,7 @@ HELP = (
             ("/goal status|pause|cancel", "查看、暂停或取消当前会话的目标"),
             ("/goal resume [补充说明]", "恢复目标；--max-rounds / --max-seconds 调整总预算"),
             ('--criterion "条件"', "创建目标时添加验收条件，可重复；默认 20 轮、3600 秒"),
+            (LOOP_USAGE, "立即执行，之后每轮结束等指定间隔（如 30s、5m）；Esc 或 Ctrl-C 停止"),
         ),
     ),
     (
@@ -146,6 +149,10 @@ def use_goal(conversation: Conversation, console: Console, arguments: list[str])
     return present_goal(conversation, console, arguments, ask_task=ask)
 
 
+def use_loop(conversation: Conversation, console: Console, arguments: list[str]) -> int:
+    return present_loop(conversation, console, arguments, ask_task=ask)
+
+
 def handle_command(conversation: Conversation, console: Console, prompt: str) -> CommandResult:
     execution = execute_command(parse_command(prompt), conversation)
     present_command(
@@ -167,6 +174,7 @@ def handle_command(conversation: Conversation, console: Console, prompt: str) ->
             CommandName.LOGIN: use_login,
             CommandName.LOGOUT: use_logout,
             CommandName.GOAL: use_goal,
+            CommandName.LOOP: use_loop,
         },
     )
     return execution.result
@@ -468,13 +476,18 @@ def main() -> int:
                 mcp_manager.start_all()
                 console.update_mcp(mcp_manager.status().data["servers"])
             if prompt:
-                if command is not None and command.name is CommandName.GOAL:
+                if command is not None and command.name in {CommandName.GOAL, CommandName.LOOP}:
                     try:
                         if command.error is not None:
                             raise command.error
+                        if command.name is CommandName.LOOP:
+                            return use_loop(conversation, console, list(command.arguments))
                         return 0 if use_goal(conversation, console, list(command.arguments)) else 1
                     except KeyboardInterrupt:
-                        console.info("目标已暂停，已保存可恢复的进展。")
+                        console.info(
+                            "循环已停止。" if command.name is CommandName.LOOP
+                            else "目标已暂停，已保存可恢复的进展。"
+                        )
                         return 130
                     except ValueError as exc:
                         console.error(exc)

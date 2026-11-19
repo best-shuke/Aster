@@ -1,6 +1,8 @@
 """Pure command parsing and domain execution, independent of terminal rendering."""
 
+import re
 import shlex
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -44,6 +46,7 @@ class CommandName(Enum):
     LOGIN = "login"
     LOGOUT = "logout"
     GOAL = "goal"
+    LOOP = "loop"
 
 
 class EffectKind(Enum):
@@ -82,6 +85,8 @@ NO_ARGUMENTS = frozenset(
 QUOTED_ARGUMENTS = frozenset(
     {CommandName.TEMPLATE, CommandName.ENVIRONMENT, CommandName.WORKFLOW, CommandName.GOAL}
 )
+LOOP_USAGE = "/loop 间隔 [--count 轮数] 任务"
+_INTERVAL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 @dataclass(frozen=True)
@@ -161,6 +166,10 @@ class CommandActions:
 
 def parse_command(prompt: str) -> ParsedCommand | None:
     prompt = prompt.strip()
+    head = prompt.split(maxsplit=1)
+    if head and head[0] == "/loop":
+        # Preserve shell quotes and pasted line breaks in the task.
+        return ParsedCommand(CommandName.LOOP, tuple(head[1:]))
     if "\n" in prompt or "\r" in prompt:
         return None
     parts = prompt.split()
@@ -175,6 +184,29 @@ def parse_command(prompt: str) -> ParsedCommand | None:
         except ValueError as exc:
             return ParsedCommand(name, error=exc)
     return ParsedCommand(name, tuple(arguments))
+
+
+def parse_loop(source: str) -> tuple[int, int | None, str]:
+    parts = source.split(maxsplit=1)
+    if len(parts) != 2:
+        raise ValueError(f"用法：{LOOP_USAGE}")
+    interval, task = parts
+    match = re.fullmatch(r"([0-9]+)([smhd])", interval)
+    if match is None:
+        raise ValueError("循环间隔须为正整数，单位用 s、m、h 或 d。")
+    seconds = int(match[1]) * _INTERVAL_UNITS[match[2]]
+    if not 1 <= seconds < threading.TIMEOUT_MAX:
+        raise ValueError("循环间隔须大于零且在系统可等待范围内。")
+    count = None
+    if task.split(maxsplit=1)[0] == "--count":
+        options = task.split(maxsplit=2)
+        if len(options) != 3 or re.fullmatch(r"[0-9]+", options[1]) is None:
+            raise ValueError(f"--count 须指定正整数轮数和任务。用法：{LOOP_USAGE}")
+        count = int(options[1])
+        if count < 1:
+            raise ValueError("--count 须为正整数。")
+        task = options[2]
+    return seconds, count, task
 
 
 def execute_command(
