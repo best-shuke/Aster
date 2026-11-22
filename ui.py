@@ -778,55 +778,56 @@ class Console:
         if self.last_environment_name:
             environment += f"（上次 {self.last_environment_name}）"
         # (priority, segments); a lower priority number is kept longer.
-        items: list[tuple[int, list[tuple[str, str]]]] = [(0, [("", environment)])]
         team = self._team_label()
+        mcp_failed = "失败" in self.mcp_status or "错误" in self.mcp_status
+        mcp_idle = self.mcp_status in {"关闭", "未配置"}
+        environment_segments = [("", environment)]
+        team_segments = [("class:toolbar.accent", team)]
+        items: list[tuple[int, list[tuple[str, str]]]] = [(0, environment_segments)]
         if team:
-            items.append((0, [("class:toolbar.accent", team)]))
-        # Labels that may be shortened, in order, when the core items do not fit.
-        shrinkable = [item[1] for item in items]
+            items.append((0, team_segments))
+        if mcp_failed:
+            items.append((1, [("class:toolbar.warn", f"MCP {self.mcp_status}")]))
         items.append((3, [("class:toolbar.strong", self.model.rsplit("/", 1)[-1])]))
         items.append((5, [("", f"推理 {self.reasoning_effort}")]))
         if self._context:
             ratio = self._context["tokens"] / max(1, self._context["window_tokens"])
-            level = {"red": "class:toolbar.error", "yellow": "class:toolbar.warn"}.get(
-                _usage_style(ratio), "class:toolbar.accent"
-            )
+            level = {
+                "red": "class:toolbar.error",
+                "yellow": "class:toolbar.warn",
+            }.get(_usage_style(ratio), "class:toolbar.accent")
             if self._context_style() == "yellow" and level == "class:toolbar.accent":
                 level = "class:toolbar.warn"
             segments = [("", "上下文 " if width >= 70 else "CTX ")]
             if width >= 100:
                 filled = _filled_cells(ratio, 8)
                 segments += [(level, "━" * filled), ("class:toolbar.dim", "━" * (8 - filled) + " ")]
-            segments += [
-                (level, f"{ratio:.1%}" if width >= 70 else ""),
-                (
-                    "",
-                    (" " if width >= 70 else "")
-                    + f"{_token_count(self._context['tokens'])}/"
-                    + _token_count(self._context["window_tokens"]),
-                ),
-            ]
+            tokens = f"{_token_count(self._context['tokens'])}/{_token_count(self._context['window_tokens'])}"
+            if width >= 70:
+                segments.append((level, f"{ratio:.1%} "))
+            segments.append((level if width < 70 else "", tokens))
             items.append((1, segments))
-        items.append((2, [("", self._tps_label())]))
+        tps = self._tps_label()
+        items.append((3 if mcp_failed and tps == "TPS —" else 2, [("", tps)]))
         cache = self._cache_rate()
         if cache is not None:
             items.append((6, [("", f"缓存 {cache:.0%}")]))
-        mcp_failed = "失败" in self.mcp_status or "错误" in self.mcp_status
-        mcp_idle = self.mcp_status in {"关闭", "未配置"}
-        items.append(
-            (
-                1 if mcp_failed else 8 if mcp_idle else 4,
-                [("class:toolbar.warn" if mcp_failed else "", f"MCP {self.mcp_status}")],
+        if not mcp_failed:
+            items.append(
+                (
+                    8 if mcp_idle else 4,
+                    [("", f"MCP {self.mcp_status}")],
+                )
             )
-        )
         branch = _git_branch(self.workspace)
         if branch:
             items.append((7, [("", f"⎇ {branch}")]))
         items.append((9, [("class:toolbar.dim", "Ctrl-T 执行轨迹 · / 命令")]))
 
         def measure(selected):
-            texts = ["".join(text for _, text in segments) for _, segments in selected]
-            return sum(_display_width(text) for text in texts) + 3 * (len(texts) - 1)
+            return sum(
+                _display_width(text) for _, segments in selected for _, text in segments
+            ) + 3 * (len(selected) - 1)
 
         visible = list(items)
         while len(visible) > 1 and measure(visible) > width:
@@ -834,35 +835,36 @@ class Console:
             if visible[drop][0] <= 2:
                 break
             visible.pop(drop)
-        if measure(visible) > width and width < 40 and self._context:
-            lines = [environment, self._context_label(compact=True), self._tps_label()]
-            return [("", "\n".join(_ellipsize(line, width) for line in lines))]
-        for segments in shrinkable:
+        # Shorten the flexible names before moving complete status items to another row.
+        for segments, minimum in ((environment_segments, 6), (team_segments, 16)):
             excess = measure(visible) - width
             if excess <= 0:
                 break
             style, text = segments[0]
-            segments[0] = (style, _ellipsize(text, max(6, _display_width(text) - excess)))
+            segments[0] = (style, _ellipsize(text, max(minimum, _display_width(text) - excess)))
+        if measure(visible) > width:
+            environment_segments[0] = ("", environment)
+            team_segments[0] = ("class:toolbar.accent", team)
+            visible.sort(key=lambda entry: entry[1] is environment_segments)
+
         fragments: list[tuple[str, str]] = []
-        for index, (_, segments) in enumerate(visible):
-            if index:
-                fragments.append(("class:toolbar.dim", " · "))
-            fragments.extend(segments)
         used = 0
-        fitted = []
-        for style, text in fragments:
-            room = width - used
-            if room <= 0:
-                break
-            if _display_width(text) > room:
-                if text != " · " and room > 1:
-                    fitted.append((style, _ellipsize(text, room)))
-                break
-            fitted.append((style, text))
-            used += _display_width(text)
-        while fitted and fitted[-1][1] == " · ":
-            fitted.pop()
-        return fitted
+        for _, segments in visible:
+            label = "".join(text for _, text in segments)
+            length = _display_width(label)
+            if length > width:
+                label = _ellipsize(label, width)
+                segments = [(segments[0][0], label)]
+                length = _display_width(label)
+            if used and used + 3 + length > width:
+                fragments.append(("", "\n"))
+                used = 0
+            if used:
+                fragments.append(("class:toolbar.dim", " · "))
+                used += 3
+            fragments.extend(segments)
+            used += length
+        return fragments
 
     def _team_label(self) -> str:
         team = self._team
@@ -1684,7 +1686,7 @@ class Console:
         content = []
         if compact:
             status = state if elapsed is None else f"{state} · {_duration(elapsed, compact=True)}"
-            title_width = max(1, min(36, width - _display_width(status) - 7))
+            title_width = max(1, width - _display_width(status) - 7)
             marker = _TASK_MARKERS.get(self._task_state, "◇")
             heading = Text(f"  {marker} ", style=style)
             heading.append(_ellipsize(self._task_title or "当前任务", title_width), style="bold")

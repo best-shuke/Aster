@@ -2206,3 +2206,41 @@ class ReadableOutputTests(unittest.TestCase):
             if created.returncode:
                 self.skipTest("git without reftable support")
             self.assertEqual(_git_branch(Path(directory)), "trunk")
+
+    def test_task_title_fills_available_width_beyond_previous_limit(self):
+        console = self.console()
+        console._task_title = "优化终端主界面排版与窄屏显示体验以及状态显示"
+        console._task_state = "running"
+        with patch("time.monotonic", return_value=120.0), patch.object(
+            console, "terminal_width", return_value=80
+        ):
+            console._task_started = 100.0
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                console._rich().print(console._dashboard())
+            first_line = out.getvalue().splitlines()[0]
+            self.assertIn("优化终端主界面排版与窄屏显示体验以及状态显示", first_line)
+            self.assertIn("运行中 · 20s", first_line)
+
+    def test_narrow_toolbar_prioritizes_mcp_failure_and_team_background(self):
+        console = self.console()
+        console.environment_name = "default"
+        console.mcp_status = "1 失败"
+        console.update_team({"phase": "team", "background": "running", "working": ["worker1"]})
+        console.update_context({"tokens": 95000, "window_tokens": 100000, "budget_tokens": 90000})
+
+        with patch.object(Console, "terminal_width", return_value=60):
+            tb60 = console._toolbar()
+            self.assertIn("MCP 1 失败", tb60)
+            self.assertIn("团队后台", tb60)
+            self.assertNotIn("MCP…", tb60)
+            self.assertLessEqual(_display_width(tb60), 59)
+
+        console.environment_name = "多代理研究与代码审查环境"
+        for width in (32, 44):
+            with self.subTest(width=width), patch.object(Console, "terminal_width", return_value=width):
+                toolbar = console._toolbar()
+                self.assertIn("MCP 1 失败", toolbar)
+                self.assertIn("团队后台 1 人工作中", toolbar)
+                self.assertIn("CTX 95k/100k", toolbar)
+                self.assertTrue(all(_display_width(line) < width for line in toolbar.splitlines()))
