@@ -31,6 +31,7 @@ from tests.team_support import (
     use,
 )
 from tests.test_environments import ROOT, EnvironmentTestCase
+from tool_runtime import ExecutionContext
 from tools import CodingTools
 from ui import Console
 from usage import uncached_tokens
@@ -737,6 +738,56 @@ class TaskDelegationTests(TeamTestCase):
 class RecoveryTests(TeamTestCase):
     """Acceptance test 8: interrupted sessions restore tasks, messages and completed work."""
 
+    def test_late_member_checkpoint_cannot_replace_a_new_session_context(self):
+        started, release = threading.Event(), threading.Event()
+
+        def researcher(messages, tools):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return say("old answer")
+
+        conversation = self.team_conversation(TeamScript(researcher=researcher))
+        runtime = conversation.team
+        context = ExecutionContext(time.monotonic() + 10)
+        runtime.begin_turn(context.deadline)
+        runtime.act_send_message("main", None, to=["researcher"], kind="request",
+                                 content="old request", _context=context)
+        try:
+            self.assertTrue(started.wait(2))
+            old = runtime.activations["researcher"]
+            with patch.object(runtime, "_join"):
+                conversation.clear()
+            runtime.store.save_context("researcher", [{"role": "user", "content": "new context"}])
+        finally:
+            release.set()
+        old.thread.join(2)
+        self.assertFalse(old.thread.is_alive())
+        self.assertEqual(
+            runtime.store.load_context("researcher"), [{"role": "user", "content": "new context"}]
+        )
+
+    def test_explicit_cancel_discards_inflight_work(self):
+        started = threading.Event()
+
+        def researcher(messages, tools):
+            started.set()
+            script.options()["cancelled"].wait(5)
+            return say("late answer")
+
+        script = TeamScript(researcher=researcher)
+        conversation = self.team_conversation(script)
+        runtime = conversation.team
+        context = ExecutionContext(time.monotonic() + 10)
+        runtime.begin_turn(context.deadline)
+        runtime.act_send_message("main", None, to=["researcher"], kind="request",
+                                 content="cancel this work", _context=context)
+        self.assertTrue(started.wait(2))
+        runtime.act_cancel("main", None, _context=context)
+        self.assertEqual(len(script.requests["researcher"]), 1)
+        self.assertNotIn("researcher", runtime.activations)
+        self.assertEqual(runtime.state.agents["researcher"]["inflight"], [])
+        self.assertEqual(runtime.state.mailbox("researcher"), [])
+
     def test_interrupted_member_work_resumes_after_restart(self):
         started = threading.Event()
 
@@ -1148,6 +1199,14 @@ class ResourceLimitTests(TeamTestCase):
         self.assertEqual(content, "ALPHA\nBETA\ngamma\n")
         self.assertEqual(result["status"], "ok")
         self.assertIn("merged with theirs", result["data"]["merged"])
+
+    def test_committed_team_environment_shares_the_main_edit_ledger(self):
+        conversation = self.team_conversation(TeamScript())
+        self.assertIsNotNone(conversation.tools.edit_ledger)
+        self.assertIs(conversation.tools.edit_ledger, conversation.team.base_tools.edit_ledger)
+        self.assertIs(conversation.tools.edit_ledger, conversation.team.member("engineer").tools.edit_ledger)
+        conversation.apply_environment(None)
+        self.assertIsNone(conversation.tools.edit_ledger)
 
     def test_full_file_write_from_a_stale_read_keeps_a_teammates_edit(self):
         content, result = self.editors(

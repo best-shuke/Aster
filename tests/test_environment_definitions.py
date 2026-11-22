@@ -191,6 +191,24 @@ class McpEditingTests(EditorTestCase):
         self.assertFalse((self.user / "solo" / "mcp.json").exists())
         self.assertNotIn("mcp_config_file", json.loads((self.user / "solo.json").read_text()))
 
+    def test_adding_another_local_server_preserves_trust_and_applies_tool_scope(self):
+        self.editor.create("solo")
+        self.editor.define_mcp_server("solo", "first", {"command": "one"})
+        result = self.editor.define_mcp_server(
+            "solo", "second", {"command": "two"}, tools=["lookup"], deny=["write"]
+        )
+        self.assertTrue(result.approved)
+        self.assertTrue(self.store.approved(self.store.resolve("solo")))
+        self.assertTrue(result.environment.mcp_scope.permits("second", "lookup"))
+        self.assertFalse(result.environment.mcp_scope.permits("second", "write"))
+
+        resources = self.user / "solo" / "mcp.json"
+        paths = (resources, result.entry.path, self.store.trust_file)
+        before = [path.read_bytes() for path in paths]
+        with self.assertRaises(ValueError):
+            self.editor.define_mcp_server("solo", "bad", {"command": "three"}, tools=["x" * 129])
+        self.assertEqual([path.read_bytes() for path in paths], before)
+
 
 class LimitEditingTests(EditorTestCase):
     def test_unlimited_support_still_rejects_invalid_numbers_and_types(self):

@@ -476,6 +476,41 @@ class ResponsesTests(TempDirTest):
             tokens, [f"Bearer {old['access_token']}", f"Bearer {fresh['access_token']}"]
         )
 
+    def test_model_deadline_bounds_credential_lock_wait(self):
+        self.save_chatgpt()
+        client = self.client()
+        with (
+            client.account._lock,
+            patch.object(client, "_perform_request") as request,
+            self.assertRaises(CompletionError) as caught,
+        ):
+            client.complete([], deadline=time.monotonic() + 0.04)
+        self.assertEqual(caught.exception.code, "task_deadline")
+        request.assert_not_called()
+
+    def test_expired_model_budget_does_not_replay_rejected_credentials(self):
+        self.save_chatgpt()
+        fresh = auth.account_tokens(token_response(refresh="refresh-2"))
+        client = self.client()
+        clock = [100.0]
+
+        def refresh(*args, **kwargs):
+            self.assertAlmostEqual(kwargs["deadline"], 101.0)
+            clock[0] = 101.1
+            return fresh
+
+        rejected = urllib.error.HTTPError("https://example.invalid", 401, "", {}, io.BytesIO(b"{}"))
+        with (
+            patch("chatgpt_client.time.monotonic", side_effect=lambda: clock[0]),
+            patch("auth.refresh_tokens", side_effect=refresh),
+            patch.object(client, "_perform_request", side_effect=rejected) as request,
+            self.assertRaises(CompletionError) as caught,
+        ):
+            client.complete([], generation_timeout=1)
+        self.assertEqual(caught.exception.code, "generation_budget")
+        request.assert_called_once()
+        self.assertEqual(self.store.read()["chatgpt"]["refresh_token"], "refresh-2")
+
     def test_usage_limit_and_request_errors_explain_themselves(self):
         self.save_chatgpt()
         client = self.client()

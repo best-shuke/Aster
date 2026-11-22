@@ -307,6 +307,15 @@ class WorkflowCommandTests(unittest.TestCase):
         self.runner.assert_not_called()
         self.console.read_value.assert_not_called()
 
+    def test_run_addresses_workflows_named_after_commands(self):
+        for name in ("add", "new", "show", "run"):
+            workflow = self.chat.workflows.create(name, f"Steps for {name}")
+            self.runner.reset_mock()
+            handle_command(self.chat, self.console, f"/workflow run {name} this time")
+            self.runner.assert_called_once_with(
+                self.chat, self.console, workflow.prompt("this time")
+            )
+
     def test_import_resolves_paths_relative_to_the_workspace_and_does_not_run(self):
         source = self.root / "source file.md"
         source.write_text("1. Inspect\n2. Test")

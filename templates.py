@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -54,24 +54,30 @@ class TemplateStore:
             path = self.directory / f"{filename[:48]}-{template_id}.json"
         return path
 
-    def _migrate_legacy(self) -> None:
+    def _migrate_legacy(self, known_ids: set[str]) -> list[SavedTemplate]:
         if self.local_directory == self.directory:
-            return
-        for path in self.local_directory.glob("*.json"):
+            return []
+        migrated = []
+        for path in sorted(self.local_directory.glob("*.json")):
             if path == self.settings_file:
                 continue
             try:
-                template = self._info(path, managed=True)
-                if self._path(template.template_id).exists():
-                    continue
                 data = self.sessions.read(path)
+                template = self._info(path, data, managed=True)
+                if (
+                    template.template_id in known_ids
+                    or (self.directory / f"{template.template_id}.json").exists()
+                ):
+                    continue
                 destination = self._new_path(template.name, template.template_id)
                 self.sessions._write(destination, json.dumps(data, ensure_ascii=False, indent=2))
+                known_ids.add(template.template_id)
+                migrated.append(replace(template, path=destination))
             except (OSError, RuntimeError, KeyError, TypeError, ValueError) as exc:
                 self.diagnostics.append(f"无法迁移旧模板 {path.name}: {exc}")
+        return migrated
 
-    def _info(self, path: Path, *, managed: bool) -> SavedTemplate:
-        data = self.sessions.read(path)
+    def _info(self, path: Path, data: dict, *, managed: bool) -> SavedTemplate:
         if not data["messages"]:
             raise ValueError("模板对话不能为空。")
         count = sum(message["role"] in {"user", "assistant"} for message in data["messages"])
@@ -95,24 +101,34 @@ class TemplateStore:
 
     def list(self) -> list[SavedTemplate]:
         self.diagnostics.clear()
-        self._migrate_legacy()
+        templates = self._managed_templates()
+        sources = {template.source for template in templates}
+        for path in sorted(self.workspace.glob("*.ds-agent.json")):
+            path = path.resolve()
+            if path in sources:
+                continue
+            try:
+                templates.append(self._info(path, self.sessions.read(path), managed=False))
+            except (RuntimeError, KeyError, TypeError, ValueError) as exc:
+                self.diagnostics.append(f"已跳过无法读取的转换文件 {path.name}: {exc}")
+        return sorted(templates, key=lambda template: template.name.casefold())
+
+    def _managed_templates(self) -> list[SavedTemplate]:
         templates = []
+        known_ids = set()
         for path in sorted(self.directory.glob("*.json")):
             if path == self.settings_file:
                 continue
             try:
-                templates.append(self._info(path, managed=True))
+                data = self.sessions.read(path)
+                template_id = data.get("template_id")
+                if isinstance(template_id, str):
+                    known_ids.add(template_id)
+                templates.append(self._info(path, data, managed=True))
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
                 self.diagnostics.append(f"已跳过无法读取的模板 {path.name}: {exc}")
-        sources = {template.source for template in templates}
-        for path in sorted(self.workspace.glob("*.ds-agent.json")):
-            if path.resolve() in sources:
-                continue
-            try:
-                templates.append(self._info(path.resolve(), managed=False))
-            except (RuntimeError, KeyError, TypeError, ValueError) as exc:
-                self.diagnostics.append(f"已跳过无法读取的转换文件 {path.name}: {exc}")
-        return sorted(templates, key=lambda template: template.name.casefold())
+        templates.extend(self._migrate_legacy(known_ids))
+        return sorted(templates, key=lambda template: template.path)
 
     def create(
         self, name: str, messages: list[dict], *, source: Path | None = None
@@ -135,7 +151,7 @@ class TemplateStore:
         }
         path = self._new_path(name, template_id)
         self.sessions._write(path, json.dumps(data, ensure_ascii=False, indent=2))
-        return self._info(path, managed=True)
+        return self._info(path, data, managed=True)
 
     def add(self, path: Path, name: str | None = None) -> SavedTemplate:
         path = path.expanduser()
@@ -144,7 +160,7 @@ class TemplateStore:
         path = path.resolve()
         data = self.sessions.read(path)
         if path.parent == self.directory.resolve():
-            return self._info(path, managed=True)
+            return self._info(path, data, managed=True)
         name = name or path.name.removesuffix(".ds-agent.json").removesuffix(".json")
         for template in self.list():
             if template.template_id and template.source == path and template.name == name:
@@ -159,12 +175,17 @@ class TemplateStore:
         if self._selected_id is None:
             return None
         try:
-            self._migrate_legacy()
-            return self._info(self._path(self._selected_id), managed=True)
+            path = self._path(self._selected_id)
+            if not path.exists():
+                for template in self._managed_templates():
+                    if template.template_id == self._selected_id:
+                        return template
+            return self._info(path, self.sessions.read(path), managed=True)
         except (OSError, RuntimeError, KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(f"Cannot load selected template {self._selected_id}: {exc}") from exc
 
     def set_default(self, template_id: str | None) -> None:
         if template_id is not None:
-            self._info(self._path(template_id), managed=True)
+            path = self._path(template_id)
+            self._info(path, self.sessions.read(path), managed=True)
         self._selected_id = template_id

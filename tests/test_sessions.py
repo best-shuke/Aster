@@ -112,6 +112,29 @@ class SessionStoreTests(unittest.TestCase):
         )
         self.assertEqual(list(self.root.rglob("*.tmp")), [])
 
+    def test_failed_active_write_rolls_back_the_saved_snapshot(self):
+        data = self.data()
+        self.store.save(data)
+        path = self.store.snapshot_path(data["session_id"])
+        previous = path.read_bytes()
+        data["messages"].append({"role": "user", "content": "retry this save"})
+        write = self.store._write
+
+        def fail_active(path, content):
+            if path == self.store.active_file:
+                raise OSError("active file unavailable")
+            write(path, content)
+
+        with (
+            patch.object(self.store, "_write", side_effect=fail_active),
+            self.assertRaisesRegex(OSError, "active file unavailable"),
+        ):
+            self.store.save(data)
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(self.store.active_file.read_bytes(), previous)
+        self.store.save(data)
+        self.assertEqual(self.store.read(path), data)
+
     def test_custom_active_file_has_its_own_archive_directory(self):
         custom = SessionStore(self.root / "custom.json")
         self.store.save(self.data("a" * 32))

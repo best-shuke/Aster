@@ -51,32 +51,19 @@ def merge_text(base: str, current: str, proposed: str) -> str:
                 changes.append((start, end, lines[new_start:new_end]))
         return changes
 
-    existing = differences(current)
-    incoming = differences(proposed)
-    combined = list(existing)
-    for change in incoming:
-        start, end, replacement = change
-        duplicate = False
-        for other_start, other_end, other_replacement in existing:
-            if change == (other_start, other_end, other_replacement):
-                duplicate = True
-                break
-            if start == end:
-                overlap = (
-                    start == other_start
-                    if other_start == other_end
-                    else other_start <= start < other_end
-                )
-            elif other_start == other_end:
-                overlap = start <= other_start < end
-            else:
-                overlap = max(start, other_start) < min(end, other_end)
-            if overlap:
+    ordered = sorted(differences(current) + differences(proposed), key=lambda change: change[:2])
+    combined = []
+    for change in ordered:
+        if combined:
+            previous = combined[-1]
+            if change == previous:
+                continue
+            # Replacements cover [start, end), and insertions occupy their start position.
+            if change[0] < previous[1] or change[0] == previous[0]:
                 raise FileMergeConflict("Overlapping changes; review and resolve the saved patch.")
-        if not duplicate:
-            combined.append((start, end, replacement))
+        combined.append(change)
     merged = list(original_lines)
-    for start, end, replacement in sorted(combined, key=lambda change: change[:2], reverse=True):
+    for start, end, replacement in reversed(combined):
         merged[start:end] = replacement
     return "".join(merged)
 

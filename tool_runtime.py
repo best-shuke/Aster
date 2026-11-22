@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -41,6 +41,26 @@ def command_environment() -> dict[str, str]:
     }
 
 
+class _LinkedCancellation(threading.Event):
+    """A local cancellation signal that also observes its parent."""
+
+    def __init__(self, parent: threading.Event):
+        super().__init__()
+        self.parent = parent
+
+    def is_set(self) -> bool:
+        return super().is_set() or self.parent.is_set()
+
+    def wait(self, timeout=None) -> bool:
+        deadline = float("inf") if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self.is_set()
+            super().wait(min(0.05, remaining))
+        return True
+
+
 @dataclass
 class ExecutionContext:
     deadline: float
@@ -68,6 +88,10 @@ class ExecutionContext:
             self.event_sink,
             self.on_progress,
         )
+
+    def cancellable_child(self, seconds: float | None) -> "ExecutionContext":
+        context = self if seconds is None else self.child(seconds)
+        return replace(context, cancelled=_LinkedCancellation(self.cancelled))
 
     def for_agent(self, agent_id: str) -> "ExecutionContext":
         return ExecutionContext(

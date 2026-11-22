@@ -44,6 +44,7 @@ from commands import (
     QUOTED_ARGUMENTS,
     CommandName,
     CommandResult,
+    EffectKind,
     execute_command,
     parse_command,
     parse_loop,
@@ -118,6 +119,7 @@ HELP = (
             ("/workflow new [名称]", "新建可复用的任务步骤"),
             ("/workflow add 文件 [名称]", "导入 Markdown workflow"),
             ("/workflow show 编号|名称", "查看步骤，不执行任务"),
+            ("/workflow run 编号|名称 [补充]", "按编号或名称运行 workflow"),
             ("/skills [名称|all]", "选择技能查看说明，或列出全部"),
             ("/skill:名称 [任务]", "加载技能完整说明并执行任务"),
         ),
@@ -156,8 +158,14 @@ def use_loop(conversation: Conversation, console: Console, arguments: list[str])
     return run_loop(conversation, console, parse_loop(*arguments), ask_task=ask)
 
 
-def handle_command(conversation: Conversation, console: Console, prompt: str) -> CommandResult:
+def handle_command(
+    conversation: Conversation, console: Console, prompt: str, *, one_shot: bool = False
+) -> CommandResult:
     execution = execute_command(parse_command(prompt), conversation)
+    if one_shot:
+        for effect in execution.effects:
+            if effect.kind is EffectKind.ERROR:
+                raise effect.payload
     present_command(
         execution,
         conversation,
@@ -517,8 +525,17 @@ def main() -> int:
                     return (
                         0 if use_environment(conversation, console, list(command.arguments)) else 2
                     )
-                if handle_command(conversation, console, prompt) is not CommandResult.NOT_COMMAND:
-                    return 0
+                try:
+                    errors_before = console.error_count
+                    result = handle_command(conversation, console, prompt, one_shot=True)
+                    if result is not CommandResult.NOT_COMMAND:
+                        return int(console.error_count != errors_before)
+                except ValueError as exc:
+                    console.error(exc)
+                    return 2
+                except (OSError, RuntimeError) as exc:
+                    console.error(exc)
+                    return 1
                 console.configuration_notice()
                 if conversation.last_environment_id and conversation.environment_id is None:
                     console.warning(

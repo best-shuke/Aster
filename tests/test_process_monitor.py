@@ -104,6 +104,27 @@ class ProcessMonitorTests(unittest.TestCase):
             self.monitor(session_id, "wait", wait_seconds=2)["data"]["state"], "completed"
         )
 
+    def test_status_does_not_report_exit_before_reading_final_output(self):
+        session_id = self.start("input(); print('FINAL')")
+        monitor = self.tools.processes
+        session = monitor.lookup(session_id)
+        read_output = monitor.read_output
+
+        def finish_after_read(*args, **kwargs):
+            page = read_output(*args, **kwargs)
+            os.write(session.process.stdin.fileno(), b"\n")
+            self.assertTrue(session.done.wait(2))
+            return page
+
+        with patch.object(monitor, "read_output", side_effect=finish_after_read):
+            first = self.monitor(session_id)["data"]
+        self.assertEqual(first["state"], "running")
+        self.assertEqual(first["output"], "")
+
+        final = self.monitor(session_id, offset=first["next_offset"])["data"]
+        self.assertEqual(final["state"], "completed")
+        self.assertEqual(final["output"], "FINAL\n")
+
     def test_background_launch_outlives_the_launching_turn_deadline(self):
         launched = self.execute(
             "exec",

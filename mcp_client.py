@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -29,6 +30,11 @@ from referencing.exceptions import Unresolvable
 
 from file_state import atomic_write_text, local_code_files
 from tool_runtime import ExecutionContext, ToolResult
+
+if sys.version_info >= (3, 11):
+    from asyncio import timeout as async_timeout
+else:
+    from async_timeout import timeout as async_timeout
 
 
 @lru_cache(maxsize=256)
@@ -469,7 +475,7 @@ class _Connection:
             async with AsyncExitStack() as stack:
                 queue = self._queue = asyncio.Queue()
                 self._refresh_pending = False
-                async with asyncio.timeout(self.config.timeout):
+                async with async_timeout(self.config.timeout):
                     client = await self._open_client(stack)
                     await self._refresh_tools(client)
                 self.instructions = client.instructions
@@ -484,7 +490,7 @@ class _Connection:
                         self._refresh_pending = False
                         try:
                             if self._catalog_revision != self._tools_revision:
-                                async with asyncio.timeout(self.config.timeout):
+                                async with async_timeout(self.config.timeout):
                                     await self._refresh_tools(client)
                         except Exception as exc:
                             # Keep the last complete catalog. Discovery retries the
@@ -510,14 +516,14 @@ class _Connection:
                     active_request = request
                     request.task = asyncio.create_task(self._operation(client, request))
                     try:
-                        async with asyncio.timeout(remaining):
+                        async with async_timeout(remaining):
                             result = await request.task
                         request.future.set_result(result)
                     except asyncio.CancelledError:
                         if not request.abandoned.is_set():
                             raise
                         request.future.set_exception(self._interrupted(request))
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         request.future.set_exception(self._interrupted(request))
                     except Exception as exc:
                         request.future.set_exception(exc)
@@ -974,21 +980,34 @@ class McpManager:
     def _catalog(
         self, context: ExecutionContext, server: str | None = None, permit=None
     ) -> tuple[list[tuple[str, dict[str, Any]]], list[dict[str, str]]]:
-        catalog: list[tuple[str, dict[str, Any]]] = []
-        failures = []
-        for config in self._selected_servers(server, permit):
+        execution = context.cancellable_child(None)
+
+        def fetch(config):
             if config.disabled:
-                failures.append({"server": config.name, "error": "server is disabled"})
-                continue
+                return [], {"server": config.name, "error": "server is disabled"}
             try:
                 connection = self._connection(config.name)
-                connection.start(self._remaining(context, config), cancelled=context.cancelled)
+                connection.start(self._remaining(execution, config), cancelled=execution.cancelled)
                 tools = connection.request(
-                    "catalog", {}, self._remaining(context, config), context=context
+                    "catalog", {}, self._remaining(execution, config), context=execution
                 )
-                catalog.extend((config.name, tool) for tool in tools)
+                return [(config.name, tool) for tool in tools], None
             except Exception as exc:
-                failures.append({"server": config.name, "error": str(exc)})
+                return [], {"server": config.name, "error": str(exc) or type(exc).__name__}
+
+        selected = self._selected_servers(server, permit)
+        if len(selected) > 1:
+            # Each connection still serializes its own catalog and tool operations.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected)) as executor:
+                try:
+                    results = list(executor.map(fetch, selected))
+                except BaseException:
+                    execution.cancelled.set()
+                    raise
+        else:
+            results = [fetch(config) for config in selected]
+        catalog = [entry for entries, _ in results for entry in entries]
+        failures = [error for _, error in results if error is not None]
         return catalog, failures
 
     @staticmethod

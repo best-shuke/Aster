@@ -1,13 +1,36 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from config import Settings
 from reasoning import ReasoningTools
+from tool_runtime import ExecutionContext
 
 
 class SubagentLimitTests(unittest.TestCase):
+    def test_delegate_timeout_cancels_workers_without_cancelling_the_caller(self):
+        parent = ExecutionContext(time.monotonic() + 10)
+        worker_stopped = threading.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            reasoning = ReasoningTools(Mock(), Mock(), [], workspace=Path(temporary))
+
+            def worker(task, context, expected, execution, *args, **kwargs):
+                if execution.cancelled.wait(2):
+                    worker_stopped.set()
+                execution.remaining()
+
+            with patch.object(reasoning.runner, "run", side_effect=worker):
+                result = reasoning.delegate(
+                    [{"task": "inspect", "expected_output": "result"}], timeout=0.2,
+                    _context=parent,
+                )
+            self.assertTrue(worker_stopped.wait(2))
+        self.assertEqual(result.data["reports"][0]["status"], "timeout")
+        self.assertGreater(parent.remaining(), 0)
+
     def test_task_deadline_defaults_to_unlimited_and_respects_explicit_settings(self):
         for configured, expected in ((None, None), ("60", 60), ("unlimited", None), ("0", None)):
             settings = {"DEEPSEEK_API_KEY": "test"}

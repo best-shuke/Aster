@@ -154,6 +154,29 @@ class RateLimitTests(unittest.TestCase):
         self.assertIsNot(client.request_gate, other_key.request_gate)
         self.assertIsNot(client.request_gate, other_endpoint.request_gate)
 
+    def test_connection_failure_releases_the_recovery_probe_before_retry_wait(self):
+        client = DeepSeekClient(settings(request_retries=1))
+        self.gate.limited(self.gate.try_start()[0], backoff=1)
+        self.clock.advance(1)
+        answer = {"role": "assistant", "content": "ok"}
+
+        def wait_for_retry(*args):
+            probe, _, _ = self.gate.try_start()
+            self.assertIsNotNone(probe)
+            self.gate.accepted(probe)
+            self.clock.advance(10)
+            return True
+
+        with (
+            patch.object(client, "_resolve_request_gate", return_value=self.gate),
+            patch.object(client, "_wait_before_retry", side_effect=wait_for_retry),
+            patch.object(
+                client, "_complete_once",
+                side_effect=[CompletionError("connection_error", "offline", retryable=True), answer],
+            ),
+        ):
+            self.assertEqual(client.complete([]), answer)
+
     def test_native_http_error_retains_safe_retry_after_without_reading_or_logging_body(self):
         body = io.BytesIO(b"private fixture error body")
         error = urllib.error.HTTPError(

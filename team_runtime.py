@@ -82,6 +82,7 @@ class Activation:
         self.turn_bound = False
         self.turn_number = 0
         self.was_backgrounded = False
+        self.discarded = False
 
 
 @dataclass
@@ -224,6 +225,7 @@ class TeamRuntime:
         self._stop_activations()
         with self.lock:
             self._close_store()
+            self.activations.clear()
             # Never keep acting on the previous session if the new one cannot be opened.
             self.state, self.session_id, self.members = None, None, {}
             store = TeamStore(self.state_dir, self.environment, session_id)
@@ -250,6 +252,7 @@ class TeamRuntime:
         self._stop_activations()
         with self.lock:
             self._close_store()
+            self.activations.clear()
 
     def _close_store(self) -> None:
         if self.store is not None:
@@ -647,18 +650,19 @@ class TeamRuntime:
 
     def _run(self, activation: Activation) -> None:
         try:
-            member = self.member(activation.agent)
+            with self.lock:
+                self._require_activation(activation)
+                member = self.member(activation.agent)
             result = member.run(activation)
         except BaseException as exc:
             result = ActivationResult("error", error=f"{type(exc).__name__}: {exc}")
         with self.lock:
             try:
-                if activation.session == self.session_id and self.state is not None:
+                if self.activations.get(activation.agent) is activation:
                     self._finish(activation, result)
             finally:
                 if self.activations.get(activation.agent) is activation:
                     del self.activations[activation.agent]
-                if self.state is not None and activation.session == self.session_id:
                     self._drain()
                     if self._background is not None and self._quiescent():
                         self._end_background("finished")
@@ -674,6 +678,10 @@ class TeamRuntime:
             data["unverified_background_source"] = data.get("unverified_background_source", 0) + 1
         record = self.state.agents[name]
         record["inflight"] = []
+        if activation.discarded:
+            record["status"] = "idle"
+            self._progress(name, state="paused", activity="finished")
+            return
         title = activation_title(self, activation.items)
         # The deadline of a turn that is over (it went to the background or a later turn
         # began) cut this activation short: that pauses the work, it did not fail.
@@ -896,12 +904,11 @@ class TeamRuntime:
                 }
             )
 
-    def progress(self, name: str, **event: Any) -> None:
+    def progress(self, activation: Activation, **event: Any) -> None:
         """Model and tool activity reported by a running member (any thread)."""
-        activation = self.activations.get(name)
-        if activation is not None and activation.cancelled.is_set():
-            return
-        self._progress(name, state="running", **event)
+        with self.lock:
+            if self.activations.get(activation.agent) is activation and not activation.cancelled.is_set():
+                self._progress(activation.agent, state="running", **event)
 
     def _origin(self, actor: str, activation):
         return activation if activation is not None else self.main_origin
@@ -1053,8 +1060,10 @@ class TeamRuntime:
 
     # Budgets called by members ------------------------------------------------------
 
-    def member_request_budgets(self, name: str) -> tuple[TokenBudget, tuple[TokenBudget, ...]]:
+    def member_request_budgets(self, name: str, cancelled=None) -> tuple[TokenBudget, tuple[TokenBudget, ...]]:
         with self.lock:
+            if cancelled is not None and cancelled.is_set():
+                raise TimeoutError("Team model request was cancelled")
             ledger = self._member_budgets.get(name)
             if ledger is None:
                 record = self.state.agents[name]["turn"]
@@ -1078,9 +1087,10 @@ class TeamRuntime:
         if persist and shared:
             self.on_background_budget(shared)
 
-    def charge_tool_call(self, name: str) -> None:
+    def charge_tool_call(self, activation: Activation) -> None:
         with self.lock:
-            record = self.state.agents[name]["turn"]
+            self._require_activation(activation)
+            record = self.state.agents[activation.agent]["turn"]
             if limit_reached(record["tool_calls"], self.limits.max_tool_calls_per_agent):
                 raise TeamError(
                     "tool_budget",
@@ -1091,13 +1101,22 @@ class TeamRuntime:
 
     def render_activation(self, activation: Activation) -> str:
         with self.lock:
+            self._require_activation(activation)
             return activation_text(self, activation.agent, activation.items)
 
-    def context_messages(self, name: str) -> list[dict]:
-        return self.store.load_context(name)
+    def _require_activation(self, activation: Activation) -> None:
+        if self.activations.get(activation.agent) is not activation or self.store is None:
+            raise TimeoutError("Team activation no longer belongs to the current session")
 
-    def save_context(self, name: str, messages: list[dict]) -> None:
-        self.store.save_context(name, messages)
+    def context_messages(self, activation: Activation) -> list[dict]:
+        with self.lock:
+            self._require_activation(activation)
+            return self.store.load_context(activation.agent)
+
+    def save_context(self, activation: Activation, messages: list[dict]) -> None:
+        with self.lock:
+            self._require_activation(activation)
+            self.store.save_context(activation.agent, messages)
 
     # Actions (the team tool) --------------------------------------------------------
 
@@ -1605,7 +1624,9 @@ class TeamRuntime:
             self._require_open()
             running = list(self.activations.values())
             for item in running:
+                item.discarded = True
                 item.cancelled.set()
+                self.state.agents[item.agent]["inflight"] = []
             dropped = 0
             for name in self.state.agents:
                 mailbox = self.state.mailbox(name)
@@ -1620,13 +1641,8 @@ class TeamRuntime:
                 "team_cancelled", actor, reason=reason, running=len(running), dropped=dropped
             )
             self._persist()
-        self._stop_activations()
-        with self.lock:
-            # Cancelled activations requeue their items; a cancel discards them instead.
-            for name in self.state.agents:
-                self.state.mailbox(name).clear()
-            self._persist()
-            return {"cancelled_activations": len(running), "dropped_items": dropped}
+        self._join(running)
+        return {"cancelled_activations": len(running), "dropped_items": dropped}
 
     # Main-agent integration --------------------------------------------------------
 

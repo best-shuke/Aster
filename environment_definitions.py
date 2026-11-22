@@ -117,29 +117,40 @@ class EnvironmentEditor:
         entry = self.store.find(selector)
         return entry, _read_json(entry.path)
 
-    def update(self, selector: str, mutate: Callable[[dict], str | None]) -> EditResult:
-        entry, data = self.load(selector)
+    def _approved(self, entry: EnvironmentEntry) -> bool:
         try:
-            was_approved = self.store.approved(self.store.resolve(entry.environment_id))
+            return self.store.approved(self.store.resolve(entry.environment_id))
         except (OSError, ValueError):
-            was_approved = False
+            return False
+
+    def update(
+        self, selector: str, mutate: Callable[[dict], str | None], *,
+        was_approved: bool | None = None,
+    ) -> EditResult:
+        entry, data = self.load(selector)
+        resource_changed = was_approved is not None
+        if was_approved is None:
+            was_approved = self._approved(entry)
         candidate = deepcopy(data)
         detail = mutate(candidate)
-        if candidate == data:
+        if candidate == data and not resource_changed:
             environment = self.store.resolve(entry.environment_id)
             return EditResult(entry, environment, self.store.approved(environment))
         self.store.resolve_data(entry, candidate)
-        original = entry.path.read_text(encoding="utf-8")
-        atomic_write_text(entry.path, json.dumps(candidate, ensure_ascii=False, indent=2) + "\n")
+        original = None
+        if candidate != data:
+            original = entry.path.read_text(encoding="utf-8")
+            atomic_write_text(entry.path, json.dumps(candidate, ensure_ascii=False, indent=2) + "\n")
         try:
             environment = self.store.resolve(entry.environment_id)
-        except Exception:
-            atomic_write_text(entry.path, original)
+            self.store.audit("edited", entry.environment_id, change=detail, reapproved=was_approved)
+            if was_approved:
+                self.store.approve(environment)
+        except BaseException:
+            if original is not None:
+                atomic_write_text(entry.path, original)
             raise
-        if was_approved:
-            self.store.approve(environment)
-        self.store.audit("edited", entry.environment_id, change=detail, reapproved=was_approved)
-        return EditResult(entry, self.store.resolve(entry.environment_id), was_approved)
+        return EditResult(entry, environment, was_approved)
 
     # Skills -------------------------------------------------------------------------
 
@@ -231,10 +242,14 @@ class EnvironmentEditor:
 
         return self.update(selector, mutate)
 
-    def define_mcp_server(self, selector: str, name: str, server: dict) -> EditResult:
+    def define_mcp_server(
+        self, selector: str, name: str, server: dict, *,
+        tools: list[str] | None = None, deny: list[str] | None = None,
+    ) -> EditResult:
         """Add a server to the environment's own MCP file; secrets must be ${VAR} references."""
         check_credentials(name, server)
         entry, data = self.load(selector)
+        was_approved = self._approved(entry)
         resources = entry.path.parent / entry.name
         relative = f"{entry.name}/mcp.json"
         configured = data.get("mcp_config_file")
@@ -247,21 +262,28 @@ class EnvironmentEditor:
             raise ValueError(f"环境 MCP 文件已定义服务 {name!r}")
         original = path.read_text(encoding="utf-8") if path.exists() else None
         servers[name] = server
-        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        path.chmod(0o600)
+        existing_servers = (
+            self.store.resolve(entry.environment_id).servers if tools or deny else {}
+        )
 
         def mutate(definition):
             inherit = definition.get("inherit_mcp", "mcp_config_file" not in definition)
             definition["mcp_config_file"] = relative
             definition["inherit_mcp"] = inherit
             selection = definition.get("mcp")
+            if selection is None and (tools or deny):
+                selection = definition["mcp"] = {
+                    server: not config.disabled for server, config in existing_servers.items()
+                }
             if selection is not None:
-                selection[name] = True
+                selection[name] = _mcp_entry(True, tools, deny)
             return f"mcp define {name}"
 
         try:
-            return self.update(selector, mutate)
-        except Exception:
+            atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            path.chmod(0o600)
+            return self.update(selector, mutate, was_approved=was_approved)
+        except BaseException:
             if original is None:
                 path.unlink(missing_ok=True)
             else:

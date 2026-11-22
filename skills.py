@@ -26,17 +26,20 @@ class SkillDiagnostic:
     message: str
 
 
-def _frontmatter(content: str) -> tuple[dict[str, Any], str]:
-    lines = content.removeprefix("\ufeff").splitlines(keepends=True)
-    if not lines or lines[0].strip() != "---":
+def _frontmatter(stream) -> dict[str, Any]:
+    if stream.readline().strip() != "---":
         raise ValueError("missing YAML frontmatter")
-    closing = next((index for index in range(1, len(lines)) if lines[index].strip() == "---"), None)
-    if closing is None:
+    lines = []
+    for line in stream:
+        if line.strip() == "---":
+            break
+        lines.append(line)
+    else:
         raise ValueError("unterminated YAML frontmatter")
-    parsed = yaml.safe_load("".join(lines[1:closing])) or {}
+    parsed = yaml.safe_load("".join(lines)) or {}
     if not isinstance(parsed, dict):
         raise ValueError("frontmatter must be a mapping")
-    return parsed, "".join(lines[closing + 1 :]).strip()
+    return parsed
 
 
 def skill_files(root: Path, *, include_root_files: bool = True) -> list[Path]:
@@ -234,7 +237,8 @@ class SkillCatalog:
     def _load(self, file_path: Path) -> Skill | None:
         declared = file_path.name == "SKILL.md"
         try:
-            metadata, _ = _frontmatter(file_path.read_text(encoding="utf-8"))
+            with file_path.open(encoding="utf-8-sig") as stream:
+                metadata = _frontmatter(stream)
         except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
             if declared:
                 self.diagnostics.append(SkillDiagnostic(file_path, str(exc)))
@@ -316,7 +320,9 @@ def skills_prompt_section(
 def skill_block(skill: Skill) -> str:
     """Load one skill's full instructions on demand, as /skill: and team members do."""
     try:
-        _, body = _frontmatter(skill.file_path.read_text(encoding="utf-8"))
+        with skill.file_path.open(encoding="utf-8-sig") as stream:
+            _frontmatter(stream)
+            body = stream.read().strip()
     except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
         raise ValueError(f"无法加载 skill {skill.name}（{skill.file_path}）：{exc}") from exc
     return (

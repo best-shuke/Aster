@@ -25,11 +25,12 @@ class _Frame:
 class StreamingDisplay:
     """A scrolling response above a task footer that remains editable."""
 
-    def __init__(self, body, footer, *, key, height, row_lengths=None):
+    def __init__(self, body, footer, *, key, height, row_lengths=None, spill=True):
         self.body = body
         self.footer = footer
         self.key = key
         self.height = height
+        self.spill = spill
         self.row_lengths = row_lengths if row_lengths is not None else self.measure_rows(body)
 
     @staticmethod
@@ -53,9 +54,9 @@ class StreamingDisplay:
         return (
             _Frame(
                 [*self.body[visible_start:], [Segment("─" * options.max_width)], *footer],
-                prefix=self.body[offset:visible_start],
+                prefix=self.body[offset:visible_start] if self.spill else (),
             ),
-            visible_start,
+            visible_start if self.spill else offset,
         )
 
     def __rich_console__(self, console, options):

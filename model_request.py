@@ -243,6 +243,8 @@ class ModelRequestRunner:
                 delay = self._retry_delay(exc, attempt, retries, backoff, deadline, recorder)
                 if delay is None:
                     raise
+                # A failed probe no longer owns recovery while this request sleeps.
+                self.request_gate.release(admission)
                 if not self._wait_before_retry(
                     delay, attempt, generation_deadline, cancelled, on_progress, exc.code
                 ):
@@ -395,15 +397,19 @@ class ModelRequestRunner:
         _admission=None,
     ) -> Message:
         cache_stats = self.cache_stats
-        body = self._request_body(messages, tools, on_content is not None, max_output_tokens)
-        system_fingerprint = self._system_fingerprint(body)
-        request = self._http_request(body)
         generation_deadline, effective_deadline, remaining, io_deadline = self._request_timing(
             timeout, generation_timeout, deadline
         )
+        body = self._request_body(messages, tools, on_content is not None, max_output_tokens)
+        system_fingerprint = self._system_fingerprint(body)
         observed = UsageAccumulator()
         answer = None
         try:
+            request = self._http_request(body)
+            if cancelled is not None and cancelled.is_set():
+                raise http_transport.TransportCancelled("Model request cancelled")
+            if io_deadline is not None and time.monotonic() >= io_deadline:
+                raise http_transport.TransportDeadline("Model request deadline reached")
             mark_dispatched()
             answer = self._perform_request(
                 request,

@@ -239,6 +239,24 @@ class StreamTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "invalid_response")
             self.assertTrue(raised.exception.retryable)
 
+    def test_malformed_usage_does_not_discard_an_answer_or_valid_counters(self):
+        payload = {
+            "choices": [
+                {"message": {"content": "answer", "provider_metadata": {"deepseek": "bad"}}}
+            ],
+            "usage": {
+                "prompt_tokens": 23,
+                "prompt_tokens_details": "bad",
+                "prompt_cache_hit_tokens": 5,
+            },
+        }
+        with patch("http_transport.open_url", return_value=io.BytesIO(json.dumps(payload).encode())):
+            answer = self.client().complete([])
+        self.assertEqual(answer["content"], "answer")
+        usage = answer["_harness"]["usage"]
+        self.assertEqual(usage["prompt_tokens"], 23)
+        self.assertEqual(usage["prompt_tokens_details"], {"cached_tokens": 5})
+
     def test_stream_malformed_shapes_are_structured_errors(self):
         payloads = (
             [],

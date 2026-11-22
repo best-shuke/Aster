@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import threading
-from itertools import compress, repeat
+from itertools import chain, compress, repeat
 from operator import is_not, itemgetter
 from urllib.parse import urlsplit
 
@@ -101,6 +101,9 @@ class WireCache:
         return hashlib.sha256(_COMPACT(self._entry(message)).encode()).hexdigest()
 
     def prefix_fingerprint(self, head_json: str, messages) -> str:
+        return self.prefix_fingerprints(head_json, messages, (len(messages),))[len(messages)]
+
+    def prefix_fingerprints(self, head_json: str, messages, indices) -> dict[int, str]:
         # sha256 of the compact dump of [*head, wire_messages(messages)], which is
         # head_json[:-1] + ",[" + compact items joined by "," + "]]". UTF-8 encodes per
         # character, so the hash can be fed piecewise. The state after each message is
@@ -120,9 +123,10 @@ class WireCache:
                 state.update(("," + part if chain else part).encode())
                 chain.append(part)
                 states.append(state)
-            final = states[len(parts)].copy()
-        final.update(b"]]")
-        return final.hexdigest()
+            snapshots = {index: states[index].copy() for index in indices}
+        for snapshot in snapshots.values():
+            snapshot.update(b"]]")
+        return {index: snapshot.hexdigest() for index, snapshot in snapshots.items()}
 
     def _shared_prefix(self, parts) -> int:
         chain = self._chain_parts
@@ -156,8 +160,8 @@ def fingerprint(value):
     ).hexdigest()
 
 
-def request_fingerprint(messages, tools, settings, cache: WireCache | None = None):
-    head = [
+def _request_head(tools, settings):
+    return [
         getattr(settings, "base_url", ""),
         getattr(settings, "model", ""),
         getattr(settings, "resolved_api", "openai-completions"),
@@ -165,6 +169,10 @@ def request_fingerprint(messages, tools, settings, cache: WireCache | None = Non
         parse_reasoning_effort(getattr(settings, "reasoning_effort", None)),
         tools or [],
     ]
+
+
+def request_fingerprint(messages, tools, settings, cache: WireCache | None = None):
+    head = _request_head(tools, settings)
     if cache is None:
         return fingerprint([*head, wire_messages(messages)])
     # Byte-identical to the branch above: the cached messages array is hashed as the
@@ -222,19 +230,38 @@ def estimate_context(messages, tools, settings, cache: WireCache | None = None):
     cannot reuse a stale usage anchor. No mutable client-wide 'last usage' is used.
     A ``cache`` only memoizes serialization; the result is identical without one.
     """
-    for index in range(len(messages) - 1, -1, -1):
+    def anchors(stop):
+        for index in range(stop - 1, -1, -1):
+            message = messages[index]
+            metadata = message.get(LOCAL_METADATA)
+            if message.get("role") != "assistant" or not isinstance(metadata, dict):
+                continue
+            usage = metadata.get("usage")
+            prompt = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+            if number(prompt) and prompt > 0 and metadata.get("input_messages") == index:
+                yield index
+
+    candidates = anchors(len(messages))
+    first = next(candidates, None)
+    prefixes = None
+    for index in (() if first is None else chain((first,), candidates)):
         message = messages[index]
-        metadata = message.get(LOCAL_METADATA)
-        if message.get("role") != "assistant" or not isinstance(metadata, dict):
+        metadata = message[LOCAL_METADATA]
+        if index == first:
+            prefix = request_fingerprint(messages[:index], tools, settings, cache)
+        else:
+            if prefixes is None:
+                head_json = json.dumps(
+                    _request_head(tools, settings), ensure_ascii=False, separators=(",", ":")
+                )
+                prefixes = (cache or WireCache()).prefix_fingerprints(
+                    head_json, messages[:index], anchors(index + 1)
+                )
+            prefix = prefixes[index]
+        if metadata.get("input_fingerprint") != prefix:
             continue
-        usage = metadata.get("usage") or {}
-        prompt = usage.get("prompt_tokens")
-        if not number(prompt) or prompt <= 0 or metadata.get("input_messages") != index:
-            continue
-        if metadata.get("input_fingerprint") != request_fingerprint(
-            messages[:index], tools, settings, cache
-        ):
-            continue
+        usage = metadata["usage"]
+        prompt = usage["prompt_tokens"]
         response = (
             fingerprint(wire_messages([message])[0])
             if cache is None

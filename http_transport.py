@@ -111,7 +111,8 @@ class _Response:
         self.lock = threading.Lock()
         self.sockets = []
         self.chunks = queue.Queue(maxsize=8)
-        self.pending = b""
+        self.pending = bytearray()
+        self.offset = 0
         self.eof = False
         self.received = 0
         self.started = time.monotonic()
@@ -204,37 +205,50 @@ class _Response:
             self.close()
             raise
 
+    def _refill(self):
+        if self.offset:
+            del self.pending[:self.offset]
+            self.offset = 0
+        chunk = self.next_chunk()
+        if chunk is _EOF:
+            self.eof = True
+        else:
+            self.pending.extend(chunk)
+
+    def _consume(self, end):
+        data = bytes(memoryview(self.pending)[self.offset:end])
+        if end == len(self.pending):
+            self.pending.clear()
+            self.offset = 0
+        else:
+            self.offset = end
+        return data
+
     def read(self, size=-1):
         try:
-            while not self.eof and (size < 0 or len(self.pending) < size):
-                chunk = self.next_chunk()
-                if chunk is _EOF:
-                    self.eof = True
-                else:
-                    self.pending += chunk
-            end = len(self.pending) if size < 0 else size
-            result, self.pending = self.pending[:end], self.pending[end:]
-            return result
+            while not self.eof and (size < 0 or len(self.pending) - self.offset < size):
+                self._refill()
+            end = len(self.pending) if size < 0 else min(len(self.pending), self.offset + size)
+            return self._consume(end)
         except BaseException:
             self.close()
             raise
 
     def __iter__(self):
         try:
+            search = self.offset
             while True:
-                while b"\n" in self.pending:
-                    line, self.pending = self.pending.split(b"\n", 1)
-                    yield line + b"\n"
-                if self.eof:
-                    if self.pending:
-                        yield self.pending
-                        self.pending = b""
+                newline = self.pending.find(b"\n", search)
+                if newline >= 0:
+                    yield self._consume(newline + 1)
+                    search = self.offset
+                elif self.eof:
+                    if self.offset < len(self.pending):
+                        yield self._consume(len(self.pending))
                     return
-                chunk = self.next_chunk()
-                if chunk is _EOF:
-                    self.eof = True
                 else:
-                    self.pending += chunk
+                    search = len(self.pending) - self.offset
+                    self._refill()
         except BaseException:
             self.close()
             raise

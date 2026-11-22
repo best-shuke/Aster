@@ -119,6 +119,21 @@ class ReliabilityTests(unittest.TestCase):
         fake_socket.sendall.assert_not_called()
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_http_buffer_keeps_the_cursor_across_reads_and_fragmented_lines(self):
+        response = http_transport._Response(None, 1, None, None, None)
+        with patch.object(
+            response, "next_chunk",
+            side_effect=[b"ab\nc", b"d\nef\nlast", http_transport._EOF],
+        ):
+            lines = iter(response)
+            self.assertEqual(response.read(1), b"a")
+            self.assertEqual(next(lines), b"b\n")
+            self.assertEqual(response.read(1), b"c")
+            self.assertEqual(next(lines), b"d\n")
+            self.assertEqual(next(lines), b"ef\n")
+            self.assertEqual(response.read(), b"last")
+            self.assertEqual(list(lines), [])
+
     def test_timed_out_batches_do_not_create_more_active_workers(self):
         release = threading.Event()
         finished = threading.Event()

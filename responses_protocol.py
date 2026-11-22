@@ -164,10 +164,12 @@ def chat_usage(usage: Any) -> dict[str, Any] | None:
         )
         if number(usage.get(source))
     }
-    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens")
+    input_details = usage.get("input_tokens_details")
+    cached = input_details.get("cached_tokens") if isinstance(input_details, dict) else None
     if number(cached):
         result["prompt_tokens_details"] = {"cached_tokens": cached}
-    reasoning = (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+    output_details = usage.get("output_tokens_details")
+    reasoning = output_details.get("reasoning_tokens") if isinstance(output_details, dict) else None
     if number(reasoning):
         result["completion_tokens_details"] = {"reasoning_tokens": reasoning}
     if (
@@ -210,6 +212,9 @@ class _ResponsesEvents:
         self.reasoning: list[dict[str, Any]] = []
         self.reasoning_part: Any = None
         self.text_item: Any = None
+        self.text_blocks: dict[tuple[int, int], list[str]] = {}
+        self.message_content: str | None = None
+        self.anonymous_text = False
         self.refusal_blocks: dict[Any, str] = {}
         self.refusal_items: dict[Any, int] = {}
         self.refusal_item_info: list[dict[str, Any]] = []
@@ -353,6 +358,39 @@ class _ResponsesEvents:
         self.text_item = item
         return [_chunk(content=separator + fragment)]
 
+    def _completed_content(self, output_items: list) -> None:
+        paragraphs = []
+        for index, item in enumerate(output_items):
+            if not isinstance(item, dict) or item.get("type") not in {"message", "refusal"}:
+                continue
+            parts = item.get("content", []) if item["type"] == "message" else [item]
+            if not isinstance(parts, list):
+                raise CompletionError("invalid_response", "Invalid Responses content blocks", retryable=True)
+            paragraph = []
+            for content_index, part in enumerate(parts):
+                if not isinstance(part, dict):
+                    raise CompletionError("invalid_response", "Invalid Responses content block", retryable=True)
+                kind = part.get("type")
+                if kind not in {"output_text", "refusal"}:
+                    continue
+                key = self._refusal_key({"output_index": index}, item, content_index)
+                if kind == "output_text":
+                    text = part.get("text")
+                    streamed = "".join(self.text_blocks.get(key, ()))
+                else:
+                    text = part.get("refusal", part.get("text"))
+                    streamed = self.refusal_blocks.get(key, "")
+                if not isinstance(text, str) or not text.startswith(streamed):
+                    raise CompletionError(
+                        "invalid_response", "Completed text differs from streamed text",
+                        retryable=True,
+                    )
+                paragraph.append(text)
+            if paragraph:
+                paragraphs.append("".join(paragraph))
+        if paragraphs:
+            self.message_content = "\n\n".join(paragraphs)
+
     def chunks(self, event: Any) -> list[dict[str, Any]]:
         if not isinstance(event, dict):
             raise CompletionError(
@@ -369,11 +407,13 @@ class _ResponsesEvents:
         } and not isinstance(delta, str):
             raise CompletionError("invalid_response", "Response delta must be text", retryable=True)
         if kind == "response.output_text.delta":
-            item = (
-                self._refusal_key(event)[0]
-                if "item_id" in event or "output_index" in event
-                else None
-            )
+            if "item_id" in event or "output_index" in event:
+                key = self._refusal_key(event)
+                self.text_blocks.setdefault(key, []).append(delta)
+                item = key[0]
+            else:
+                item = None
+                self.anonymous_text = True
             separator = "\n\n" if self.text_item not in (None, item) else ""
             self.text_item = item
             return [_chunk(content=separator + delta)] if isinstance(delta, str) else []
@@ -548,6 +588,8 @@ class _ResponsesEvents:
                             "Completed response tool differs from finalized tool",
                             retryable=True,
                         )
+                if not self.anonymous_text:
+                    self._completed_content(output_items)
             self.done = True
             finish = "tool_calls" if self.tools else "stop"
             return [_chunk(finish, chat_usage(response.get("usage")))]

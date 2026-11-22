@@ -93,7 +93,7 @@ class BudgetedClient:
         )
 
     def complete(self, messages, tools=None, on_content=None, timeout=180, **kwargs):
-        ledger, shared = self._runtime.member_request_budgets(self._agent)
+        ledger, shared = self._runtime.member_request_budgets(self._agent, kwargs.get("cancelled"))
         try:
             with budget_scope(*shared, ledger):
                 return complete_with_budget(self._inner, messages, tools, on_content, timeout, **kwargs)
@@ -197,7 +197,7 @@ class MemberAgent:
 
     def run(self, activation: "Activation") -> "ActivationResult":
         runtime, name = self.runtime, self.spec.name
-        trace = TraceContext(session_id=runtime.session_id, task_id=activation.id, agent_id=name)
+        trace = TraceContext(session_id=activation.session, task_id=activation.id, agent_id=name)
         stats = getattr(self.client, "cache_stats", None)
         scope = (
             stats.request_scope(f"{runtime.environment.environment_id}/{name}")
@@ -207,14 +207,21 @@ class MemberAgent:
         self.team_tool.activation = activation
         # The complete answer a self-check nudge set aside, delivered if the rest fails.
         self.set_aside = None
-        messages = runtime.context_messages(name)
+        messages = runtime.context_messages(activation)
         repair_incomplete(messages)
         messages.append({"role": "user", "content": runtime.render_activation(activation)})
-        runtime.save_context(name, messages)
+        checkpointed = None
+
+        def save_checkpoint():
+            nonlocal checkpointed
+            runtime.save_context(activation, messages)
+            checkpointed = messages[:]
+
+        save_checkpoint()
         execution = ExecutionContext(activation.deadline, activation.cancelled, trace)
         try:
             with scope, trace_scope(trace):
-                return self._loop(activation, messages, execution)
+                return self._loop(activation, messages, execution, save_checkpoint)
         except (TimeoutError, CompletionError) as exc:
             if activation.cancelled.is_set():
                 return self.Result("cancelled")
@@ -234,11 +241,12 @@ class MemberAgent:
         finally:
             self.team_tool.activation = None
             # Best effort: every accepted step was already saved as it happened.
-            with suppress(Exception):
-                runtime.save_context(name, messages)
+            if checkpointed != messages:
+                with suppress(Exception):
+                    save_checkpoint()
 
-    def _loop(self, activation, messages, execution) -> "ActivationResult":
-        runtime, name = self.runtime, self.spec.name
+    def _loop(self, activation, messages, execution, save_checkpoint) -> "ActivationResult":
+        runtime = self.runtime
         task_runtime = TaskRuntime(
             self.client,
             self.settings,
@@ -255,17 +263,17 @@ class MemberAgent:
             phase = event.get("phase")
             if phase in {None, "response_delta", "response_reset", "context"}:
                 return
-            runtime.progress(name, activity="model", model_phase=phase)
+            runtime.progress(activation, activity="model", model_phase=phase)
 
         while True:
             execution.remaining()
-            runtime.progress(name, activity="model", model_phase="thinking")
+            runtime.progress(activation, activity="model", model_phase="thinking")
             response = task_runtime.generate(
                 messages, self.system, self.tools.definitions, on_progress=model_progress
             )
             execution.remaining()
             messages.append(response)
-            runtime.save_context(name, messages)
+            save_checkpoint()
             calls = response.get("tool_calls") or []
             if not calls:
                 final = response.get("content") or ""
@@ -288,7 +296,7 @@ class MemberAgent:
                 messages.append(
                     {"role": "user", "content": UNVERIFIED_NUDGE.format(problem=problem)}
                 )
-                runtime.save_context(name, messages)
+                save_checkpoint()
                 continue
             for call in calls:
                 execution.remaining()
@@ -299,12 +307,12 @@ class MemberAgent:
                 except ValueError:
                     arguments = {}
                 try:
-                    runtime.charge_tool_call(name)
+                    runtime.charge_tool_call(activation)
                 except TeamError as exc:
                     output = json.dumps(ToolResult.failure(exc.code, str(exc)).as_dict())
                 else:
                     runtime.progress(
-                        name,
+                        activation,
                         activity="tool",
                         tool=function.get("name"),
                         arguments=arguments if isinstance(arguments, dict) else {},
@@ -317,13 +325,13 @@ class MemberAgent:
                 messages.append(
                     {"role": "tool", "tool_call_id": call.get("id", ""), "content": output}
                 )
-                runtime.save_context(name, messages)
+                save_checkpoint()
                 decoded = json.loads(output)
                 acceptance.observe(call, decoded)
                 with trace_scope(execution.trace):
                     task_runtime.progress.observe(call, decoded)
                 runtime.progress(
-                    name,
+                    activation,
                     activity="tool_result",
                     tool=function.get("name"),
                     arguments=arguments if isinstance(arguments, dict) else {},

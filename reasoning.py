@@ -615,7 +615,7 @@ class ReasoningTools:
         *,
         _context: ExecutionContext,
     ) -> ToolResult:
-        execution = _context if timeout is None else _context.child(timeout)
+        execution = _context.cancellable_child(timeout)
         execution.remaining()
         reports: list[ToolResult | None] = [None] * len(tasks)
         transactions: list[FileTransaction | None] = [None] * len(tasks)

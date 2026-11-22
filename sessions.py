@@ -149,11 +149,8 @@ class SessionStore:
         snapshot = self.snapshot_path(data["session_id"])
         # Saved after every tool step: unindented JSON uses the C encoder, ~2x faster.
         content = json.dumps(data, ensure_ascii=False)
-        with self._locked():
-            if data["messages"] or data.get("goal") is not None:
-                self._write(snapshot, content)
-            self._write(self.active_file, content)
-            self._revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        snapshots = {snapshot: content} if data["messages"] or data.get("goal") is not None else {}
+        self._commit(content, snapshots)
 
     def transition(self, previous: dict, data: dict) -> None:
         content = json.dumps(data, ensure_ascii=False)
@@ -163,14 +160,19 @@ class SessionStore:
                 snapshots[self.snapshot_path(item["session_id"])] = json.dumps(
                     item, ensure_ascii=False
                 )
+        self._commit(content, snapshots)
+
+    def _commit(self, content: str, snapshots: dict[Path, str]) -> None:
         with self._locked():
-            originals = {
-                path: path.read_bytes().decode("utf-8") if path.exists() else None
-                for path in snapshots
-            }
+            originals = {}
             try:
-                for path, snapshot in snapshots.items():
-                    self._write(path, snapshot)
+                for path, snapshot_content in snapshots.items():
+                    try:
+                        original = path.read_bytes().decode("utf-8")
+                    except FileNotFoundError:
+                        original = None
+                    self._write(path, snapshot_content)
+                    originals[path] = original
                 self._write(self.active_file, content)
             except BaseException:
                 for path, original in originals.items():

@@ -880,6 +880,20 @@ class ManagerStartupTests(unittest.TestCase):
         self.assertEqual(sorted(self.opened), ["first", "second"])
         self.assertEqual(announced, ["first, second"])
 
+    def test_catalog_starts_and_queries_multiple_servers_concurrently(self):
+        both = asyncio.Event()
+
+        async def open_client(name):
+            if len(self.opened) == 2:
+                both.set()
+            await both.wait()
+
+        self.open_client = open_client
+        manager = self.manager("first", "second")
+        result = manager.search("*", None, 20, ExecutionContext(time.monotonic() + 2))
+        self.assertEqual(result.status, "ok", result)
+        self.assertEqual(sorted(self.opened), ["first", "second"])
+
     def test_start_all_returns_at_once_and_reports_each_failure_once(self):
         async def open_client(name):
             if name == "broken":

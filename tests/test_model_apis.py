@@ -690,6 +690,28 @@ class ModelApiTests(unittest.TestCase):
         msg_nonstream = client._read_nonstream_response(stream, obs)
         self.assertEqual(msg_nonstream["content"], "I refuse this task.")
 
+    def test_responses_recovers_text_from_completion_and_rejects_a_conflict(self):
+        for client in (ResponsesClient, ChatGPTClient):
+            for streamed in ("prefix", "different"):
+                item = {"type": "message", "id": "msg", "content": [
+                    {"type": "output_text", "text": "prefix and suffix"}
+                ]}
+                rows = [
+                    {"type": "response.output_text.delta", "item_id": "msg", "delta": streamed},
+                    {"type": "response.completed", "response": {"output": [item]}},
+                ]
+                with self.subTest(client=client.__name__, streamed=streamed):
+                    response = io.BytesIO(encode_sse(rows))
+                    if streamed == "different":
+                        with self.assertRaises(CompletionError) as error:
+                            client._read_stream(response, lambda _: None)
+                        self.assertEqual(error.exception.code, "invalid_response")
+                    else:
+                        shown = []
+                        answer = client._read_stream(response, shown.append)
+                        self.assertEqual(answer["content"], "prefix and suffix")
+                        self.assertEqual("".join(shown), answer["content"])
+
     def test_responses_malformed_refusal_is_rejected(self):
         bad_delta = [
             {"type": "response.refusal.delta", "output_index": 0, "delta": 123},

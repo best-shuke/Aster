@@ -11,7 +11,7 @@ def number(value):
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
-        and math.isfinite(value)
+        and (isinstance(value, int) or math.isfinite(value))
         and value >= 0
     )
 
@@ -37,10 +37,10 @@ class UsageAccumulator:
                 continue
             sources.append(choice.get("usage"))
             message = choice.get("delta") or choice.get("message") or {}
-            metadata = message.get("provider_metadata") or {}
-            self.provider.update(
-                {k: v for k, v in (metadata.get("deepseek") or {}).items() if v is not None}
-            )
+            metadata = message.get("provider_metadata") if isinstance(message, dict) else None
+            deepseek = metadata.get("deepseek") if isinstance(metadata, dict) else None
+            if isinstance(deepseek, dict):
+                self.provider.update({k: v for k, v in deepseek.items() if v is not None})
         for source in sources:
             if not isinstance(source, dict):
                 continue
@@ -51,12 +51,13 @@ class UsageAccumulator:
                         **(previous if isinstance(previous, dict) else {}),
                         **{k: v for k, v in value.items() if v is not None},
                     }
-                elif value is not None:
+                elif value is not None and key != "prompt_tokens_details":
                     self.usage[key] = value
 
     def result(self):
         usage = copy.deepcopy(self.usage)
-        details = usage.get("prompt_tokens_details") or {}
+        details = usage.get("prompt_tokens_details")
+        details = details if isinstance(details, dict) else {}
         hit = details.get("cached_tokens")
         if hit is None:
             hit = usage.get(
@@ -115,7 +116,8 @@ def usage_metrics(usages, calls):
     }
     cache_rows, writes, costs = [], [], []
     for usage in usages:
-        details = usage.get("prompt_tokens_details") or {}
+        details = usage.get("prompt_tokens_details")
+        details = details if isinstance(details, dict) else {}
         prompt, cached = usage.get("prompt_tokens"), details.get("cached_tokens")
         if number(prompt) and number(cached) and cached <= prompt:
             cache_rows.append((prompt, cached))

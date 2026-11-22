@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from config import CHATGPT_BASE_URL, Login
-from http_transport import build_no_redirect_opener
+from http_transport import TransportDeadline, build_no_redirect_opener, open_url
 from model_api import model_endpoint
 
 ISSUER = "https://auth.openai.com"
@@ -127,7 +127,9 @@ def _open(request: urllib.request.Request, timeout: float = HTTP_TIMEOUT_SECONDS
     return build_no_redirect_opener().open(request, timeout=timeout)
 
 
-def _post(url: str, fields: dict[str, str], *, form: bool = True) -> dict[str, Any]:
+def _post(
+    url: str, fields: dict[str, str], *, form: bool = True, deadline: float | None = None
+) -> dict[str, Any]:
     if form:
         data = urllib.parse.urlencode(fields).encode()
         content_type = "application/x-www-form-urlencoded"
@@ -140,7 +142,11 @@ def _post(url: str, fields: dict[str, str], *, form: bool = True) -> dict[str, A
         headers={"Content-Type": content_type, "User-Agent": USER_AGENT},
         method="POST",
     )
-    with _open(request) as response:
+    connection = (
+        _open(request) if deadline is None
+        else open_url(request, timeout=HTTP_TIMEOUT_SECONDS, deadline=deadline)
+    )
+    with connection as response:
         payload = json.load(response)
     if not isinstance(payload, dict):
         raise AuthError("ChatGPT 授权服务返回了无法识别的响应")
@@ -180,7 +186,7 @@ def exchange_code(code: str, verifier: str, redirect_uri: str) -> dict[str, Any]
     return account_tokens(payload)
 
 
-def refresh_tokens(tokens: dict[str, Any]) -> dict[str, Any]:
+def refresh_tokens(tokens: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
     try:
         payload = _post(
             TOKEN_URL,
@@ -189,12 +195,15 @@ def refresh_tokens(tokens: dict[str, Any]) -> dict[str, Any]:
                 "client_id": CLIENT_ID,
                 "refresh_token": tokens.get("refresh_token") or "",
             },
+            deadline=deadline,
         )
     except urllib.error.HTTPError as exc:
         reason = _oauth_error(exc)
         if exc.code in {400, 401, 403}:
             raise LoginExpired(f"ChatGPT 登录已失效（{reason}），请运行 /login 重新登录") from exc
         raise AuthError(f"刷新 ChatGPT 登录失败（{reason}）") from exc
+    except TransportDeadline:
+        raise
     except (OSError, ValueError) as exc:
         raise AuthError(f"无法连接 ChatGPT 授权服务：{exc}") from exc
     return account_tokens(payload, tokens)
@@ -472,11 +481,20 @@ class AuthStore:
             raise
 
     @contextlib.contextmanager
-    def locked(self):
+    def locked(self, check=None):
         """Serialize read-modify-write across Aster processes."""
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(self.path.with_name(self.path.name + ".lock"), "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            if check is None:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            else:
+                while True:
+                    check()
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.05)
             try:
                 yield
             finally:
@@ -558,29 +576,45 @@ class ChatGPTAccount:
     def _fresh(tokens: dict[str, Any]) -> bool:
         return tokens.get("expires_at", 0) - _now() > REFRESH_MARGIN_SECONDS
 
-    def credentials(self) -> tuple[str, str]:
+    @contextlib.contextmanager
+    def _credential_lock(self, check):
+        if check is None:
+            with self._lock:
+                yield
+            return
+        while not self._lock.acquire(timeout=0.05):
+            check()
+        try:
+            check()
+            yield
+        finally:
+            self._lock.release()
+
+    def credentials(self, *, check=None, deadline=None) -> tuple[str, str]:
         """(access token, account id), refreshed first when it is about to expire."""
-        with self._lock:
+        with self._credential_lock(check):
             tokens = self._tokens or self._saved()
             if not self._fresh(tokens):
-                tokens = self._refresh(tokens["access_token"])
+                tokens = self._refresh(tokens["access_token"], check=check, deadline=deadline)
             self._tokens = tokens
             return tokens["access_token"], tokens["account_id"]
 
-    def refresh(self, rejected_token: str) -> None:
+    def refresh(self, rejected_token: str, *, check=None, deadline=None) -> None:
         """Replace a token the backend rejected, unless another client already did."""
-        with self._lock:
-            self._tokens = self._refresh(rejected_token)
+        with self._credential_lock(check):
+            self._tokens = self._refresh(rejected_token, check=check, deadline=deadline)
 
-    def _refresh(self, rejected_token: str) -> dict[str, Any]:
-        with self.store.locked():
+    def _refresh(self, rejected_token: str, *, check=None, deadline=None) -> dict[str, Any]:
+        with self.store.locked(check):
             data = self.store.read()
             saved = data.get("chatgpt") or {}
             if not saved.get("refresh_token"):
                 raise LoginExpired("没有 ChatGPT 登录信息，请运行 /login 登录")
             if saved.get("access_token") != rejected_token and self._fresh(saved):
                 return saved  # Another client or process refreshed already.
-            tokens = refresh_tokens(saved)
+            if check is not None:
+                check()
+            tokens = refresh_tokens(saved, deadline=deadline)
             data["chatgpt"] = {**saved, **tokens}
             self.store.write(data)
             return data["chatgpt"]

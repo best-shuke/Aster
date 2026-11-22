@@ -41,6 +41,7 @@ class ProcessSession:
     lock: threading.RLock = field(default_factory=threading.RLock)
     watcher: threading.Thread | None = None
     source_checkpoint: dict | None = None
+    cleanup_error: str | None = None
 
     def terminate(self) -> None:
         with suppress(ProcessLookupError):
@@ -62,9 +63,15 @@ class ProcessSession:
                 self.process.wait()
         finally:
             # A shell exiting must not leave descendants using the session log.
-            self.terminate()
-            self.process.wait()
+            try:
+                self.terminate()
+                self.process.wait()
+            except OSError as exc:
+                cleanup_error = str(exc)
+            else:
+                cleanup_error = None
             with self.lock:
+                self.cleanup_error = cleanup_error
                 if self.process.stdin is not None:
                     self.process.stdin.close()
                 if self.state == "running":
@@ -94,6 +101,7 @@ class ProcessSession:
                 "duration_seconds": round((self.ended or time.monotonic()) - self.started, 3),
                 "timeout_seconds": self.timeout,
                 "artifact_path": str(self.path),
+                **({"cleanup_error": self.cleanup_error} if self.cleanup_error else {}),
             }
 
 
@@ -158,31 +166,31 @@ class ProcessMonitor:
             return self.sessions.get(session_id)
 
     @staticmethod
-    def read_output(session: ProcessSession, offset: int) -> tuple[str, int, bool]:
+    def read_output(session: ProcessSession, offset: int, *, finished: bool) -> tuple[str, int, bool]:
         with session.path.open("rb") as stream:
-            if offset > os.fstat(stream.fileno()).st_size:
+            size = os.fstat(stream.fileno()).st_size
+            if offset > size:
                 raise ValueError("offset exceeds the current output size")
             stream.seek(offset)
-            chunk = stream.read(PAGE_CHARS)
+            chunk = stream.read(min(PAGE_CHARS, size - offset))
             while True:
                 decoder = codecs.getincrementaldecoder("utf-8")("replace")
-                output = decoder.decode(
-                    chunk,
-                    final=session.done.is_set()
-                    and offset + len(chunk) >= os.fstat(stream.fileno()).st_size,
-                )
+                output = decoder.decode(chunk, final=finished and offset + len(chunk) >= size)
                 pending, _ = decoder.getstate()
                 if len(json.dumps(output, ensure_ascii=False)) <= PAGE_CHARS:
                     break
                 # Escaped control characters also count against the JSON budget.
                 chunk = chunk[: len(chunk) // 2]
             next_offset = offset + len(chunk) - len(pending)
-            more = next_offset < os.fstat(stream.fileno()).st_size - len(pending)
+            more = offset + len(chunk) < size
         return output, next_offset, more
 
     def result(self, session: ProcessSession, offset: int = 0, **details) -> ToolResult:
-        output, next_offset, more = self.read_output(session, offset)
+        # A terminal status must describe output read after the last writer has exited.
         data = session.metadata()
+        output, next_offset, more = self.read_output(
+            session, offset, finished=data["state"] != "running"
+        )
         data.update(output=output, next_offset=next_offset, has_more_output=more, **details)
         result = ToolResult(
             data=data,
@@ -198,6 +206,12 @@ class ProcessMonitor:
             result.error = {
                 "code": "nonzero_exit",
                 "message": f"Command exited with code {data['exit_code']}",
+            }
+        elif data.get("cleanup_error"):
+            result.status = "partial"
+            result.error = {
+                "code": "process_cleanup_failed",
+                "message": data["cleanup_error"],
             }
         return result
 

@@ -51,6 +51,19 @@ class SkillCatalogTests(unittest.TestCase):
         self.assertIn(str(path), prompt)
         self.assertNotIn("PRIVATE FULL INSTRUCTIONS", prompt)
 
+    def test_discovery_reads_only_the_header_and_invocation_reads_the_body(self):
+        path = self.create_skill(self.program_skills, "bounded", "Description.", "")
+        header = path.read_text(encoding="utf-8").strip() + "\n"
+        body = "Large body.\n" * 10_000
+        discovery, invocation = (io.StringIO(header + body) for _ in range(2))
+        with (
+            patch.object(Path, "open", side_effect=[discovery, invocation]),
+            patch.object(discovery, "close"),
+        ):
+            catalog = SkillCatalog(self.workspace, self.program_skills)
+            self.assertEqual(discovery.tell(), len(header))
+            self.assertIn(body.strip(), catalog.expand_command("/skill:bounded"))
+
     def test_explicit_command_loads_body_and_appends_arguments(self):
         self.create_skill(
             self.program_skills,

@@ -501,7 +501,8 @@ def use_workflow(
 ) -> None:
     usage = (
         "用法：/workflow [编号|名称] [本次任务补充]、/workflow new [名称]、"
-        "/workflow add 文件 [名称]、/workflow show 编号|名称"
+        "/workflow add 文件 [名称]、/workflow show 编号|名称、"
+        "/workflow run 编号|名称 [本次任务补充]"
     )
     try:
         if arguments and arguments[0] == "new":
@@ -522,6 +523,8 @@ def use_workflow(
         if show_only:
             if len(arguments) != 2:
                 raise ValueError(usage)
+            arguments = arguments[1:]
+        elif len(arguments) > 1 and arguments[0] == "run":
             arguments = arguments[1:]
         workflows = conversation.workflows.list()
         for diagnostic in conversation.workflows.diagnostics:

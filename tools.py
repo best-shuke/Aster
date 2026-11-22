@@ -623,7 +623,6 @@ class CodingTools:
         snapshot.processes = self.processes
         snapshot._file_versions = self._file_versions
         snapshot.worker_status = self.worker_status
-        snapshot.edit_ledger = self.edit_ledger
         snapshot.apply_configuration(self)
         if registry is not None:
             snapshot.registry = self._registry_for(snapshot, registry)
@@ -640,6 +639,7 @@ class CodingTools:
         self.worker_instructions = other.worker_instructions
         self.cache_scope = other.cache_scope
         self.role_loader = other.role_loader
+        self.edit_ledger = other.edit_ledger
         self._global_worker_slots = other._global_worker_slots
         self._global_worker_limit = other._global_worker_limit
         self._worker_slots_initialized = other._worker_slots_initialized

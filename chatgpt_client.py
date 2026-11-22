@@ -10,11 +10,12 @@ import uuid
 from contextlib import suppress
 from typing import Any
 
-from auth import USER_AGENT, AuthError, LoginExpired, chatgpt_account
+from auth import HTTP_TIMEOUT_SECONDS, USER_AGENT, AuthError, LoginExpired, chatgpt_account
 from config import auth_file, parse_reasoning_effort
 from context_budget import wire_messages
 from contracts import Message
 from deepseek_client import CompletionError
+from http_transport import TransportDeadline
 from model_api import protocol_origin
 from model_messages import protocol_messages
 from model_rate_limit import retry_after_seconds
@@ -165,7 +166,8 @@ class ChatGPTClient(ResponsesClient):
 
     def _http_request(self, body: dict[str, Any]) -> urllib.request.Request:
         try:
-            token, account_id = self.account.credentials()
+            auth_options = getattr(self._local, "auth_options", {})
+            token, account_id = self.account.credentials(**auth_options)
         except LoginExpired as exc:
             raise CompletionError("auth_error", str(exc)) from exc
         except AuthError as exc:
@@ -185,21 +187,63 @@ class ChatGPTClient(ResponsesClient):
             method="POST",
         )
 
-    def _complete_once(self, messages, *args, **kwargs) -> Message:
+    def _complete_once(self, messages, tools=None, on_content=None, timeout=180, **kwargs) -> Message:
+        generation_timeout = kwargs.get("generation_timeout")
+        if generation_timeout is None:
+            generation_timeout = getattr(self.settings, "generation_timeout_seconds", None)
+        now = time.monotonic()
+        generation_deadline = now + generation_timeout if generation_timeout else None
+        task_deadline = min(
+            (value for value in (kwargs.get("deadline"), self.deadline) if value is not None),
+            default=None,
+        )
+        cancelled = kwargs.get("cancelled") or threading.Event()
+        auth_deadline = None
+
+        def check():
+            remaining = self._attempt_budget(cancelled, task_deadline, generation_deadline)
+            if auth_deadline is not None and time.monotonic() >= auth_deadline:
+                raise CompletionError("auth_error", "ChatGPT 登录验证超时", retryable=True)
+            return remaining
+
+        def configure_auth():
+            nonlocal auth_deadline
+            auth_deadline = min(
+                value
+                for value in (
+                    time.monotonic() + min(timeout, HTTP_TIMEOUT_SECONDS),
+                    task_deadline,
+                    generation_deadline,
+                )
+                if value is not None
+            )
+            self._local.auth_options = {"check": check, "deadline": auth_deadline}
+
         self._local.token = None
         try:
-            return super()._complete_once(messages, *args, **kwargs)
-        except CompletionError as exc:
-            rejected = self._local.token
-            if exc.code != "http_401" or rejected is None:
-                raise
-        try:
-            self.account.refresh(rejected)
-        except LoginExpired as exc:
-            raise CompletionError("auth_error", str(exc)) from exc
-        except AuthError as exc:
-            raise CompletionError("auth_error", str(exc), retryable=True) from exc
-        return super()._complete_once(messages, *args, **kwargs)
+            try:
+                configure_auth()
+                kwargs["generation_timeout"] = check()
+                return super()._complete_once(messages, tools, on_content, timeout, **kwargs)
+            except CompletionError as exc:
+                rejected = self._local.token
+                if exc.code != "http_401" or rejected is None:
+                    raise
+            try:
+                configure_auth()
+                check()
+                self.account.refresh(rejected, **self._local.auth_options)
+            except LoginExpired as exc:
+                raise CompletionError("auth_error", str(exc)) from exc
+            except AuthError as exc:
+                raise CompletionError("auth_error", str(exc), retryable=True) from exc
+            kwargs["generation_timeout"] = check()
+            return super()._complete_once(messages, tools, on_content, timeout, **kwargs)
+        except TransportDeadline as exc:
+            check()
+            raise CompletionError("auth_error", "ChatGPT 登录验证超时", retryable=True) from exc
+        finally:
+            self._local.auth_options = {}
 
     def _http_error(self, exc: urllib.error.HTTPError) -> CompletionError:
         return http_error(exc)

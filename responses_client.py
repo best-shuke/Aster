@@ -39,6 +39,14 @@ class ResponsesClient(DeepSeekClient):
             if events.reasoning:
                 state.metadata[REASONING_KEY] = list(events.reasoning)
             if events.done:
+                if events.message_content is not None:
+                    streamed = "".join(state.content)
+                    if events.message_content.startswith(streamed):
+                        suffix = events.message_content[len(streamed) :]
+                        if suffix:
+                            state.add_payload({"choices": [{"delta": {"content": suffix}}]})
+                    elif events.message_content != streamed:
+                        state.content[:] = [events.message_content]
                 state.saw_done = True
                 break
         if not events.done:

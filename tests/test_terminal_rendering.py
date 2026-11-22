@@ -172,6 +172,18 @@ class TerminalRenderingTests(unittest.TestCase):
         self.assertNotIn("\x1b[2K", output)
         self.assertEqual(self.live._live_render.last_render_height, 1)
 
+    def test_unaccepted_preview_can_be_replaced_without_spilling_into_scrollback(self):
+        body = [[Segment(f"preview-{index:02d}")] for index in range(30)]
+        display = StreamingDisplay(body, Text("任务状态"), key=1, height=12, spill=False)
+        first = self.refresh(display)
+        self.assertNotIn("preview-00", first)
+        self.assertIn("preview-29", first)
+        self.clear_output()
+        self.live.update(Text("任务状态"))
+        self.live.finish_stream(display)
+        output = self.output.getvalue()
+        self.assertEqual(output.count("preview-00"), 1)
+
     def test_resize_reflows_the_live_tail_without_repeating_older_history(self):
         source = Group(*(Text(f"row-{index:02d} " + "x" * 72) for index in range(40)))
 

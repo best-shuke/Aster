@@ -189,7 +189,12 @@ class TeamTool:
                     "main_only", f"team action={action} is for the main agent. {guidance}"
                 )
             method = getattr(self.runtime, f"act_{action}")
-            data = method(self.actor, self.activation, _context=_context, **arguments)
+            if self.actor == MAIN:
+                data = method(self.actor, self.activation, _context=_context, **arguments)
+            else:
+                with self.runtime.lock:
+                    _context.remaining()
+                    data = method(self.actor, self.activation, _context=_context, **arguments)
             return ToolResult(data=data)
         except TeamError as exc:
             return ToolResult.failure(exc.code, str(exc), data=exc.data)

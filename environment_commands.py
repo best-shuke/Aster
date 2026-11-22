@@ -318,9 +318,7 @@ class EnvironmentCommands:
             server = parse_server_options(
                 ["--env" if option == "--set-env" else option for option in options]
             )
-            result = self.editor.define_mcp_server(selector, name, server)
-            if tools or deny:
-                result = self.editor.edit_mcp(selector, "tools", name, tools=tools, deny=deny)
+            result = self.editor.define_mcp_server(selector, name, server, tools=tools, deny=deny)
             return self.applied(result, f"已在环境 MCP 文件中定义并启用服务 {name}。")
         if action == "tools":
             tools = [*options, *(tools or [])]

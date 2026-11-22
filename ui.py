@@ -638,6 +638,7 @@ class Console:
         self._response_number = 0
         self._tool_count = 0
         self._tool_errors = 0
+        self.error_count = 0
         self._preview_content: list[str] = []
         self._preview_reasoning: list[str] = []
         self._preview_cache: dict[str, tuple[str, int, list[list[Segment]]]] = {}
@@ -1970,9 +1971,12 @@ class Console:
             dashboard,
             height,
             response_number=response_number,
+            spill=False,
         )
 
-    def _response_display(self, content, reasoning, dashboard, height, *, response_number=None):
+    def _response_display(
+        self, content, reasoning, dashboard, height, *, response_number=None, spill=True
+    ):
         if response_number is None:
             response_number = self._response_number
         console = self._rich()
@@ -1984,7 +1988,7 @@ class Console:
         if key in cache:
             body, lengths = cache[key]
             return StreamingDisplay(
-                body, dashboard, key=response_number, height=height, row_lengths=lengths
+                body, dashboard, key=response_number, height=height, row_lengths=lengths, spill=spill
             )
         sections = [Text("")]
         if reasoning:
@@ -2013,7 +2017,7 @@ class Console:
         cache.clear()
         cache[key] = (body, lengths)
         return StreamingDisplay(
-            body, dashboard, key=response_number, height=height, row_lengths=lengths
+            body, dashboard, key=response_number, height=height, row_lengths=lengths, spill=spill
         )
 
     def task_update(self, event: dict[str, Any]) -> None:
@@ -2702,6 +2706,7 @@ class Console:
         print(self.style(self._notice("✓", message), GREEN))
 
     def error(self, error: Exception) -> None:
+        self.error_count += 1
         self._clear_status()
         text = self.style("\n" + self._notice("✗", error), RED)
         if self._screen_active:

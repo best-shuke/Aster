@@ -35,6 +35,26 @@ class CliBrandingTests(unittest.TestCase):
         self.assertNotIn("DeepSeek coding agent", output.getvalue())
         settings.assert_not_called()
 
+    def test_one_shot_command_reports_parse_and_execution_failures(self):
+        settings = Mock(mcp_enabled=False, websearch_enabled=False, skills_enabled=False)
+        for prompt, expected in (('/workflow "unterminated', 2), ("/new", 1)):
+            with (
+                self.subTest(prompt=prompt),
+                patch("main.load_settings", return_value=settings),
+                patch("main.Console") as console,
+                patch("main.Conversation") as conversation,
+                patch("main.SkillCatalog"),
+                patch("main.model_client"),
+                patch("main.CodingTools"),
+                patch("main.ask") as ask_task,
+                patch("sys.argv", ["main.py", prompt]),
+            ):
+                console.return_value.interactive = False
+                conversation.return_value.clear.side_effect = OSError("disk full")
+                self.assertEqual(main(), expected)
+                console.return_value.error.assert_called_once()
+                ask_task.assert_not_called()
+
 
 class SessionCommandTests(unittest.TestCase):
     def test_new_and_clear_start_a_clean_conversation_and_ui(self):
