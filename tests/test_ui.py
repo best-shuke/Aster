@@ -2222,6 +2222,20 @@ class ReadableOutputTests(unittest.TestCase):
             self.assertIn("优化终端主界面排版与窄屏显示体验以及状态显示", first_line)
             self.assertIn("运行中 · 20s", first_line)
 
+    def test_compact_plan_title_keeps_elapsed_time_on_the_first_line(self):
+        console = self.console()
+        console._task_state = "running"
+        console._task_elapsed = 20.0
+        for whitespace in ("\t", "\n"):
+            with self.subTest(whitespace=whitespace):
+                title = f"setup{whitespace}{'x' * 70}"
+                with patch.object(console, "interactive", True):
+                    console.task_update({"phase": "plan", "title": title, "steps": []})
+                output = self.render(lambda: console._rich().print(console._dashboard()), width=80)
+                first_line = output.splitlines()[0]
+                self.assertIn("setup x", first_line)
+                self.assertTrue(first_line.endswith("运行中 · 20s"))
+
     def test_narrow_toolbar_prioritizes_mcp_failure_and_team_background(self):
         console = self.console()
         console.environment_name = "default"
@@ -2244,3 +2258,31 @@ class ReadableOutputTests(unittest.TestCase):
                 self.assertIn("团队后台 1 人工作中", toolbar)
                 self.assertIn("CTX 95k/100k", toolbar)
                 self.assertTrue(all(_display_width(line) < width for line in toolbar.splitlines()))
+
+    def test_narrow_toolbar_keeps_failure_count_from_live_mcp_summary(self):
+        console = self.console()
+        console.mcp_provider = lambda: [
+            {"status": status} for status in ("connected", "connecting", "failed")
+        ]
+        for width, summary in ((24, "MCP 1 失败"), (44, "MCP 已连接 1/3 · 1 连接中 · 1 失败")):
+            with (
+                self.subTest(width=width),
+                patch.object(console, "terminal_width", return_value=width),
+            ):
+                fragments = console._toolbar_fragments()
+                self.assertIn(("class:toolbar.warn", summary), fragments)
+                toolbar = "".join(text for _, text in fragments)
+                self.assertTrue(all(_display_width(line) < width for line in toolbar.splitlines()))
+
+    def test_toolbar_wraps_before_truncating_team_work_status(self):
+        console = self.console()
+        console.environment_name = "default"
+        for width, unread in ((35, 0), (24, 1)):
+            console.update_team({"background": "running", "working": ["worker1"], "unread": unread})
+            with (
+                self.subTest(width=width),
+                patch.object(console, "terminal_width", return_value=width),
+            ):
+                self.assertIn(
+                    ("class:toolbar.accent", "团队后台 1 人工作中"), console._toolbar_fragments()
+                )

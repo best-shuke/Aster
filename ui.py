@@ -779,15 +779,24 @@ class Console:
             environment += f"（上次 {self.last_environment_name}）"
         # (priority, segments); a lower priority number is kept longer.
         team = self._team_label()
-        mcp_failed = "失败" in self.mcp_status or "错误" in self.mcp_status
-        mcp_idle = self.mcp_status in {"关闭", "未配置"}
+        if _display_width(team) > width:
+            team = team.partition(" · ")[0]
+        mcp_status = self.mcp_status
+        mcp_failed = "失败" in mcp_status or "错误" in mcp_status
+        mcp_idle = mcp_status in {"关闭", "未配置"}
         environment_segments = [("", environment)]
         team_segments = [("class:toolbar.accent", team)]
         items: list[tuple[int, list[tuple[str, str]]]] = [(0, environment_segments)]
         if team:
             items.append((0, team_segments))
         if mcp_failed:
-            items.append((1, [("class:toolbar.warn", f"MCP {self.mcp_status}")]))
+            label = f"MCP {mcp_status}"
+            if _display_width(label) > width:
+                failure = next(
+                    part for part in mcp_status.split(" · ") if "失败" in part or "错误" in part
+                )
+                label = f"MCP {failure}"
+            items.append((1, [("class:toolbar.warn", label)]))
         items.append((3, [("class:toolbar.strong", self.model.rsplit("/", 1)[-1])]))
         items.append((5, [("", f"推理 {self.reasoning_effort}")]))
         if self._context:
@@ -816,7 +825,7 @@ class Console:
             items.append(
                 (
                     8 if mcp_idle else 4,
-                    [("", f"MCP {self.mcp_status}")],
+                    [("", f"MCP {mcp_status}")],
                 )
             )
         branch = _git_branch(self.workspace)
@@ -835,17 +844,14 @@ class Console:
             if visible[drop][0] <= 2:
                 break
             visible.pop(drop)
-        # Shorten the flexible names before moving complete status items to another row.
-        for segments, minimum in ((environment_segments, 6), (team_segments, 16)):
-            excess = measure(visible) - width
-            if excess <= 0:
-                break
-            style, text = segments[0]
-            segments[0] = (style, _ellipsize(text, max(minimum, _display_width(text) - excess)))
-        if measure(visible) > width:
-            environment_segments[0] = ("", environment)
-            team_segments[0] = ("class:toolbar.accent", team)
-            visible.sort(key=lambda entry: entry[1] is environment_segments)
+        excess = measure(visible) - width
+        if excess > 0:
+            environment_room = _display_width(environment) - excess
+            if environment_room >= 6:
+                environment_segments[0] = ("", _ellipsize(environment, environment_room))
+            else:
+                # Keep operational statuses together and put the environment last when wrapping.
+                visible.sort(key=lambda entry: entry[1] is environment_segments)
 
         fragments: list[tuple[str, str]] = []
         used = 0
@@ -1689,7 +1695,8 @@ class Console:
             title_width = max(1, width - _display_width(status) - 7)
             marker = _TASK_MARKERS.get(self._task_state, "◇")
             heading = Text(f"  {marker} ", style=style)
-            heading.append(_ellipsize(self._task_title or "当前任务", title_width), style="bold")
+            title = " ".join(self._task_title.split()) or "当前任务"
+            heading.append(_ellipsize(title, title_width), style="bold")
             gap = max(2, width - 1 - heading.cell_len - _display_width(status))
             heading.append(" " * gap)
             heading.append(status, style=style)
