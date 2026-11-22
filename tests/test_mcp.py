@@ -864,13 +864,14 @@ class ManagerStartupTests(unittest.TestCase):
         return manager
 
     def test_connect_all_starts_servers_concurrently(self):
-        both = asyncio.Event()
+        both = threading.Event()
 
         async def open_client(name):
             # Each server waits for the other to start; one at a time would time out.
             if len(self.opened) == 2:
                 both.set()
-            await both.wait()
+            while not both.is_set():
+                await asyncio.sleep(0.005)
 
         self.open_client = open_client
         manager = self.manager("first", "second")
@@ -881,12 +882,13 @@ class ManagerStartupTests(unittest.TestCase):
         self.assertEqual(announced, ["first, second"])
 
     def test_catalog_starts_and_queries_multiple_servers_concurrently(self):
-        both = asyncio.Event()
+        both = threading.Event()
 
         async def open_client(name):
             if len(self.opened) == 2:
                 both.set()
-            await both.wait()
+            while not both.is_set():
+                await asyncio.sleep(0.005)
 
         self.open_client = open_client
         manager = self.manager("first", "second")

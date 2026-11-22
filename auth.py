@@ -128,7 +128,8 @@ def _open(request: urllib.request.Request, timeout: float = HTTP_TIMEOUT_SECONDS
 
 
 def _post(
-    url: str, fields: dict[str, str], *, form: bool = True, deadline: float | None = None
+    url: str, fields: dict[str, str], *, form: bool = True, deadline: float | None = None,
+    cancelled: threading.Event | None = None,
 ) -> dict[str, Any]:
     if form:
         data = urllib.parse.urlencode(fields).encode()
@@ -143,8 +144,8 @@ def _post(
         method="POST",
     )
     connection = (
-        _open(request) if deadline is None
-        else open_url(request, timeout=HTTP_TIMEOUT_SECONDS, deadline=deadline)
+        _open(request) if deadline is None and cancelled is None
+        else open_url(request, timeout=HTTP_TIMEOUT_SECONDS, deadline=deadline, cancelled=cancelled)
     )
     with connection as response:
         payload = json.load(response)
@@ -186,7 +187,10 @@ def exchange_code(code: str, verifier: str, redirect_uri: str) -> dict[str, Any]
     return account_tokens(payload)
 
 
-def refresh_tokens(tokens: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
+def refresh_tokens(
+    tokens: dict[str, Any], *, deadline: float | None = None,
+    cancelled: threading.Event | None = None,
+) -> dict[str, Any]:
     try:
         payload = _post(
             TOKEN_URL,
@@ -196,6 +200,7 @@ def refresh_tokens(tokens: dict[str, Any], *, deadline: float | None = None) -> 
                 "refresh_token": tokens.get("refresh_token") or "",
             },
             deadline=deadline,
+            cancelled=cancelled,
         )
     except urllib.error.HTTPError as exc:
         reason = _oauth_error(exc)
@@ -590,21 +595,25 @@ class ChatGPTAccount:
         finally:
             self._lock.release()
 
-    def credentials(self, *, check=None, deadline=None) -> tuple[str, str]:
+    def credentials(self, *, check=None, deadline=None, cancelled=None) -> tuple[str, str]:
         """(access token, account id), refreshed first when it is about to expire."""
         with self._credential_lock(check):
             tokens = self._tokens or self._saved()
             if not self._fresh(tokens):
-                tokens = self._refresh(tokens["access_token"], check=check, deadline=deadline)
+                tokens = self._refresh(
+                    tokens["access_token"], check=check, deadline=deadline, cancelled=cancelled,
+                )
             self._tokens = tokens
             return tokens["access_token"], tokens["account_id"]
 
-    def refresh(self, rejected_token: str, *, check=None, deadline=None) -> None:
+    def refresh(self, rejected_token: str, *, check=None, deadline=None, cancelled=None) -> None:
         """Replace a token the backend rejected, unless another client already did."""
         with self._credential_lock(check):
-            self._tokens = self._refresh(rejected_token, check=check, deadline=deadline)
+            self._tokens = self._refresh(
+                rejected_token, check=check, deadline=deadline, cancelled=cancelled,
+            )
 
-    def _refresh(self, rejected_token: str, *, check=None, deadline=None) -> dict[str, Any]:
+    def _refresh(self, rejected_token: str, *, check=None, deadline=None, cancelled=None) -> dict[str, Any]:
         with self.store.locked(check):
             data = self.store.read()
             saved = data.get("chatgpt") or {}
@@ -614,7 +623,7 @@ class ChatGPTAccount:
                 return saved  # Another client or process refreshed already.
             if check is not None:
                 check()
-            tokens = refresh_tokens(saved, deadline=deadline)
+            tokens = refresh_tokens(saved, deadline=deadline, cancelled=cancelled)
             data["chatgpt"] = {**saved, **tokens}
             self.store.write(data)
             return data["chatgpt"]

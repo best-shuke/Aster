@@ -15,7 +15,7 @@ from config import auth_file, parse_reasoning_effort
 from context_budget import wire_messages
 from contracts import Message
 from deepseek_client import CompletionError
-from http_transport import TransportDeadline
+from http_transport import TransportCancelled, TransportDeadline
 from model_api import protocol_origin
 from model_messages import protocol_messages
 from model_rate_limit import retry_after_seconds
@@ -192,7 +192,10 @@ class ChatGPTClient(ResponsesClient):
         if generation_timeout is None:
             generation_timeout = getattr(self.settings, "generation_timeout_seconds", None)
         now = time.monotonic()
-        generation_deadline = now + generation_timeout if generation_timeout else None
+        generation_deadline = kwargs.get("_generation_deadline")
+        if generation_deadline is None and generation_timeout:
+            generation_deadline = now + generation_timeout
+            kwargs["_generation_deadline"] = generation_deadline
         task_deadline = min(
             (value for value in (kwargs.get("deadline"), self.deadline) if value is not None),
             default=None,
@@ -217,7 +220,9 @@ class ChatGPTClient(ResponsesClient):
                 )
                 if value is not None
             )
-            self._local.auth_options = {"check": check, "deadline": auth_deadline}
+            self._local.auth_options = {
+                "check": check, "deadline": auth_deadline, "cancelled": cancelled,
+            }
 
         self._local.token = None
         try:
@@ -239,6 +244,8 @@ class ChatGPTClient(ResponsesClient):
                 raise CompletionError("auth_error", str(exc), retryable=True) from exc
             kwargs["generation_timeout"] = check()
             return super()._complete_once(messages, tools, on_content, timeout, **kwargs)
+        except TransportCancelled as exc:
+            raise CompletionError("cancelled", "Model request cancelled during login") from exc
         except TransportDeadline as exc:
             check()
             raise CompletionError("auth_error", "ChatGPT 登录验证超时", retryable=True) from exc

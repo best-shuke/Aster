@@ -764,6 +764,42 @@ class ModelApiTests(unittest.TestCase):
 class ResponsesIdentityTests(unittest.TestCase):
     clients = (ResponsesClient, ChatGPTClient)
 
+    def test_completed_snapshot_reorders_text_and_matches_nonstream_and_callback(self):
+        output = [
+            {"type": "message", "id": item, "content": [{"type": "output_text", "text": label}]}
+            for item, label in (("first", "First."), ("second", "Second."))
+        ]
+        payload = {"status": "completed", "output": output}
+        rows = [
+            {"type": "response.output_text.delta", "item_id": "second", "delta": "Second."},
+            {"type": "response.output_text.delta", "item_id": "first", "delta": "First"},
+            {"type": "response.completed", "response": payload},
+        ]
+        for client in self.clients:
+            shown = []
+            result = client._read_stream(io.BytesIO(encode_sse(rows)), shown.append)
+            self.assertEqual(result["content"], "First.\n\nSecond.")
+            self.assertEqual("".join(shown), result["content"])
+        nonstream = object.__new__(ResponsesClient)._read_nonstream_response(
+            io.BytesIO(json.dumps(payload).encode()), UsageAccumulator()
+        )
+        self.assertEqual(nonstream["content"], result["content"])
+
+    def test_anonymous_delta_is_checked_against_final_snapshot(self):
+        item = {"type": "message", "content": [{"type": "output_text", "text": "Complete."}]}
+        rows = [
+            {"type": "response.output_text.delta", "delta": "Complete"},
+            {"type": "response.completed", "response": {"output": [item]}},
+        ]
+        shown = []
+        result = ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), shown.append)
+        self.assertEqual("".join(shown), "Complete.")
+        self.assertEqual(result["content"], "Complete.")
+        rows[0]["delta"] = "Inconsistent"
+        with self.assertRaises(CompletionError) as caught:
+            ResponsesClient._read_stream(io.BytesIO(encode_sse(rows)), lambda _: None)
+        self.assertEqual(caught.exception.code, "invalid_response")
+
     def test_reversed_done_only_calls_match_final_output_by_identity(self):
         calls = [
             {"type": "function_call", "id": f"fc_{i}", "call_id": f"call_{i}",

@@ -168,7 +168,7 @@ class SessionStore:
             try:
                 for path, snapshot_content in snapshots.items():
                     try:
-                        original = path.read_bytes().decode("utf-8")
+                        original = path.read_bytes().decode("utf-8", errors="surrogateescape")
                     except FileNotFoundError:
                         original = None
                     self._write(path, snapshot_content)
@@ -179,7 +179,7 @@ class SessionStore:
                     if original is None:
                         path.unlink(missing_ok=True)
                     else:
-                        atomic_write_text(path, original)
+                        atomic_write_text(path, original, errors="surrogateescape")
                 raise
             self._revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
 

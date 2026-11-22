@@ -230,6 +230,7 @@ class ModelRequestRunner:
                     on_content=chunks.append if on_content is not None else None,
                     timeout=timeout, deadline=deadline, generation_timeout=generation_remaining,
                     purpose=purpose, cancelled=cancelled, on_progress=on_progress, _admission=admission,
+                    _generation_deadline=generation_deadline,
                 )
                 self.request_gate.accepted(admission)
             except CompletionError as exc:
@@ -303,23 +304,31 @@ class ModelRequestRunner:
         timeout: float,
         generation_timeout: float | None,
         deadline: float | None,
+        generation_deadline: float | None = None,
     ) -> tuple[float | None, float | None, float, float | None]:
         generation_seconds = (
             generation_timeout
             if generation_timeout is not None
             else getattr(self.settings, "generation_timeout_seconds", None)
         )
-        generation_deadline = time.monotonic() + generation_seconds if generation_seconds else None
+        now = time.monotonic()
+        if generation_deadline is None and generation_seconds:
+            generation_deadline = now + generation_seconds
         deadlines = [d for d in (deadline, getattr(self, "deadline", None)) if d is not None]
         effective_deadline = min(deadlines) if deadlines else None
         remaining = min(
             timeout,
-            generation_seconds or float("inf"),
-            effective_deadline - time.monotonic()
+            generation_deadline - now if generation_deadline is not None else float("inf"),
+            effective_deadline - now
             if effective_deadline is not None
             else float("inf"),
         )
         if remaining <= 0:
+            if (
+                (effective_deadline is None or now < effective_deadline)
+                and generation_deadline is not None and now >= generation_deadline
+            ):
+                raise CompletionError("generation_budget", "Generation budget reached before request")
             raise CompletionError("task_deadline", "Task deadline reached before model request")
         io_deadlines = [d for d in (effective_deadline, generation_deadline) if d is not None]
         io_deadline = min(io_deadlines) if io_deadlines else None
@@ -395,10 +404,11 @@ class ModelRequestRunner:
         cancelled: threading.Event | None = None,
         on_progress: ProgressCallback | None = None,
         _admission=None,
+        _generation_deadline=None,
     ) -> Message:
         cache_stats = self.cache_stats
         generation_deadline, effective_deadline, remaining, io_deadline = self._request_timing(
-            timeout, generation_timeout, deadline
+            timeout, generation_timeout, deadline, _generation_deadline
         )
         body = self._request_body(messages, tools, on_content is not None, max_output_tokens)
         system_fingerprint = self._system_fingerprint(body)

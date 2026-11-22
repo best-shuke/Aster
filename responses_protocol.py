@@ -360,6 +360,7 @@ class _ResponsesEvents:
 
     def _completed_content(self, output_items: list) -> None:
         paragraphs = []
+        text_keys, refusal_keys = set(), set()
         for index, item in enumerate(output_items):
             if not isinstance(item, dict) or item.get("type") not in {"message", "refusal"}:
                 continue
@@ -375,9 +376,11 @@ class _ResponsesEvents:
                     continue
                 key = self._refusal_key({"output_index": index}, item, content_index)
                 if kind == "output_text":
+                    text_keys.add(key)
                     text = part.get("text")
                     streamed = "".join(self.text_blocks.get(key, ()))
                 else:
+                    refusal_keys.add(key)
                     text = part.get("refusal", part.get("text"))
                     streamed = self.refusal_blocks.get(key, "")
                 if not isinstance(text, str) or not text.startswith(streamed):
@@ -388,8 +391,12 @@ class _ResponsesEvents:
                 paragraph.append(text)
             if paragraph:
                 paragraphs.append("".join(paragraph))
-        if paragraphs:
-            self.message_content = "\n\n".join(paragraphs)
+        if self.text_blocks.keys() - text_keys or self.refusal_blocks.keys() - refusal_keys:
+            raise CompletionError(
+                "invalid_response", "Completed response omitted a streamed text block",
+                retryable=True,
+            )
+        self.message_content = "\n\n".join(paragraphs)
 
     def chunks(self, event: Any) -> list[dict[str, Any]]:
         if not isinstance(event, dict):
@@ -588,7 +595,7 @@ class _ResponsesEvents:
                             "Completed response tool differs from finalized tool",
                             retryable=True,
                         )
-                if not self.anonymous_text:
+                if output_items:
                     self._completed_content(output_items)
             self.done = True
             finish = "tool_calls" if self.tools else "stop"

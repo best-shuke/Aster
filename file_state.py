@@ -163,17 +163,21 @@ def file_digest(path: Path, check=None) -> str | None:
         return None
 
 
-def atomic_write_text(path: Path, content: str, *, expected=_UNSPECIFIED, check=None) -> None:
+def atomic_write_text(
+    path: Path, content: str, *, expected=_UNSPECIFIED, check=None, errors="strict"
+) -> None:
     with file_lock(path, check):
-        _atomic_write_text(path, content, expected=expected, check=check)
+        _atomic_write_text(path, content, expected=expected, check=check, errors=errors)
 
 
-def _atomic_write_text(path: Path, content: str, *, expected=_UNSPECIFIED, check=None) -> None:
+def _atomic_write_text(
+    path: Path, content: str, *, expected=_UNSPECIFIED, check=None, errors="strict"
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
-        with temporary.open("x", encoding="utf-8", newline="") as stream:
+        with temporary.open("x", encoding="utf-8", errors=errors, newline="") as stream:
             if check:
                 check()
             stream.write(content)

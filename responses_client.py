@@ -26,6 +26,8 @@ class ResponsesClient(DeepSeekClient):
         cls, response, state, deadline, generation_deadline, on_usage, metrics=None
     ) -> None:
         events = _ResponsesEvents()
+        publish_content = state.on_content
+        state.on_content = lambda _: None
         for event in sse_events(
             response,
             lambda: cls._check_stream_deadline(deadline, generation_deadline, state.finish_reason),
@@ -45,9 +47,17 @@ class ResponsesClient(DeepSeekClient):
                         suffix = events.message_content[len(streamed) :]
                         if suffix:
                             state.add_payload({"choices": [{"delta": {"content": suffix}}]})
-                    elif events.message_content != streamed:
+                    elif events.anonymous_text:
+                        raise CompletionError(
+                            "invalid_response", "Completed text differs from streamed text",
+                            retryable=True,
+                        )
+                    else:
                         state.content[:] = [events.message_content]
                 state.saw_done = True
+                if state.finish_reason in {"stop", "tool_calls"}:
+                    for fragment in state.content:
+                        publish_content(fragment)
                 break
         if not events.done:
             raise CompletionError(
@@ -125,6 +135,8 @@ class ResponsesClient(DeepSeekClient):
         for chunk in events.chunks({"type": terminal, "response": payload}):
             observed.add(chunk)
             state.add_payload(chunk)
+        if events.message_content is not None:
+            state.content[:] = [events.message_content]
         state.metadata[REASONING_KEY] = events.reasoning
         state.saw_done = events.done
         return state.finish()

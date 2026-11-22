@@ -289,7 +289,7 @@ class MemberAgent:
                     if acceptance.failed_verifications
                     else "no passing standalone check followed its last edit"
                 )
-                final += UNVERIFIED_NOTE.format(name=name, reason=reason)
+                final += UNVERIFIED_NOTE.format(name=activation.agent, reason=reason)
                 if self.set_aside is not None:
                     return self.Result("ok", final)
                 self.set_aside = final

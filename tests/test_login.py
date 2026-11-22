@@ -23,6 +23,7 @@ from config import CHATGPT_BASE_URL, Login, LoginRequired, Settings
 from context_budget import LOCAL_METADATA
 from conversation import Conversation
 from deepseek_client import CompletionError
+from http_transport import TransportCancelled
 from tests.support import make_settings
 from tests.test_conversation import FakeClient
 from ui import _quota_text
@@ -510,6 +511,47 @@ class ResponsesTests(TempDirTest):
         self.assertEqual(caught.exception.code, "generation_budget")
         request.assert_called_once()
         self.assertEqual(self.store.read()["chatgpt"]["refresh_token"], "refresh-2")
+
+    def test_attempt_preparation_does_not_extend_generation_deadline(self):
+        self.save_chatgpt()
+        client = self.client()
+        clock = [100.0]
+        complete_once = client._complete_once
+
+        def prepare(*args, **kwargs):
+            clock[0] += 1.1
+            return complete_once(*args, **kwargs)
+
+        with (
+            patch("chatgpt_client.time.monotonic", side_effect=lambda: clock[0]),
+            patch.object(client, "_complete_once", side_effect=prepare),
+            patch.object(client, "_perform_request") as request,
+            self.assertRaises(CompletionError) as caught,
+        ):
+            client.complete([], generation_timeout=1)
+        self.assertEqual(caught.exception.code, "generation_budget")
+        request.assert_not_called()
+
+    def test_cancellation_interrupts_inflight_token_refresh(self):
+        self.save_chatgpt()
+        client = self.client()
+        cancelled = threading.Event()
+        rejected = urllib.error.HTTPError("https://example.invalid", 401, "", {}, io.BytesIO(b"{}"))
+
+        def open_refresh(request, **options):
+            self.assertIs(options.get("cancelled"), cancelled)
+            cancelled.set()
+            raise TransportCancelled("cancelled")
+
+        with (
+            patch("auth.open_url", side_effect=open_refresh) as refresh,
+            patch.object(client, "_perform_request", side_effect=rejected) as request,
+            self.assertRaises(CompletionError) as caught,
+        ):
+            client.complete([], cancelled=cancelled)
+        self.assertEqual(caught.exception.code, "cancelled")
+        refresh.assert_called_once()
+        request.assert_called_once()
 
     def test_usage_limit_and_request_errors_explain_themselves(self):
         self.save_chatgpt()
